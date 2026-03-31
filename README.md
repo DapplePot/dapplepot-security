@@ -23,7 +23,7 @@ Kafka obs.events.v1  (same topic as dapplepot_pipeline, separate consumer group)
         │     ├── tool_start  → output passthrough detector
         │     └── tool_end    → PII second-pass scanner
         │
-        └── POST-SESSION (after session_end arrives)
+        └── POST-SESSION (after graph_end / graph_error arrives)
               ├── S-05: excessive tool calls vs baseline
               ├── S-06: out-of-scope tool invocations
               ├── S-07: write actions on read-intent sessions
@@ -61,17 +61,21 @@ Kafka obs.events.v1  (same topic as dapplepot_pipeline, separate consumer group)
 
 **`dapplepot_pipeline`** — no changes. This service reads from the same
 Kafka topic independently. The pipeline is completely unaware security exists.
+Note: `dp-alert-router` (in pipeline) must be able to parse alerts from this
+service — the alert format includes `source: "security"` so the router can
+identify and route them correctly.
 
-**`dapplepot_api`** — additive only. 5 new files + 1 line edit:
-- `src/routes/security.ts` — 5 new endpoints
+**`dapplepot_api`** — additive only. 5 new files + 2 line edits:
+- `src/types/security.ts` — TypeScript types: `RiskBand`, `SessionRiskScore`, `SecurityFinding`, `SecurityOverview`, `RemediationCard`
+- `src/types/index.ts` — one line: `export * from './security.js'`
 - `src/queries/security.pg.ts` — read queries for findings + scores
-- `src/types/security.ts` — TypeScript types
-- `src/types/index.ts` — updated barrel export
+- `src/routes/security.ts` — 5 new endpoints (see agent.md §12)
 - `src/routes/index.ts` — one line: `app.route('/v1/security', securityRouter)`
+- `src/lib/cache.ts` — 3 new TTL constants: `CACHE_TTL_SECURITY_OVERVIEW=120`, `CACHE_TTL_SESSION_SCORE=300`, `CACHE_TTL_REMEDIATION=300`
 
 **`dapplepot_ui`** — additive only. 2 new files:
 - `src/api/security.ts` — API client functions
-- `src/hooks/useSecurity.ts` — TanStack Query hooks
+- `src/hooks/useSecurity.ts` — TanStack Query hooks (`staleTime: 120_000` for overview, `300_000` for scores)
   (Security surface was already designed in `dapplepot_ui/agent.md`)
 
 **`dapplepot_langgraph`** and **`dapplepot_sim`** — no changes.
@@ -123,7 +127,8 @@ dapplepot_security/
 │
 └── scripts/
     ├── run_migrations.py
-    └── seed_signatures.py          ← seeds 2,400+ jailbreak strings
+    ├── seed_signatures.py          ← seeds 2,400+ jailbreak strings
+    └── health_check.py             ← dp-security-eval consumer lag check (make health)
 ```
 
 ---
@@ -225,6 +230,100 @@ Cached in Redis at `dp:sec:sigs:{tenant_id}`, TTL 300s.
 | Medium | 40–64 | Warning alert (platform inbox) |
 | High | 65–84 | Critical alert → webhook / Slack / PD |
 | Critical | 85–100 | Critical alert → all channels |
+
+---
+
+## Redis key namespace
+
+This service uses the `dp:sec:*` prefix exclusively. No overlap with
+`dapplepot_pipeline` which uses `dp:rules:*`.
+
+| Key pattern | Owner | TTL |
+|-------------|-------|-----|
+| `dp:sec:sigs:{tenant_id}` | injection.py | `SIG_CACHE_TTL_S` (300s) |
+| `dp:sec:llm_out:{session_id}:{node_run_id}` | redis_ctx.py | `SESSION_CTX_TTL_S` (120s) |
+| `dp:sec:tool_out:{session_id}:{node_run_id}` | redis_ctx.py | `SESSION_CTX_TTL_S` (120s) |
+
+---
+
+## Alert format on obs.alerts.v1
+
+When `risk_score >= ALERT_ON_SCORE_GTE` (default 65), the scorer produces
+one message to `obs.alerts.v1`. The schema is designed to match what
+`dp-alert-router` (in `dapplepot_pipeline`) expects:
+
+```json
+{
+  "alert_id": "<uuid4>",
+  "alert_type": "security_risk",
+  "source": "security",
+  "timestamp": "<ISO 8601 UTC>",
+  "session_id": "...",
+  "tenant_id": "...",
+  "agent_id": "...",
+  "risk_score": 72,
+  "risk_band": "high",
+  "signal_ids": ["INJ-001", "S-06"],
+  "top_findings": [
+    { "signal_id": "INJ-001", "owasp_id": "LLM01", "severity": "critical", "detail": "..." }
+  ],
+  "scorer_version": "1.0.0"
+}
+```
+
+Required fields consumed by `dp-alert-router`: `alert_id`, `alert_type`,
+`source`, `tenant_id`, `session_id`, `timestamp`.
+
+---
+
+## Dead letter queue (DLQ)
+
+If the consumer fails to process an event (parse error, detector crash,
+infra timeout), the raw message is forwarded to `obs.dlq.v1` with metadata:
+
+```json
+{
+  "source": "dp-security-eval",
+  "original_offset": 12345,
+  "error": "...",
+  "raw": "..."
+}
+```
+
+The consumer then commits the offset so it doesn't stall on the same
+message indefinitely. `obs.dlq.v1` is owned and monitored by
+`dapplepot_pipeline`.
+
+---
+
+## Consumer lag health check
+
+```bash
+make health                        # checks dp-security-eval lag, exits 1 if > 10,000
+make health -- --max-lag 5000      # custom threshold
+```
+
+Intended for use in liveness probes and the platform health check script.
+
+---
+
+## Full platform startup sequence
+
+This service is **Step 3** in the platform startup order. Migrations
+must run after `dapplepot_pipeline` migrations (Steps 1–2):
+
+```
+Step 1  cd dapplepot_pipeline && docker compose up -d
+Step 2  cd dapplepot_pipeline && make setup        # topics + PG migrations 001-007
+Step 3  cd dapplepot_security && make migrate && make seed-sigs
+Step 4  cd dapplepot_pipeline && make run-ingest   # + other consumers
+Step 5  cd dapplepot_security && make run          # this service
+Step 6  cd dapplepot_api      && <setup>
+Step 7  cd dapplepot_ui       && pnpm dev
+```
+
+Foreign key constraint: `security_findings.session_id` references
+`sessions.session_id`, so pipeline migrations must complete first.
 
 ---
 

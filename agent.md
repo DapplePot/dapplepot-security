@@ -122,7 +122,8 @@ dapplepot_security/
 │
 └── scripts/
     ├── run_migrations.py                   ← runs db/postgres/ in order
-    └── seed_signatures.py                  ← seeds injection_signatures table
+    ├── seed_signatures.py                  ← seeds injection_signatures table
+    └── health_check.py                     ← consumer lag check for dp-security-eval (make health)
 ```
 
 ---
@@ -587,12 +588,23 @@ Connects to the same infrastructure as `dapplepot_pipeline`:
 
 ```bash
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+
+# Kafka topic names — must match topic names created by dapplepot_pipeline exactly
+KAFKA_EVENTS_TOPIC=obs.events.v1
+KAFKA_ALERTS_TOPIC=obs.alerts.v1
+KAFKA_DLQ_TOPIC=obs.dlq.v1
+
 POSTGRES_DSN=postgresql://dapplepot:dapplepot@localhost:5432/dapplepot_pipeline
 CLICKHOUSE_HOST=localhost
 CLICKHOUSE_PORT=8123
 CLICKHOUSE_DB=dapplepot_pipeline
 CLICKHOUSE_USER=dapplepot
 CLICKHOUSE_PASSWORD=dapplepot
+
+# Shared Redis — this service owns the dp:sec:* namespace only
+# Pipeline owns: dp:rules:{tenant_id}
+# API owns:      dp:api:*
+# This service:  dp:sec:sigs:{tenant_id}, dp:sec:llm_out:*, dp:sec:tool_out:*
 REDIS_URL=redis://localhost:6379/0
 
 SECURITY_EVAL_WORKERS=4
@@ -612,16 +624,40 @@ TOOL_MANIFESTS={}
 
 ## 10. Local dev setup
 
-```bash
-# dapplepot_pipeline's docker compose must be running (shares all infra)
-cd ../dapplepot_pipeline && docker compose up -d
+This service is **Step 3** in the full platform startup. Always run after
+`dapplepot_pipeline` migrations — `security_findings.session_id` has a FK
+on `sessions.session_id` which the pipeline creates.
 
-# Back in dapplepot_security:
+```bash
+# Step 1: infrastructure (owned by dapplepot_pipeline)
+cd ../dapplepot_pipeline && docker compose up -d
+# Wait ~15 seconds for Kafka, Postgres, ClickHouse, Redis to be healthy
+
+# Step 2: pipeline setup (topics + PG migrations 001-007 + ClickHouse schemas + seed tenant)
+cd ../dapplepot_pipeline && make setup
+
+# Step 3: THIS SERVICE — migrations must run after pipeline's
+cd ../dapplepot_security
 uv sync
 cp .env.example .env
-make migrate        # runs db/postgres/ migrations
-make seed-sigs      # seeds injection_signatures table
-make run            # starts dp-security-eval consumer
+make migrate        # PG migrations 001-004 — run AFTER pipeline's
+make seed-sigs      # seeds 2,400+ injection signatures
+
+# Step 4: start pipeline consumers (separate terminals)
+cd ../dapplepot_pipeline
+make run-ingest          # Terminal 1 — port 8000
+make run-session-writer  # Terminal 2
+make run-event-appender  # Terminal 3
+make run-policy-evaluator # Terminal 4
+
+# Step 5: start this service
+cd ../dapplepot_security
+make run             # Terminal 5 — dp-security-eval
+
+# Steps 6-7: dapplepot_api (port 3000) and dapplepot_ui (port 5173)
+
+# Verify health
+make health          # checks dp-security-eval consumer lag on obs.events.v1
 ```
 
 ---
@@ -679,7 +715,7 @@ tests/integration/test_post_session_scorer.py
 
 ## 12. Updates required in other repos
 
-### dapplepot_api — 4 new files + 3 edits
+### dapplepot_api — 5 new files + 2 line edits
 
 ```
 src/types/security.ts               NEW — RiskBand, SessionRiskScore, SecurityFinding, SecurityOverview, RemediationCard
@@ -706,7 +742,7 @@ New endpoints in `dapplepot_api`:
 
 Add to `src/lib/cache.ts`:
 ```typescript
-CACHE_TTL_SECURITY_OVERVIEW  = 120   // 2 minutes
+CACHE_TTL_SECURITY_OVERVIEW  = 120   // 2 minutes — matches UI staleTime
 CACHE_TTL_SESSION_SCORE      = 300   // 5 minutes — stable once written
 CACHE_TTL_REMEDIATION        = 300   // 5 minutes
 ```
@@ -721,6 +757,18 @@ const data = await cached(
 ```
 Apply the same pattern for the score and remediation routes using their respective TTL constants.
 
+### dapplepot_api — TypeScript types to verify against this service's schema
+
+The UI types must match what this service writes to Postgres exactly:
+
+| UI type | Postgres source | Key fields from this service |
+|---------|----------------|------------------------------|
+| `RiskBand` | `session_risk_scores.risk_band` | `"clean" \| "low" \| "medium" \| "high" \| "critical"` |
+| `SessionRiskScore` | `session_risk_scores` | `session_id`, `risk_score` (0–100), `risk_band`, `signal_ids[]`, `scorer_version` |
+| `SecurityFinding` | `security_findings` | `signal_id`, `owasp_id`, `severity`, `matched_text`, `score_contrib`, `detection_phase` |
+| `SecurityOverview` | aggregated from both tables | scores distribution, OWASP frequency, top-risk sessions |
+| `RemediationCard` | aggregated from `security_findings` | ranked by signal frequency |
+
 ---
 
 ### dapplepot_ui — 2 new files
@@ -730,7 +778,7 @@ src/api/security.ts                 NEW — getSecurityOverview, getSessionScore
 src/hooks/useSecurity.ts            NEW — useSecurityOverview, useSessionSecurity, useRemediation
 ```
 
-staleTime per hook:
+staleTime per hook (must align with API cache TTLs above):
 - `useSecurityOverview`: `staleTime: 120_000`, `refetchInterval: 120_000`
 - `useSessionSecurity` (score + findings): `staleTime: 300_000` — stable once written, never re-fetch
 - `useRemediation`: `staleTime: 300_000`
@@ -749,6 +797,54 @@ need these two files to wire up the data.
 
 ---
 
+### Alert format contract with dapplepot_pipeline
+
+When `risk_score >= ALERT_ON_SCORE_GTE` this service produces to `obs.alerts.v1`.
+The `dp-alert-router` consumer in `dapplepot_pipeline` reads this topic.
+The alert envelope this service sends:
+
+```json
+{
+  "alert_id":      "<uuid4>",
+  "alert_type":    "security_risk",
+  "source":        "security",
+  "timestamp":     "<ISO 8601 UTC>",
+  "session_id":    "...",
+  "tenant_id":     "...",
+  "agent_id":      "...",
+  "risk_score":    72,
+  "risk_band":     "high",
+  "signal_ids":    ["INJ-001", "S-06"],
+  "top_findings":  [{ "signal_id": "...", "owasp_id": "...", "severity": "...", "detail": "..." }],
+  "scorer_version":"1.0.0"
+}
+```
+
+Fields `alert_id`, `alert_type`, `source`, `tenant_id`, `session_id`, `timestamp`
+are required by `dp-alert-router` for routing. If `dp-alert-router`'s schema changes,
+update `findings.py::produce_security_alert` to match.
+
+---
+
+### Dead letter queue contract with dapplepot_pipeline
+
+If the security consumer fails to process an event (parse error, detector crash,
+infra timeout), it produces to `obs.dlq.v1` — the DLQ owned by `dapplepot_pipeline`:
+
+```json
+{
+  "source":           "dp-security-eval",
+  "original_offset":  12345,
+  "error":            "...",
+  "raw":              "..."
+}
+```
+
+After DLQ produce, the offset is committed to prevent the consumer stalling.
+`obs.dlq.v1` is monitored by `dapplepot_pipeline` — no changes needed there.
+
+---
+
 ## 13. Locked architecture decisions — do not change
 
 | # | Decision | Reason |
@@ -758,11 +854,15 @@ need these two files to wire up the data.
 | 3 | Redis session context TTL = 120s | Long enough for one node's execution window. Short enough that a long-running session doesn't accumulate stale context for every node it ever visited. |
 | 4 | `ON CONFLICT DO UPDATE` on session_risk_scores | Scorer may re-run on retry. Idempotent upsert is safer than INSERT. |
 | 5 | Produce to `obs.alerts.v1` only on score >= 65 (high/critical) | Clean/low/medium scores go into the security UI only. High+ warrants ops notification via existing alert router. |
-| 6 | Separate `dp:sec:` Redis key prefix | Namespaced from pipeline's `dp:` and API's `dp:api:` keys. |
+| 6 | Separate `dp:sec:` Redis key prefix | Namespaced from pipeline's `dp:rules:*` and API's `dp:api:*` keys. No overlap verified. |
 | 7 | Signal functions are pure + independently testable | Each signal function takes events + session, returns Finding or None. No side effects. Fully unit testable without infra. |
 | 8 | No HTTP calls between this service and dapplepot_pipeline | Purely event-driven. Security service is invisible to the pipeline. |
 | 9 | `matched_text` always redacted before storage | PII patterns store only `PII-001: 4***...1234` not the actual card number. Injection matches truncated to 200 chars. |
 | 10 | Scorer version tracked in `session_risk_scores.scorer_version` | When signal weights change, old scores can be identified and re-scored by filtering on scorer_version. |
+| 11 | Kafka topic names in config, not hardcoded | `kafka_events_topic`, `kafka_alerts_topic`, `kafka_dlq_topic` in `Settings`. Must match `dapplepot_pipeline` topic names. |
+| 12 | Failed events go to DLQ + commit offset | Sending to `obs.dlq.v1` then committing prevents the consumer stalling on a poison-pill message indefinitely. Pipeline's DLQ topic is the shared mechanism for all consumers. |
+| 13 | Alert payload includes `alert_id`, `source`, `timestamp` | Required by `dp-alert-router` for deduplication, routing, and audit. `source: "security"` distinguishes these from policy alerts (`source: "policy"`). |
+| 14 | Security migrations run after pipeline migrations | FK: `security_findings.session_id → sessions.session_id`. Pipeline must create the `sessions` table first. |
 
 ---
 

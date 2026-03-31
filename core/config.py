@@ -6,6 +6,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_events_topic: str = "obs.events.v1"
+    kafka_alerts_topic: str = "obs.alerts.v1"
+    kafka_dlq_topic: str = "obs.dlq.v1"
+
     postgres_dsn: str = "postgresql://dapplepot:dapplepot@localhost:5432/dapplepot_pipeline"
     clickhouse_host: str = "localhost"
     clickhouse_port: int = 8123

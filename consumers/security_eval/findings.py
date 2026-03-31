@@ -1,8 +1,11 @@
 """Finding dataclass, Postgres batch writer, and alert producer."""
 import json
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
+from core.config import settings
 from core.infra.kafka import make_producer
 from core.infra.postgres import get_pool
 
@@ -64,8 +67,13 @@ async def write_findings(findings: list[Finding]) -> None:
 
 
 async def produce_security_alert(score_row: dict, findings: list[Finding]) -> None:
+    # Alert schema must match what dp-alert-router expects on obs.alerts.v1.
+    # Required fields: alert_id, alert_type, source, tenant_id, session_id, timestamp.
     alert = {
+        "alert_id": str(uuid.uuid4()),
         "alert_type": "security_risk",
+        "source": "security",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "session_id": score_row["session_id"],
         "tenant_id": score_row["tenant_id"],
         "agent_id": score_row.get("agent_id"),
@@ -85,8 +93,8 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
     }
     producer = _get_producer()
     producer.produce(
-        "obs.alerts.v1",
+        settings.kafka_alerts_topic,
         key=score_row["session_id"].encode(),
         value=json.dumps(alert).encode(),
     )
-    producer.poll(0)
+    producer.flush()
