@@ -1,0 +1,107 @@
+"""S-09: Cross-session model theft probe detection."""
+import re
+from difflib import SequenceMatcher
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from consumers.security_eval.findings import Finding
+
+# Minimum sessions with near-identical inputs to flag as a theft probe
+MIN_SESSIONS = 5
+# Similarity threshold for "near-identical"
+SIMILARITY_THRESHOLD = 0.85
+
+
+async def detect_model_theft_probe(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """
+    Check if the same user_context_id has sent near-identical llm_start inputs
+    across 5+ sessions — a pattern consistent with systematic model probing.
+    """
+    # Get user_context_id from the current session's first graph_start event
+    graph_start = next((e for e in events if e["event_type"] == "graph_start"), None)
+    if not graph_start:
+        return None
+
+    payload = graph_start.get("payload") or {}
+    user_context_id = payload.get("user_context_id")
+    if not user_context_id:
+        return None
+
+    # Fetch recent llm_start inputs for this user_context_id from ClickHouse
+    from core import infra
+    from core.infra import clickhouse as ch
+
+    recent_sessions = await ch.fetch(
+        """
+        SELECT DISTINCT session_id, argMin(payload, sequence_index) AS first_payload
+        FROM obs_events
+        WHERE tenant_id  = %(tenant_id)s
+          AND event_type = 'llm_start'
+          AND JSONExtractString(payload, 'user_context_id') = %(user_context_id)s
+          AND emitted_at >= now() - INTERVAL 24 HOUR
+          AND session_id != %(session_id)s
+        GROUP BY session_id
+        LIMIT 50
+        """,
+        tenant_id=tenant_id,
+        user_context_id=str(user_context_id),
+        session_id=session_id,
+    )
+
+    if len(recent_sessions) < MIN_SESSIONS - 1:
+        return None
+
+    # Get the current session's first llm_start input
+    current_llm_start = next((e for e in events if e["event_type"] == "llm_start"), None)
+    if not current_llm_start:
+        return None
+
+    current_msgs = current_llm_start.get("payload", {}).get("messages", [])
+    current_text = " ".join(
+        str(m.get("content", "")) for m in current_msgs if m.get("role") == "user"
+    ).lower()
+
+    if not current_text:
+        return None
+
+    similar_count = 0
+    for row in recent_sessions:
+        try:
+            import json
+            other_payload = json.loads(row["first_payload"]) if isinstance(row["first_payload"], str) else row["first_payload"]
+            other_msgs = other_payload.get("messages", [])
+            other_text = " ".join(
+                str(m.get("content", "")) for m in other_msgs if m.get("role") == "user"
+            ).lower()
+            if not other_text:
+                continue
+            ratio = SequenceMatcher(None, current_text, other_text).ratio()
+            if ratio >= SIMILARITY_THRESHOLD:
+                similar_count += 1
+        except Exception:
+            continue
+
+    if similar_count < MIN_SESSIONS - 1:
+        return None
+
+    from consumers.security_eval.findings import Finding
+    return Finding(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        event_id="00000000-0000-0000-0000-000000000000",
+        event_type="post_session",
+        signal_id="S-09",
+        sig_type="scorer",
+        owasp_id="LLM10",
+        severity="warning",
+        matched_text=None,
+        detail=f"Cross-session model theft probe: {similar_count + 1} near-identical sessions for user_context_id={user_context_id}",
+        score_contrib=10,
+        detection_phase="post_session",
+    )
