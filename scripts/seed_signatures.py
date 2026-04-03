@@ -1,10 +1,11 @@
-"""Seed injection_signatures with platform-global patterns."""
+"""Seed injection_signatures for the dapplepot_dev tenant."""
 import asyncio
-import os
 import asyncpg
 
-# Platform-global injection signatures (tenant_id = NULL)
-PLATFORM_SIGNATURES = [
+# Must match pipeline seed (scripts/seed_dev.py in dapplepot-pipeline)
+TENANT_ID = "00000000-0000-0000-0000-000000000001"
+
+SIGNATURES = [
     # Direct instruction override — INJ-001
     {
         "signal_id": "INJ-001",
@@ -62,37 +63,33 @@ JAILBREAK_STRINGS = [
 
 
 async def run() -> None:
-    dsn = os.environ.get(
-        "POSTGRES_DSN",
-        "postgresql://dapplepot:dapplepot@localhost:5432/dapplepot_pipeline",
-    )
-    conn = await asyncpg.connect(dsn)
+    from core.config import settings
+
+    conn = await asyncpg.connect(settings.postgres_dsn)
     try:
-        # Seed platform-global regex/indirect signatures
-        for sig in PLATFORM_SIGNATURES:
+        for sig in SIGNATURES:
             await conn.execute(
                 """
                 INSERT INTO injection_signatures (tenant_id, signal_id, sig_type, pattern, severity)
-                VALUES (NULL, $1, $2, $3, $4)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT DO NOTHING
                 """,
-                sig["signal_id"], sig["sig_type"], sig["pattern"], sig["severity"],
+                TENANT_ID, sig["signal_id"], sig["sig_type"], sig["pattern"], sig["severity"],
             )
-        print(f"Seeded {len(PLATFORM_SIGNATURES)} platform signatures.")
+        print(f"Seeded {len(SIGNATURES)} signatures for tenant {TENANT_ID}.")
 
-        # Seed blocklist strings as INJ-003
         count = 0
         for jailbreak in JAILBREAK_STRINGS:
             await conn.execute(
                 """
                 INSERT INTO injection_signatures (tenant_id, signal_id, sig_type, pattern, severity)
-                VALUES (NULL, 'INJ-003', 'blocklist', $1, 'critical')
+                VALUES ($1, 'INJ-003', 'blocklist', $2, 'critical')
                 ON CONFLICT DO NOTHING
                 """,
-                jailbreak,
+                TENANT_ID, jailbreak,
             )
             count += 1
-        print(f"Seeded {count} blocklist strings (INJ-003).")
+        print(f"Seeded {count} blocklist strings (INJ-003) for tenant {TENANT_ID}.")
     finally:
         await conn.close()
 

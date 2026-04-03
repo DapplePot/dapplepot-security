@@ -122,7 +122,7 @@ dapplepot_security/
 │
 └── scripts/
     ├── run_migrations.py                   ← runs db/postgres/ in order
-    ├── seed_signatures.py                  ← seeds injection_signatures table
+    ├── seed_signatures.py                  ← seeds injection_signatures for dapplepot_dev tenant (00000000-0000-0000-0000-000000000001)
     └── health_check.py                     ← consumer lag check for dp-security-eval (make health)
 ```
 
@@ -209,7 +209,7 @@ INJECTION_SIGNATURES = [
         "pattern":  r"(?i)(pretend|act|behave|you are now|you are a).{0,40}(without|no|ignore).{0,30}(restriction|limit|filter|rule)",
         "field":    "content",
     },
-    # Known jailbreak blocklist — INJ-003 (2,400+ strings seeded by scripts/seed_signatures.py)
+    # Known jailbreak blocklist — INJ-003 (seeded per-tenant by scripts/seed_signatures.py)
     {
         "sig_id":   "INJ-003",
         "sig_type": "blocklist",
@@ -551,7 +551,7 @@ CREATE INDEX idx_scores_tenant_score ON session_risk_scores (tenant_id, risk_sco
 ```sql
 CREATE TABLE injection_signatures (
     sig_id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       UUID        REFERENCES tenants(tenant_id),  -- NULL = platform-global
+    tenant_id       UUID        NOT NULL REFERENCES tenants(tenant_id),
     signal_id       TEXT        NOT NULL,
     sig_type        TEXT        NOT NULL CHECK (sig_type IN ('regex','blocklist','indirect')),
     pattern         TEXT,
@@ -575,7 +575,7 @@ Same as `dapplepot_pipeline` — Python 3.12, same libraries:
 | Kafka | `confluent-kafka` | ≥ 2.3 |
 | Postgres | `asyncpg` | ≥ 0.29 |
 | ClickHouse | `clickhouse-connect` | ≥ 0.7 |
-| Redis | `redis[asyncio]` | ≥ 5.0 |
+| Redis | `redis` | ≥ 5.0 |
 | Validation | `pydantic` | v2 |
 | Config | `pydantic-settings` | ≥ 2.0 |
 | Testing | `pytest` + `pytest-asyncio` | latest |
@@ -597,9 +597,9 @@ KAFKA_DLQ_TOPIC=obs.dlq.v1
 POSTGRES_DSN=postgresql://dapplepot:dapplepot@localhost:5432/dapplepot_pipeline
 CLICKHOUSE_HOST=localhost
 CLICKHOUSE_PORT=8123
-CLICKHOUSE_DB=dapplepot_pipeline
 CLICKHOUSE_USER=dapplepot
 CLICKHOUSE_PASSWORD=dapplepot
+# Note: no CLICKHOUSE_DB — database is resolved per-query inside clickhouse.py
 
 # Shared Redis — this service owns the dp:sec:* namespace only
 # Pipeline owns: dp:rules:{tenant_id}
@@ -641,7 +641,7 @@ cd ../dapplepot_security
 uv sync
 cp .env.example .env
 make migrate        # PG migrations 001-004 — run AFTER pipeline's
-make seed-sigs      # seeds 2,400+ injection signatures
+make seed-sigs      # seeds injection_signatures for dapplepot_dev tenant
 
 # Step 4: start pipeline consumers (separate terminals)
 cd ../dapplepot_pipeline

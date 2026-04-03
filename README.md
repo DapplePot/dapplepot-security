@@ -127,7 +127,7 @@ dapplepot_security/
 │
 └── scripts/
     ├── run_migrations.py
-    ├── seed_signatures.py          ← seeds 2,400+ jailbreak strings
+    ├── seed_signatures.py          ← seeds injection_signatures for dapplepot_dev tenant
     └── health_check.py             ← dp-security-eval consumer lag check (make health)
 ```
 
@@ -139,6 +139,9 @@ dapplepot_security/
 - uv
 - `dapplepot_pipeline` cloned with `docker compose up -d` running
   (shares Kafka, Postgres, ClickHouse, Redis)
+
+> **Windows:** `make run` works on Windows — signal handling uses `signal.signal` instead of
+> `loop.add_signal_handler` (which is Unix-only).
 
 ---
 
@@ -152,7 +155,7 @@ uv sync
 cp .env.example .env
 
 make migrate        # creates 3 new PG tables in the shared dapplepot_pipeline DB
-make seed-sigs      # seeds injection_signatures with platform-global patterns
+make seed-sigs      # seeds injection_signatures for the dapplepot_dev tenant
 make run            # starts dp-security-eval Kafka consumer
 ```
 
@@ -182,9 +185,8 @@ Key columns: `session_id`, `risk_score` (0–100), `risk_band`
 
 ### `injection_signatures`
 
-Platform-global and tenant-customisable injection detection patterns.
-`tenant_id = NULL` = platform-global (applies to all tenants).
-Seeded with 2,400+ jailbreak strings by `scripts/seed_signatures.py`.
+Tenant-specific injection detection patterns.
+Seeded with jailbreak strings for the `dapplepot_dev` tenant by `scripts/seed_signatures.py`.
 Cached in Redis at `dp:sec:sigs:{tenant_id}`, TTL 300s.
 
 ---

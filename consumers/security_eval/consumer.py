@@ -4,6 +4,7 @@ import json
 import logging
 import logging.config
 import signal as os_signal
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from confluent_kafka import KafkaError
@@ -139,8 +140,12 @@ async def run() -> None:
         if not stopped.done():
             stopped.set_result(None)
 
-    loop.add_signal_handler(os_signal.SIGINT, _stop)
-    loop.add_signal_handler(os_signal.SIGTERM, _stop)
+    if sys.platform != "win32":
+        loop.add_signal_handler(os_signal.SIGINT, _stop)
+        loop.add_signal_handler(os_signal.SIGTERM, _stop)
+    else:
+        os_signal.signal(os_signal.SIGINT, _stop)
+        os_signal.signal(os_signal.SIGTERM, _stop)
 
     executor = ThreadPoolExecutor(max_workers=1)
 

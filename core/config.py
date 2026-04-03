@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     postgres_dsn: str = "postgresql://dapplepot:dapplepot@localhost:5432/dapplepot_pipeline"
     clickhouse_host: str = "localhost"
     clickhouse_port: int = 8123
-    clickhouse_db: str = "dapplepot_pipeline"
     clickhouse_user: str = "dapplepot"
     clickhouse_password: str = "dapplepot"
     redis_url: str = "redis://localhost:6379/0"
