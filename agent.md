@@ -90,7 +90,9 @@ dapplepot_security/
 │           ├── __init__.py
 │           ├── post_session.py             ← orchestrator: fetch events → run signals → write score
 │           ├── signals.py                  ← S-01 through S-10 signal functions (pure, testable)
-│           └── cohort.py                   ← S-09 cross-session model theft probe
+│           └── cohort.py                   ← S-09 cross-session model theft probe;
+│                                              payload column from ClickHouse is a JSON string —
+│                                              always json.loads() before calling .get()
 │
 ├── core/
 │   ├── __init__.py
@@ -99,7 +101,9 @@ dapplepot_security/
 │       ├── __init__.py
 │       ├── kafka.py                        ← confluent-kafka consumer + producer factory
 │       ├── postgres.py                     ← asyncpg pool (same pattern as dapplepot_pipeline)
-│       ├── clickhouse.py                   ← clickhouse-connect (reads obs_events for scoring)
+│       ├── clickhouse.py                   ← clickhouse-connect (reads obs_events for scoring);
+│       │                                      must pass compress=False — ClickHouse Cloud resets
+│       │                                      the SSL connection when compression is enabled
 │       └── redis.py                        ← redis.asyncio pool for session context cache
 │
 ├── db/
@@ -122,7 +126,14 @@ dapplepot_security/
 │
 └── scripts/
     ├── run_migrations.py                   ← runs db/postgres/ in order
-    ├── seed_signatures.py                  ← seeds injection_signatures for dapplepot_dev tenant (00000000-0000-0000-0000-000000000001)
+    ├── seed_signatures.py                  ← seeds injection_signatures for dapplepot_dev tenant;
+    │                                          fixed sig_ids (SIG_INJ001–SIG_INJ005) aligned with
+    │                                          pipeline seed_dev.py; INJ-003 blocklist sig_ids via
+    │                                          uuid5(_BLOCKLIST_NS, pattern) for idempotency
+    ├── seed_scores.py                      ← backfills security_findings + session_risk_scores for
+    │                                          the 5 seeded sessions (SES_001–SES_005); calls
+    │                                          score_session() directly against ClickHouse so the
+    │                                          security UI shows real data without live Kafka events
     └── health_check.py                     ← consumer lag check for dp-security-eval (make health)
 ```
 
@@ -636,12 +647,17 @@ cd ../dapplepot_pipeline && docker compose up -d
 # Step 2: pipeline setup (topics + PG migrations 001-007 + ClickHouse schemas + seed tenant)
 cd ../dapplepot_pipeline && make setup
 
+# Step 2b: seed dev data (tenant · agent · sdk_key · policy rules · sessions)
+# Populates all fixed-ID rows that integration tests reference by constant.
+cd ../dapplepot_pipeline && make seed-dev
+
 # Step 3: THIS SERVICE — migrations must run after pipeline's
 cd ../dapplepot_security
 uv sync
 cp .env.example .env
-make migrate        # PG migrations 001-004 — run AFTER pipeline's
-make seed-sigs      # seeds injection_signatures for dapplepot_dev tenant
+make setup          # migrate (PG 001-004) + seed-sigs + seed-scores
+                    # seed-scores backfills security_findings + session_risk_scores
+                    # for SES_001–SES_005 so the security UI shows data immediately
 
 # Step 4: start pipeline consumers (separate terminals)
 cd ../dapplepot_pipeline
@@ -677,6 +693,7 @@ db/postgres/003_injection_signatures.sql
 db/postgres/004_indexes.sql
 scripts/run_migrations.py
 scripts/seed_signatures.py
+scripts/seed_scores.py
 ```
 
 ### Phase 2 — Online detectors
@@ -845,7 +862,52 @@ After DLQ produce, the offset is committed to prevent the consumer stalling.
 
 ---
 
-## 13. Locked architecture decisions — do not change
+## 13. Dev seed fixed IDs
+
+All IDs below are shared constants between `dapplepot_pipeline/scripts/seed_dev.py`
+and `dapplepot_security/scripts/seed_signatures.py`. Use them directly in integration
+tests — no DB query needed.
+
+### Tenant / agent / key
+
+| Constant | Value |
+|----------|-------|
+| `TEST_TENANT_ID` | `00000000-0000-0000-0000-000000000001` |
+| `TEST_AGENT_ID` | `00000000-0000-0000-0000-000000000002` |
+| `TEST_SDK_KEY` | `dp_dev_key_langgraph_checkout_local` |
+| `TENANT_NAME` | `dapplepot_dev` |
+| `AGENT_NAME` | `langgraph_checkout` |
+
+### Sessions (seeded by pipeline seed_dev.py + security scores by seed_scores.py)
+
+| Constant | UUID suffix | Status | Security score | Signals fired |
+|----------|-------------|--------|----------------|---------------|
+| `SES_001` | `…000000001001` | `finalised` | 0 — clean | none |
+| `SES_002` | `…000000001002` | `open` | 0 — clean | none |
+| `SES_003` | `…000000001003` | `interrupted` | 40 — medium | INJ-001 → S-01 |
+| `SES_004` | `…000000001004` | `killed` | 70 — high | INJ-001 + OUT-001 → S-01 + S-03 |
+| `SES_005` | `…000000001005` | `finalised` | 35 — low | PII-001 → S-04 |
+
+S-05 and S-10 (baseline signals) are always silent for seeded data — they query
+ClickHouse with the agent UUID but obs_events stores the agent name string.
+Both require a 7-day baseline anyway; they activate naturally once the live
+service has processed enough sessions.
+
+### Injection signatures (seeded by seed_signatures.py)
+
+| Constant | UUID suffix | signal_id | sig_type | severity |
+|----------|-------------|-----------|----------|----------|
+| `SIG_INJ001` | `…000000000101` | INJ-001 | regex | critical |
+| `SIG_INJ002` | `…000000000102` | INJ-002 | regex | critical |
+| `SIG_INJ004` | `…000000000104` | INJ-004 | indirect | warning |
+| `SIG_INJ005` | `…000000000105` | INJ-005 | regex | warning |
+| _(blocklist ns)_ | `…000000000103` | INJ-003 | blocklist | critical |
+
+INJ-003 rows each get `uuid5("00000000-…-000000000103", pattern)` as their `sig_id`.
+
+---
+
+## 14. Locked architecture decisions — do not change
 
 | # | Decision | Reason |
 |---|----------|--------|
@@ -866,7 +928,7 @@ After DLQ produce, the offset is committed to prevent the consumer stalling.
 
 ---
 
-## 14. What done looks like
+## 15. What done looks like
 
 **Unit tests pass** (`make test-unit`):
 - Injection detector fires on INJ-001 pattern, silent on normal input

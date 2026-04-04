@@ -1,4 +1,5 @@
 """S-09: Cross-session model theft probe detection."""
+import json
 import re
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
@@ -28,7 +29,8 @@ async def detect_model_theft_probe(
     if not graph_start:
         return None
 
-    payload = graph_start.get("payload") or {}
+    raw = graph_start.get("payload") or "{}"
+    payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
     user_context_id = payload.get("user_context_id")
     if not user_context_id:
         return None
@@ -62,7 +64,9 @@ async def detect_model_theft_probe(
     if not current_llm_start:
         return None
 
-    current_msgs = current_llm_start.get("payload", {}).get("messages", [])
+    raw_current = current_llm_start.get("payload") or "{}"
+    current_payload = json.loads(raw_current) if isinstance(raw_current, str) else (raw_current or {})
+    current_msgs = current_payload.get("messages", [])
     current_text = " ".join(
         str(m.get("content", "")) for m in current_msgs if m.get("role") == "user"
     ).lower()
@@ -73,7 +77,6 @@ async def detect_model_theft_probe(
     similar_count = 0
     for row in recent_sessions:
         try:
-            import json
             other_payload = json.loads(row["first_payload"]) if isinstance(row["first_payload"], str) else row["first_payload"]
             other_msgs = other_payload.get("messages", [])
             other_text = " ".join(

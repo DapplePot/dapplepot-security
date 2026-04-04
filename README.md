@@ -127,7 +127,12 @@ dapplepot_security/
 │
 └── scripts/
     ├── run_migrations.py
-    ├── seed_signatures.py          ← seeds injection_signatures for dapplepot_dev tenant
+    ├── seed_signatures.py          ← seeds injection_signatures for dapplepot_dev tenant;
+    │                                  fixed sig_ids (SIG_INJ001–SIG_INJ005) aligned with
+    │                                  pipeline seed_dev.py; blocklist sig_ids via uuid5
+    ├── seed_scores.py              ← backfills security_findings + session_risk_scores for
+    │                                  the 5 seeded sessions by running the post-session scorer
+    │                                  directly against ClickHouse (no Kafka required)
     └── health_check.py             ← dp-security-eval consumer lag check (make health)
 ```
 
@@ -154,8 +159,7 @@ cd dapplepot_security
 uv sync
 cp .env.example .env
 
-make migrate        # creates 3 new PG tables in the shared dapplepot_pipeline DB
-make seed-sigs      # seeds injection_signatures for the dapplepot_dev tenant
+make setup          # migrate + seed-sigs + seed-scores (Step 3 of platform startup)
 make run            # starts dp-security-eval Kafka consumer
 ```
 
@@ -302,7 +306,7 @@ message indefinitely. `obs.dlq.v1` is owned and monitored by
 
 ```bash
 make health                        # checks dp-security-eval lag, exits 1 if > 10,000
-make health -- --max-lag 5000      # custom threshold
+make health ARGS="--max-lag 5000"  # custom threshold
 ```
 
 Intended for use in liveness probes and the platform health check script.
@@ -317,7 +321,9 @@ must run after `dapplepot_pipeline` migrations (Steps 1–2):
 ```
 Step 1  cd dapplepot_pipeline && docker compose up -d
 Step 2  cd dapplepot_pipeline && make setup        # topics + PG migrations 001-007
-Step 3  cd dapplepot_security && make migrate && make seed-sigs
+Step 2b cd dapplepot_pipeline && make seed-dev     # tenant · agent (langgraph_checkout) · sdk_key
+                                                   # policy rules (8) · sessions SES_001–SES_005
+Step 3  cd dapplepot_security && make setup
 Step 4  cd dapplepot_pipeline && make run-ingest   # + other consumers
 Step 5  cd dapplepot_security && make run          # this service
 Step 6  cd dapplepot_api      && <setup>

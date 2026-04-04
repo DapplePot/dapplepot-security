@@ -12,6 +12,9 @@ def get_client():
             port=settings.clickhouse_port,
             username=settings.clickhouse_user,
             password=settings.clickhouse_password,
+            compress=False,
+            connect_timeout=10,
+            send_receive_timeout=30,
         )
     return _client
 
