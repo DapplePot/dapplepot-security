@@ -1,12 +1,19 @@
 """Post-session scorer orchestrator — triggered on graph_end / graph_error.
 
+All detection (per-event and session-level) runs here after the full event
+history is available from ClickHouse.
+
 v2 scoring model (§4.1):
   - Parent signal score = max(check_score) of its fired sub-checks.
   - Composite score = weighted avg: highest-score signal × 0.6 + rest × 0.4.
   - Alert fires when any individual signal score >= SIGNAL_ALERT_THRESHOLDS[signal]
     OR composite score >= COMPOSITE_ALERT_THRESHOLD.
 """
+import asyncio
+import logging
 import json
+
+logger = logging.getLogger(__name__)
 from core.config import settings, SIGNAL_ALERT_THRESHOLDS, COMPOSITE_ALERT_THRESHOLD
 from consumers.security_eval.scorer.llm_signals import (
     SIGNAL_ID_FUNCTIONS,
@@ -59,14 +66,6 @@ def compute_ow_signal_score(fired_findings: list) -> dict[str, dict]:
     """
     Group findings by owasp_signal_id and compute per-signal score as the
     max check_score of all fired sub-checks.
-
-    Returns:
-    {
-      "OW-LLM01": {
-        "score": 92, "status": "fired",
-        "sub_checks": {"PI-04b": {"status": "fired", "score": 92, "detail": "..."}}
-      }, ...
-    }
     """
     signal_map: dict[str, dict] = {}
     for f in fired_findings:
@@ -105,28 +104,102 @@ def compute_composite_score(signal_map: dict, framework: str) -> int:
     return min(100, int(primary + secondary))
 
 
+async def _run_per_event_detectors(
+    events: list[dict],
+    tenant_id: str,
+    session_id: str,
+) -> list:
+    """
+    Replay the session event sequence and run all per-event detectors with
+    in-memory cross-event context (replaces the Redis context used during
+    online processing). All findings are tagged post_session.
+    """
+    from consumers.security_eval.detectors.injection import detect_injection
+    from consumers.security_eval.detectors.passthrough import detect_passthrough
+    from consumers.security_eval.detectors.disclosure import detect_pii
+    from consumers.security_eval.detectors.agentic import (
+        detect_agent_threats_on_tool_start,
+        detect_agent_threats_on_llm_start,
+    )
+    from consumers.security_eval.detectors.prompt_guard import check_prompt_guard
+
+    last_llm_output: dict[str, str] = {}   # node_run_id → completion
+    last_tool_output: dict[str, str] = {}  # node_run_id → tool_output
+    last_user_turn: str = ""
+    findings: list = []
+
+    for ev in events:
+        etype = ev["event_type"]
+        nid = ev.get("node_run_id") or ""
+        payload = ev.get("payload") or {}
+        ev_findings: list = []
+
+        try:
+            if etype == "llm_start":
+                msgs = payload.get("messages", []) if isinstance(payload, dict) else []
+                for m in reversed(msgs):
+                    if isinstance(m, dict) and m.get("role") in ("user", "human"):
+                        last_user_turn = str(m.get("content", ""))
+                        break
+                ev_findings += await detect_injection(
+                    ev, last_tool_output=last_tool_output.get(nid, ""), tenant_id=tenant_id
+                )
+                ev_findings += detect_agent_threats_on_llm_start(ev)
+
+            elif etype == "llm_end":
+                completion = payload.get("completion", "") if isinstance(payload, dict) else ""
+                last_llm_output[nid] = str(completion)
+                ev_findings += detect_pii(ev)
+                ev_findings += check_prompt_guard(
+                    ev, session_ctx={"last_user_turn": last_user_turn}, agent_manifest={}
+                )
+
+            elif etype == "tool_start":
+                ev_findings += await detect_passthrough(
+                    ev, last_llm_output=last_llm_output.get(nid, "")
+                )
+                ev_findings += detect_agent_threats_on_tool_start(ev)
+
+            elif etype == "tool_end":
+                tool_output = payload.get("tool_output", "") if isinstance(payload, dict) else ""
+                if not isinstance(tool_output, str):
+                    tool_output = json.dumps(tool_output)
+                last_tool_output[nid] = tool_output
+                ev_findings += detect_pii(ev)
+
+        except Exception:
+            logger.exception(
+                '"per-event detector failed event_type=%s event_id=%s"',
+                etype,
+                ev.get("event_id"),
+            )
+
+        findings.extend(ev_findings)
+
+    return findings
+
+
 async def score_session(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list,
 ) -> dict:
     """
     1. Fetch full event list for session from ClickHouse.
     2. Fetch session row from Postgres.
-    3. Run all OW-LLM signal functions + sub-check helpers.
-    4. Run all OW-ASI signal functions.
-    5. Compute per-signal scores (max sub-check model) and composites.
-    6. Write security_findings rows for post-session findings.
-    7. Write session_risk_scores.
-    8. Upsert agent_risk_scores.
-    9. Alert if any signal >= its threshold OR composite >= COMPOSITE_ALERT_THRESHOLD.
+    3. Run per-event detectors (injection, PII, passthrough, agentic, prompt guard).
+    4. Run session-level OW-LLM signal functions + sub-check helpers.
+    5. Run session-level OW-ASI signal functions.
+    6. Compute per-signal scores (max sub-check model) and composites.
+    7. Write security_findings rows.
+    8. Write session_risk_scores.
+    9. Upsert agent_risk_scores.
+    10. Alert if any signal >= its threshold OR composite >= COMPOSITE_ALERT_THRESHOLD.
     """
     from core.infra import clickhouse as ch
     from core.infra.postgres import get_pool
 
-    events = await ch.fetch(
-        """
+    _CH_QUERY = """
         SELECT event_type, event_id, emitted_at, sequence_index,
                node_run_id, node_name, tool_name, llm_model,
                llm_input_tokens, llm_output_tokens, payload
@@ -134,10 +207,36 @@ async def score_session(
         WHERE tenant_id  = %(tenant_id)s
           AND session_id = %(session_id)s
         ORDER BY sequence_index ASC
-        """,
-        tenant_id=tenant_id,
-        session_id=session_id,
-    )
+    """
+    # ClickHouse may lag behind the Kafka graph_end event by a few seconds.
+    # Retry up to 3 times with increasing delays before giving up.
+    _RETRY_DELAYS = [1, 3, 5]
+    events = []
+    for attempt, delay in enumerate(_RETRY_DELAYS):
+        await asyncio.sleep(delay)
+        events = await ch.fetch(_CH_QUERY, tenant_id=tenant_id, session_id=session_id)
+        if events:
+            break
+        logger.warning(
+            '"score_session no CH events yet session_id=%s attempt=%d/%d"',
+            session_id,
+            attempt + 1,
+            len(_RETRY_DELAYS),
+        )
+
+    # ClickHouse returns payload as a JSON string — parse into dict for all signal functions.
+    for ev in events:
+        # Stamp tenant_id and session_id onto each event row (not stored in CH columns)
+        ev.setdefault("tenant_id", tenant_id)
+        ev.setdefault("session_id", session_id)
+        p = ev.get("payload")
+        if not p:
+            ev["payload"] = {}
+        elif isinstance(p, str):
+            try:
+                ev["payload"] = json.loads(p)
+            except Exception:
+                ev["payload"] = {}
 
     pool = await get_pool()
     session_row = await pool.fetchrow(
@@ -149,9 +248,10 @@ async def score_session(
     )
     session = dict(session_row) if session_row else {}
 
-    # ─── OW-LLM01 through OW-LLM10 ───────────────────────────────────────────
-    all_findings = list(online_findings)
+    # ─── Per-event detectors (replayed post-session) ──────────────────────────
+    all_findings = await _run_per_event_detectors(events, tenant_id, session_id)
 
+    # ─── Session-level OW-LLM signals ────────────────────────────────────────
     for signal_key, signal_fn in SIGNAL_ID_FUNCTIONS:
         finding = await signal_fn(
             events=events,
@@ -159,7 +259,6 @@ async def score_session(
             tenant_id=tenant_id,
             session_id=session_id,
             agent_id=agent_id,
-            online_findings=online_findings,
         )
         if finding:
             all_findings.append(finding)
@@ -170,8 +269,20 @@ async def score_session(
     all_findings.extend(check_system_prompt_leakage(events, session_id, tenant_id))
     all_findings.extend(check_vector_integrity(events, session_id, tenant_id))
 
-    # ─── OW-ASI01 through OW-ASI10 ───────────────────────────────────────────
-    agent_findings: list = []
+    # ─── Session-level OW-ASI signals ────────────────────────────────────────
+    from consumers.security_eval.scorer.asi_signals import signal_a01
+    # signal_a01 (goal hijack) correlates OW-ASI06 per-event detections with
+    # write-tool behaviour — pass per-event findings so it can find them.
+    a01_finding = await signal_a01(
+        events=events,
+        session=session,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        agent_id=agent_id,
+        online_findings=all_findings,
+    )
+    if a01_finding:
+        all_findings.append(a01_finding)
 
     for signal_key, signal_fn in AGENT_SIGNAL_ID_FUNCTIONS:
         finding = await signal_fn(
@@ -180,13 +291,12 @@ async def score_session(
             tenant_id=tenant_id,
             session_id=session_id,
             agent_id=agent_id,
-            online_findings=online_findings,
         )
         if finding:
-            agent_findings.append(finding)
+            all_findings.append(finding)
 
     # ─── v2 scoring model ─────────────────────────────────────────────────────
-    all_session_findings = all_findings + agent_findings
+    all_session_findings = all_findings
 
     llm_signal_map = compute_ow_signal_score(
         [f for f in all_session_findings if f.framework == "LLM"]
@@ -200,16 +310,12 @@ async def score_session(
     llm_band   = _band(llm_score)
     asi_band   = _band(asi_score)
 
-    # ─── Persist post-session findings ───────────────────────────────────────
+    # ─── Persist findings ─────────────────────────────────────────────────────
     from consumers.security_eval.findings import write_findings, write_agent_risk_score
-    post_session_findings = [
-        f for f in all_session_findings
-        if f.detection_phase == "post_session"
-    ]
-    if post_session_findings:
-        await write_findings(post_session_findings)
+    if all_session_findings:
+        await write_findings(all_session_findings)
 
-    # ─── Write session risk score ──────────────────────────────────────────────
+    # ─── Write session risk score ─────────────────────────────────────────────
     await pool.execute(
         """
         INSERT INTO session_risk_scores

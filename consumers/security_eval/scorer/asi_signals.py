@@ -99,7 +99,7 @@ async def signal_a01(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
+    online_findings: list | None = None,
 ) -> "Finding | None":
     """AGH-01b — goal hijack: context injection led to write action on read-intent session."""
     if not online_findings:
@@ -135,31 +135,6 @@ async def signal_a01(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OW-ASI02: Tool Misuse & Exploitation
-# ─────────────────────────────────────────────────────────────────────────────
-async def signal_a02(
-    events: list[dict],
-    session: dict,
-    tenant_id: str,
-    session_id: str,
-    agent_id: str,
-    online_findings: list["Finding"] | None = None,
-) -> "Finding | None":
-    """TME-01a — tool misuse: aggregates online OW-ASI02 findings."""
-    if not online_findings:
-        return None
-    hits = [f for f in online_findings if f.owasp_signal_id == "OW-ASI02"]
-    if not hits:
-        return None
-    best = max(hits, key=lambda f: f.check_score)
-    return _make_finding(
-        "OW-ASI02", best.sub_check_id, best.check_label, best.check_score,
-        session_id, tenant_id,
-        detail=f"Tool misuse detected in {len(hits)} event(s): suspicious payload patterns in tool_input",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI03: Identity & Privilege Abuse
 # ─────────────────────────────────────────────────────────────────────────────
 async def signal_a03(
@@ -168,7 +143,6 @@ async def signal_a03(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """IPA-01a — agent requests scope beyond role definition (privilege escalation tools)."""
     tool_names = [
@@ -201,7 +175,6 @@ async def signal_a04(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """ASCV-01a — all tools used are outside the registered manifest (possible registry substitution)."""
     from core.config import settings
@@ -232,59 +205,6 @@ async def signal_a04(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OW-ASI05: Unexpected Code Execution (RCE)
-# ─────────────────────────────────────────────────────────────────────────────
-async def signal_a05(
-    events: list[dict],
-    session: dict,
-    tenant_id: str,
-    session_id: str,
-    agent_id: str,
-    online_findings: list["Finding"] | None = None,
-) -> "Finding | None":
-    """RCE-01b / RCE-03a / RCE-03b — aggregates online OW-ASI05 findings."""
-    if not online_findings:
-        return None
-    hits = [f for f in online_findings if f.owasp_signal_id == "OW-ASI05"]
-    if not hits:
-        return None
-    best = max(hits, key=lambda f: f.check_score)
-    tools = [h.matched_text for h in hits if h.matched_text]
-    return _make_finding(
-        "OW-ASI05", best.sub_check_id, best.check_label, best.check_score,
-        session_id, tenant_id,
-        detail=f"Code/shell execution tool(s) invoked: {', '.join(dict.fromkeys(tools))}" if tools
-               else "Code/shell execution tool invoked",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-ASI06: Memory & Context Poisoning
-# ─────────────────────────────────────────────────────────────────────────────
-async def signal_a06(
-    events: list[dict],
-    session: dict,
-    tenant_id: str,
-    session_id: str,
-    agent_id: str,
-    online_findings: list["Finding"] | None = None,
-) -> "Finding | None":
-    """MCP-01a — aggregates online OW-ASI06 (context/memory injection) findings."""
-    if not online_findings:
-        return None
-    hits = [f for f in online_findings if f.owasp_signal_id == "OW-ASI06"]
-    if not hits:
-        return None
-    check_score = min(88 + (len(hits) - 1) * 2, 95)
-    return _make_finding(
-        "OW-ASI06", "MCP-01a",
-        "Injected content alters current plan",
-        check_score, session_id, tenant_id,
-        detail=f"Context/memory injection patterns found in {len(hits)} LLM input event(s)",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI07: Insecure Inter-Agent Communication
 # ─────────────────────────────────────────────────────────────────────────────
 async def signal_a07(
@@ -293,7 +213,6 @@ async def signal_a07(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """IAC-01a — sub-agent message lacks auth signature."""
     delegation_tools = list(dict.fromkeys(
@@ -323,7 +242,6 @@ async def signal_a08(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """CF-01a — tool retry count > threshold (cascading failure pattern)."""
     error_events = [e for e in events if e["event_type"] == "graph_error"]
@@ -354,7 +272,6 @@ async def signal_a09(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """HAT-01a — agent mimics human / authority claim + uninspected high-stakes action."""
     initial_input = session.get("initial_input", "") or ""
@@ -397,7 +314,6 @@ async def signal_a10(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """RA-01a — tool usage pattern deviates from agent profile (>3σ)."""
     tool_names_this = [
@@ -446,12 +362,11 @@ async def signal_a10(
 # Signal registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
-    ("OW-ASI01", signal_a01),
-    ("OW-ASI02", signal_a02),
+    # signal_a01 is called separately in orchestrator with per-event findings
     ("OW-ASI03", signal_a03),
     ("OW-ASI04", signal_a04),
-    ("OW-ASI05", signal_a05),
-    ("OW-ASI06", signal_a06),
+    # signal_a02/a05/a06 were wrappers around per-event findings; removed now that
+    # _run_per_event_detectors produces those findings directly.
     ("OW-ASI07", signal_a07),
     ("OW-ASI08", signal_a08),
     ("OW-ASI09", signal_a09),

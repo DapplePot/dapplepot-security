@@ -22,7 +22,7 @@ def _finding(owasp_signal_id: str, sub_check_id: str, check_score: int = 88,
         category="prompt_injection",
         severity=severity,
         matched_text="...",
-        detection_phase="online",
+        detection_phase="post_session",
     )
 
 
@@ -91,24 +91,6 @@ async def test_a01_silent_when_write_intent_matches():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OW-ASI02: signal_a02 (TME-01a — tool misuse)
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_a02_fires_on_online_findings():
-    online = [_finding("OW-ASI02", "TME-01a", check_score=65), _finding("OW-ASI02", "TME-01b", check_score=70)]
-    result = await agent_signals.signal_a02([], SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.owasp_signal_id == "OW-ASI02"
-    assert result.check_score == 70  # max of hits
-
-
-@pytest.mark.asyncio
-async def test_a02_silent_without_online_findings():
-    result = await agent_signals.signal_a02([], SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID, [])
-    assert result is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI03: signal_a03 (IPA-01a — privilege escalation)
 # ─────────────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
@@ -158,46 +140,6 @@ async def test_a04_silent_when_some_tools_known():
     ):
         result = await agent_signals.signal_a04(events, SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID)
     assert result is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-ASI05: signal_a05 (RCE-01b)
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_a05_fires_on_online_rce_finding():
-    online = [_finding("OW-ASI05", "RCE-01b", check_score=95)]
-    result = await agent_signals.signal_a05([], SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.owasp_signal_id == "OW-ASI05"
-    assert result.sub_check_id == "RCE-01b"
-    assert result.check_score == 95
-
-
-@pytest.mark.asyncio
-async def test_a05_fires_on_rce03a_container_escape():
-    online = [_finding("OW-ASI05", "RCE-03a", check_score=98)]
-    result = await agent_signals.signal_a05([], SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.check_score == 98
-
-
-@pytest.mark.asyncio
-async def test_a05_silent_without_rce_finding():
-    result = await agent_signals.signal_a05([], SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID, [])
-    assert result is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-ASI06: signal_a06 (MCP-01a — context injection)
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_a06_fires_on_online_injection_findings():
-    online = [_finding("OW-ASI06", "MCP-01a"), _finding("OW-ASI06", "MCP-01a")]
-    result = await agent_signals.signal_a06([], SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.owasp_signal_id == "OW-ASI06"
-    assert result.sub_check_id == "MCP-01a"
-    assert result.check_score == 90  # 88 + (2-1)*2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

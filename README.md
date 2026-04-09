@@ -18,38 +18,31 @@ LLM and agent dimensions.
 Kafka obs.events.v1  (same topic as dapplepot_pipeline, separate consumer group)
   └── dp-security-eval (30 workers)
         │
-        ├── ONLINE (per event, real-time)
-        │     ├── llm_start   → prompt_injection.py  (OW-LLM01: PI-01a, PI-01b, PI-02a)
-        │     │               → agentic_threats.py   (OW-ASI06: MCP-01a context injection)
-        │     ├── llm_end     → data_disclosure.py   (OW-LLM02: SID-01a/c, SID-02a/b/c)
-        │     │               → system_prompt.py     (OW-LLM07: SPL-01a/b)
-        │     ├── tool_start  → output_handling.py   (OW-LLM05: IOH-01a/b/c, IOH-02a)
-        │     │               → agentic_threats.py   (OW-ASI02: TME-01a, TME-03b)
-        │     │               →                      (OW-ASI05: RCE-01b, RCE-03a, RCE-03b)
-        │     └── tool_end    → data_disclosure.py   (OW-LLM02: PII patterns)
-        │
-        └── POST-SESSION (after graph_end / graph_error arrives)
+        └── On graph_end / graph_error — post-session scorer (async)
+              │
+              ├── Per-event detectors — replays session events from ClickHouse in order
+              │     ├── llm_start   → injection.py      (OW-LLM01: PI-01a, PI-01b, PI-02a)
+              │     │               → agentic.py        (OW-ASI06: MCP-01a context injection)
+              │     ├── llm_end     → disclosure.py     (OW-LLM02: SID-01a/c, SID-02a/b/c)
+              │     │               → prompt_guard.py   (OW-LLM07: SPL-01a/b)
+              │     ├── tool_start  → passthrough.py    (OW-LLM05: IOH-01a/b/c, IOH-02a)
+              │     │               → agentic.py        (OW-ASI02: TME-01a, TME-03b)
+              │     │               →                   (OW-ASI05: RCE-01b, RCE-03a, RCE-03b)
+              │     └── tool_end    → disclosure.py     (OW-LLM02: PII patterns)
+              │
               ├── LLM signals (OWASP LLM Top 10) — llm_signals.py
-              │     ├── OW-LLM01: confirmed prompt injection (PI-01a)
-              │     ├── OW-LLM01: indirect injection vector (PI-02a)
               │     ├── OW-LLM01: multi-turn jailbreak accumulation (PI-04b)
-              │     ├── OW-LLM02: PII in LLM/tool output (SID-01a, SID-02b)
               │     ├── OW-LLM04: RAG integrity (DMP-01a, DMP-01c)
-              │     ├── OW-LLM05: output passthrough to tool (IOH-02a)
               │     ├── OW-LLM06: excessive tool calls vs baseline (EAG-01a)
               │     ├── OW-LLM06: out-of-scope tool invocations (EAG-02a)
               │     ├── OW-LLM06: write action on read-intent session (EAG-03a)
-              │     ├── OW-LLM07: system prompt leakage (SPL-02a/b, SPL-03b)
               │     ├── OW-LLM09: high-stakes action without HITL (SAG-01a)
               │     └── OW-LLM10: token spike / cross-session probe (UBC-01a, UBC-04a)
               │
               ├── ASI signals (OWASP Agentic AI Top 10) — asi_signals.py
               │     ├── OW-ASI01: agent goal hijacking
-              │     ├── OW-ASI02: tool misuse & exploitation
               │     ├── OW-ASI03: identity & privilege abuse
               │     ├── OW-ASI04: agentic supply chain vulnerability
-              │     ├── OW-ASI05: unexpected code execution
-              │     ├── OW-ASI06: memory & context poisoning
               │     ├── OW-ASI07: insecure inter-agent communication
               │     ├── OW-ASI08: cascading failures
               │     ├── OW-ASI09: human-agent trust exploitation
@@ -91,15 +84,18 @@ All events share a common envelope:
 }
 ```
 
-| `event_type` | Payload fields consumed | What runs |
+The consumer only watches for `graph_end`/`graph_error`. All detection runs post-session
+by replaying ClickHouse events through the detectors in sequence.
+
+| `event_type` | Payload fields consumed (post-session replay) | What runs |
 |---|---|---|
-| `llm_start` | `payload.messages[].role`, `payload.messages[].content` | Prompt injection (PI-01a/b, PI-02a); context injection (MCP-01a); last user turn stored for SPL-01b |
-| `llm_end` | `payload.completion` | PII scanner (SID-*); system prompt leakage (SPL-01a/b); completion stored in Redis |
+| `llm_start` | `payload.messages[].role`, `payload.messages[].content` | Prompt injection (PI-01a/b, PI-02a); context injection (MCP-01a) |
+| `llm_end` | `payload.completion` | PII scanner (SID-*); system prompt leakage (SPL-01a/b) |
 | `tool_start` | `payload.tool_input`, `payload.tool_name` | Output passthrough (IOH-*); tool misuse (TME-01a, TME-03b); code execution (RCE-01b, RCE-03a/b) |
-| `tool_end` | `payload.tool_output` | PII scanner; output stored in Redis for indirect injection check |
-| `graph_end` | (envelope only) | Triggers async post-session scoring |
+| `tool_end` | `payload.tool_output` | PII scanner |
+| `graph_end` | (envelope only) | Triggers async `score_session()` |
 | `graph_error` | (envelope only) | Same as `graph_end` |
-| everything else | — | Consumed and committed, no detection runs |
+| everything else | — | Consumed and committed, no detection |
 
 ### Postgres `sessions` table — queried during post-session scoring
 
@@ -178,20 +174,19 @@ dapplepot_security/
 │
 ├── consumers/
 │   └── security_eval/              ← consumer group: dp-security-eval
-│       ├── consumer.py             ← Kafka poll loop, routes events
-│       ├── session_ctx.py          ← Redis session context: LLM/tool output per node_run_id
+│       ├── consumer.py             ← Kafka poll loop; triggers score_session on graph_end/graph_error
 │       ├── findings.py             ← Finding dataclass, PG batch writer, alert producer
-│       ├── online/
-│       │   ├── prompt_injection.py ← OW-LLM01: PI-01a, PI-01b, PI-02a
-│       │   ├── data_disclosure.py  ← OW-LLM02: SID-01a/c, SID-02a/b/c
-│       │   ├── output_handling.py  ← OW-LLM05: IOH-01a/b/c, IOH-02a (passthrough)
-│       │   ├── agentic_threats.py  ← OW-ASI02/05/06: TME-01a, RCE-01b/03a/03b, MCP-01a
-│       │   └── system_prompt.py    ← OW-LLM07: SPL-01a (prefix similarity), SPL-01b (probe)
+│       ├── detectors/              ← per-event detectors (replayed post-session from ClickHouse)
+│       │   ├── injection.py        ← OW-LLM01: PI-01a, PI-01b, PI-02a
+│       │   ├── disclosure.py       ← OW-LLM02: SID-01a/c, SID-02a/b/c
+│       │   ├── passthrough.py      ← OW-LLM05: IOH-01a/b/c, IOH-02a (LCS passthrough)
+│       │   ├── agentic.py          ← OW-ASI02/05/06: TME-01a, RCE-01b/03a/03b, MCP-01a
+│       │   └── prompt_guard.py     ← OW-LLM07: SPL-01a (prefix similarity), SPL-01b (probe)
 │       └── scorer/
-│           ├── orchestrator.py     ← score_session(): runs all signals, writes DB, fires alerts
+│           ├── orchestrator.py     ← score_session(): replays events, runs all signals, writes DB, fires alerts
 │           ├── llm_signals.py      ← OW-LLM01..10 post-session signal functions + sub-check helpers
 │           ├── asi_signals.py      ← OW-ASI01..10 post-session signal functions
-│           └── probe_detector.py   ← OW-LLM10 cross-session model theft probe (UBC-04a)
+│           └── probe.py            ← OW-LLM10 cross-session model theft probe (UBC-04a)
 │
 ├── core/
 │   ├── config.py                   ← pydantic-settings: Kafka, PG, CH, Redis, thresholds
@@ -218,17 +213,17 @@ dapplepot_security/
 │
 ├── tests/
 │   ├── unit/
-│   │   ├── test_prompt_injection.py        ← OW-LLM01 online detector
-│   │   ├── test_data_disclosure.py         ← OW-LLM02 online detector
-│   │   ├── test_output_handling.py         ← OW-LLM05 online detector
-│   │   ├── test_agentic_threats.py         ← OW-ASI02/05/06 online detectors
+│   │   ├── test_prompt_injection.py        ← OW-LLM01 injection detector
+│   │   ├── test_data_disclosure.py         ← OW-LLM02 disclosure detector
+│   │   ├── test_output_handling.py         ← OW-LLM05 passthrough detector
+│   │   ├── test_agentic_threats.py         ← OW-ASI02/05/06 agentic detectors
 │   │   ├── test_llm_signals.py             ← OW-LLM01..10 post-session signals
 │   │   ├── test_asi_signals.py             ← OW-ASI01..10 post-session signals
 │   │   ├── test_scoring.py                 ← v2 scoring model (max sub-check, composite)
 │   │   └── test_signal_registry.py         ← REGISTRY coverage (no DB required)
 │   └── integration/
-│       ├── test_online_detection.py
-│       └── test_post_session_scorer.py
+│       ├── test_detectors.py               ← detector scenarios against Postgres
+│       └── test_post_session_scorer.py     ← end-to-end scorer with mocked ClickHouse events
 │
 └── scripts/
     ├── run_migrations.py           ← runs db/postgres/ in order
@@ -271,8 +266,8 @@ make run            # starts dp-security-eval Kafka consumer
 
 ### `security_findings`
 
-One row per detected sub-check per event. Written by both online detectors and
-the post-session scorer.
+One row per detected sub-check per event. Written entirely by the post-session scorer
+(per-event detectors are replayed from ClickHouse; session-level signals run once).
 
 Key columns: `session_id`, `event_id`, `signal_id` (`OW-LLM01:PI-01a` format),
 `owasp_signal_id` (`OW-LLM01`), `sub_check_id` (`PI-01a`), `check_label`,
@@ -316,13 +311,13 @@ Tenant-specific injection detection patterns. Cached in Redis at
 
 | Signal | Threat | Sub-checks | Detection phase |
 |--------|--------|-----------|-----------------|
-| OW-LLM01 | Prompt injection | PI-01a/b, PI-02a, PI-04b | Online + Post-session |
-| OW-LLM02 | Sensitive info disclosure (PII) | SID-01a/c, SID-02a/b/c | Online + Post-session |
+| OW-LLM01 | Prompt injection | PI-01a/b, PI-02a, PI-04b | Post-session |
+| OW-LLM02 | Sensitive info disclosure (PII) | SID-01a/c, SID-02a/b/c | Post-session |
 | OW-LLM03 | Training data poisoning | — | Excluded (not detectable at inference time) |
-| OW-LLM04 | Model denial of service | DMP-01a/c | Post-session (RAG integrity) |
-| OW-LLM05 | Insecure output handling | IOH-01a/b/c, IOH-02a | Online + Post-session |
+| OW-LLM04 | Model denial of service | DMP-01a/c | Post-session |
+| OW-LLM05 | Insecure output handling | IOH-01a/b/c, IOH-02a | Post-session |
 | OW-LLM06 | Excessive agency | EAG-01a, EAG-02a, EAG-03a | Post-session |
-| OW-LLM07 | System prompt leakage | SPL-01a/b, SPL-02a/b, SPL-03b | Online + Post-session |
+| OW-LLM07 | System prompt leakage | SPL-01a/b, SPL-02a/b, SPL-03b | Post-session |
 | OW-LLM08 | Vector / embedding weakness | VEW-01b, VEW-02a | Post-session |
 | OW-LLM09 | Misinformation / overreliance | SAG-01a | Post-session |
 | OW-LLM10 | Model theft / unbounded consumption | UBC-01a, UBC-04a | Post-session |
@@ -331,16 +326,16 @@ Tenant-specific injection detection patterns. Cached in Redis at
 
 | Signal | Threat | Sub-checks | Detection phase |
 |--------|--------|-----------|-----------------|
-| OW-ASI01 | Agent goal hijacking | — | Post-session |
-| OW-ASI02 | Tool misuse & exploitation | TME-01a, TME-03b | Online + Post-session |
-| OW-ASI03 | Identity & privilege abuse | — | Post-session |
-| OW-ASI04 | Agentic supply chain | — | Post-session |
-| OW-ASI05 | Unexpected code execution | RCE-01b, RCE-03a, RCE-03b | Online |
-| OW-ASI06 | Memory & context poisoning | MCP-01a | Online |
-| OW-ASI07 | Insecure inter-agent comms | — | Post-session |
-| OW-ASI08 | Cascading failures | — | Post-session |
-| OW-ASI09 | Human-agent trust exploitation | — | Post-session |
-| OW-ASI10 | Rogue agents | — | Post-session |
+| OW-ASI01 | Agent goal hijacking | AGH-01b | Post-session |
+| OW-ASI02 | Tool misuse & exploitation | TME-01a, TME-03b | Post-session |
+| OW-ASI03 | Identity & privilege abuse | IPA-01a | Post-session |
+| OW-ASI04 | Agentic supply chain | ASCV-01a | Post-session |
+| OW-ASI05 | Unexpected code execution | RCE-01b, RCE-03a, RCE-03b | Post-session |
+| OW-ASI06 | Memory & context poisoning | MCP-01a | Post-session |
+| OW-ASI07 | Insecure inter-agent comms | IAC-01a | Post-session |
+| OW-ASI08 | Cascading failures | CF-01a | Post-session |
+| OW-ASI09 | Human-agent trust exploitation | HAT-01a | Post-session |
+| OW-ASI10 | Rogue agents | RA-01a | Post-session |
 
 ---
 
@@ -389,10 +384,7 @@ to prevent duplicate alerts for the same threat cluster:
 
 | Key pattern | Owner | TTL |
 |-------------|-------|-----|
-| `dp:sec:sigs:{tenant_id}` | `prompt_injection.py` | 300s |
-| `dp:sec:llm_out:{session_id}:{node_run_id}` | `session_ctx.py` | 120s |
-| `dp:sec:tool_out:{session_id}:{node_run_id}` | `session_ctx.py` | 120s |
-| `dp:sec:last_user:{session_id}` | `consumer.py` | configurable |
+| `dp:sec:sigs:{tenant_id}` | `detectors/injection.py` | 300s |
 
 ---
 
@@ -477,9 +469,9 @@ make test-integration   # requires docker compose up from dapplepot_pipeline
 make test               # all
 ```
 
-Unit tests cover all online detectors (81 tests pass without infra), the v2
-scoring model, and the full signal registry. Integration tests run end-to-end
-session scenarios against Postgres and ClickHouse.
+Unit tests cover all detectors (no infra required), the v2 scoring model, and
+the full signal registry. Integration tests run end-to-end session scenarios
+against Postgres with mocked ClickHouse events.
 
 ---
 

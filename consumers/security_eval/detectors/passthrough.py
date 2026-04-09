@@ -63,7 +63,7 @@ def _make_finding(event: dict, sub_check_id: str, check_label: str, check_score:
         severity=severity,
         matched_text=matched_text,
         detail=detail,
-        detection_phase="online",
+        detection_phase="post_session",
     )
 
 

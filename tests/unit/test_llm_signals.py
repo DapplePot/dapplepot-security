@@ -14,7 +14,7 @@ def _finding(owasp_signal_id: str, sub_check_id: str, check_score: int = 85,
         tenant_id=TENANT_ID,
         session_id=SESSION_ID,
         event_id=EVENT_ID,
-        event_type="online",
+        event_type="llm_start",
         owasp_signal_id=owasp_signal_id,
         sub_check_id=sub_check_id,
         check_label="test label",
@@ -22,7 +22,7 @@ def _finding(owasp_signal_id: str, sub_check_id: str, check_score: int = 85,
         category="prompt_injection",
         severity=severity,
         matched_text="...",
-        detection_phase="online",
+        detection_phase="post_session",
     )
 
 
@@ -44,107 +44,6 @@ SESSION = {
     "graph_runs": 1,
     "duration_ms": 500,
 }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-LLM01: signal_ow_llm01 (direct injection from online PI-01a/PI-01b)
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_llm01_fires_on_pi01a():
-    online = [_finding("OW-LLM01", "PI-01a", check_score=85)]
-    result = await signals.signal_ow_llm01([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.owasp_signal_id == "OW-LLM01"
-    assert result.sub_check_id == "PI-01a"
-    assert result.check_score == 85
-
-
-@pytest.mark.asyncio
-async def test_llm01_fires_on_pi01b():
-    online = [_finding("OW-LLM01", "PI-01b", check_score=90)]
-    result = await signals.signal_ow_llm01([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.sub_check_id == "PI-01b"
-    assert result.check_score == 90
-
-
-@pytest.mark.asyncio
-async def test_llm01_silent_without_injection():
-    online = [_finding("OW-LLM02", "SID-02a")]
-    result = await signals.signal_ow_llm01([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-LLM01: signal_ow_llm01_indirect (PI-02a)
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_llm01_indirect_fires_on_pi02a():
-    online = [_finding("OW-LLM01", "PI-02a", check_score=70)]
-    result = await signals.signal_ow_llm01_indirect([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.owasp_signal_id == "OW-LLM01"
-    assert result.sub_check_id == "PI-02a"
-
-
-@pytest.mark.asyncio
-async def test_llm01_indirect_silent_without_pi02a():
-    online = [_finding("OW-LLM01", "PI-01a")]
-    result = await signals.signal_ow_llm01_indirect([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-LLM02: signal_ow_llm02 (PII)
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_llm02_fires_on_critical_pii():
-    online = [_finding("OW-LLM02", "SID-01a", check_score=95, severity="critical")]
-    result = await signals.signal_ow_llm02([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.owasp_signal_id == "OW-LLM02"
-    assert result.check_score == 95
-
-
-@pytest.mark.asyncio
-async def test_llm02_fires_on_high_pii():
-    online = [_finding("OW-LLM02", "SID-02a", check_score=75, severity="high")]
-    result = await signals.signal_ow_llm02([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.check_score == 75
-
-
-@pytest.mark.asyncio
-async def test_llm02_silent_with_no_pii():
-    online = [_finding("OW-LLM01", "PI-01a")]
-    result = await signals.signal_ow_llm02([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-LLM05: signal_ow_llm05 (output passthrough)
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_llm05_fires_on_ioh02a():
-    online = [_finding("OW-LLM05", "IOH-02a", check_score=70)]
-    result = await signals.signal_ow_llm05([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.owasp_signal_id == "OW-LLM05"
-
-
-@pytest.mark.asyncio
-async def test_llm05_fires_on_ioh01a_critical():
-    online = [_finding("OW-LLM05", "IOH-01a", check_score=90, severity="critical")]
-    result = await signals.signal_ow_llm05([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is not None
-    assert result.check_score == 90
-
-
-@pytest.mark.asyncio
-async def test_llm05_silent_on_low_score_passthrough():
-    online = [_finding("OW-LLM05", "IOH-02b", check_score=55, severity="medium")]
-    result = await signals.signal_ow_llm05([], SESSION, TENANT_ID, SESSION_ID, AGENT_ID, online)
-    assert result is None  # check_score < 70 threshold
 
 
 # ─────────────────────────────────────────────────────────────────────────────

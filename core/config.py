@@ -20,7 +20,6 @@ class Settings(BaseSettings):
     security_eval_workers: int = 4
     scorer_version: str = "2.0.0"
     sig_cache_ttl_s: int = 300
-    session_ctx_ttl_s: int = 120
 
     # Legacy single threshold kept for backward compat (now superseded by
     # SIGNAL_ALERT_THRESHOLDS below; composite check still uses this).

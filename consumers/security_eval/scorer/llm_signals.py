@@ -1,8 +1,8 @@
-"""OW-LLM01 through OW-LLM10 signal functions — pure, independently testable.
+"""OW-LLM session-level signal functions — pure, independently testable.
 
-Each function evaluates one OWASP LLM signal and returns a Finding (or None).
-New sub-check helper functions at the bottom add additional detectors that
-the post-session orchestrator calls after the main signal loop.
+These run once per session (post-session) on the full event list from ClickHouse.
+Per-event detectors (injection, PII, passthrough, agentic, prompt guard) live in
+consumers/security_eval/online/ and are called by the orchestrator's event loop.
 """
 import json
 import re
@@ -70,108 +70,6 @@ def _make_finding(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OW-LLM01: Prompt Injection
-# ─────────────────────────────────────────────────────────────────────────────
-async def signal_ow_llm01(
-    events: list[dict],
-    session: dict,
-    tenant_id: str,
-    session_id: str,
-    agent_id: str,
-    online_findings: list["Finding"],
-) -> "Finding | None":
-    """PI-01a — confirmed direct injection (fired from online PI-01a/PI-01b findings)."""
-    hit = next(
-        (f for f in online_findings
-         if f.owasp_signal_id == "OW-LLM01" and f.sub_check_id in ("PI-01a", "PI-01b")),
-        None,
-    )
-    if not hit:
-        return None
-    # Preserve the sub-check from the online finding (could be PI-01a or PI-01b)
-    return _make_finding(
-        "OW-LLM01", hit.sub_check_id, hit.check_label, hit.check_score,
-        session_id, tenant_id,
-        detail=f"Confirmed prompt injection: {hit.detail or hit.matched_text or ''}",
-    )
-
-
-async def signal_ow_llm01_indirect(
-    events: list[dict],
-    session: dict,
-    tenant_id: str,
-    session_id: str,
-    agent_id: str,
-    online_findings: list["Finding"],
-) -> "Finding | None":
-    """PI-02a — indirect injection via retrieved/tool content."""
-    hit = next(
-        (f for f in online_findings
-         if f.owasp_signal_id == "OW-LLM01" and f.sub_check_id == "PI-02a"),
-        None,
-    )
-    if not hit:
-        return None
-    return _make_finding(
-        "OW-LLM01", "PI-02a",
-        "Indirect injection in retrieved content",
-        70, session_id, tenant_id,
-        detail="Indirect injection vector detected in tool/retrieval output",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-LLM02: Sensitive Information Disclosure
-# ─────────────────────────────────────────────────────────────────────────────
-async def signal_ow_llm02(
-    events: list[dict],
-    session: dict,
-    tenant_id: str,
-    session_id: str,
-    agent_id: str,
-    online_findings: list["Finding"],
-) -> "Finding | None":
-    """SID-01a/SID-01c/SID-02a..c — PII and credential leakage."""
-    pii_hits = [f for f in online_findings if f.owasp_signal_id == "OW-LLM02"]
-    if not pii_hits:
-        return None
-    # Return the highest-scoring hit (the orchestrator takes max anyway, but
-    # we need a single Finding here for the legacy status map).
-    best = max(pii_hits, key=lambda f: f.check_score)
-    return _make_finding(
-        "OW-LLM02", best.sub_check_id, best.check_label, best.check_score,
-        session_id, tenant_id,
-        detail=f"PII/credential detected: {', '.join(set(f.sub_check_id for f in pii_hits))}",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OW-LLM05: Improper Output Handling
-# ─────────────────────────────────────────────────────────────────────────────
-async def signal_ow_llm05(
-    events: list[dict],
-    session: dict,
-    tenant_id: str,
-    session_id: str,
-    agent_id: str,
-    online_findings: list["Finding"],
-) -> "Finding | None":
-    """IOH-01a..c / IOH-02a — output passthrough / code injection."""
-    hit = next(
-        (f for f in online_findings
-         if f.owasp_signal_id == "OW-LLM05" and f.check_score >= 70),
-        None,
-    )
-    if not hit:
-        return None
-    return _make_finding(
-        "OW-LLM05", hit.sub_check_id, hit.check_label, hit.check_score,
-        session_id, tenant_id,
-        detail=hit.detail or "LLM output passed to tool without sanitisation",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # OW-LLM06: Excessive Agency
 # ─────────────────────────────────────────────────────────────────────────────
 async def signal_ow_llm06_tool_count(
@@ -180,7 +78,6 @@ async def signal_ow_llm06_tool_count(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """EA-02b — sub-agents spawned / excessive tool calls vs baseline."""
     tool_events = [e for e in events if e["event_type"] == "tool_start"]
@@ -230,7 +127,6 @@ async def signal_ow_llm06_scope(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """EA-01a — tool not in approved manifest invoked."""
     from core.config import settings
@@ -268,7 +164,6 @@ async def signal_ow_llm06_write_on_read(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """EA-01c — data written outside designated namespace (write on read-intent session)."""
     initial_input = session.get("initial_input", "") or ""
@@ -301,7 +196,6 @@ async def signal_ow_llm09(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """MIS-03a — high-stakes action without interrupt (HITL gap)."""
     tool_names = [
@@ -343,10 +237,9 @@ async def signal_ow_llm10_probe(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """UBC-04a — cross-session model theft probe (delegated to cohort.py)."""
-    from consumers.security_eval.scorer.probe_detector import detect_model_theft_probe
+    from consumers.security_eval.scorer.probe import detect_model_theft_probe
     return await detect_model_theft_probe(
         events=events,
         session=session,
@@ -362,7 +255,6 @@ async def signal_ow_llm10_token_spike(
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    online_findings: list["Finding"] | None = None,
 ) -> "Finding | None":
     """UBC-01a — single turn / session token count > 4σ baseline."""
     llm_events = [e for e in events if e["event_type"] == "llm_end"]
@@ -419,7 +311,7 @@ def check_multi_turn_jailbreak(
     Rule: >= 3 llm_start events each containing a sub-threshold injection
           fragment that, when concatenated, matches a full injection pattern.
     """
-    from consumers.security_eval.online.prompt_injection import (
+    from consumers.security_eval.detectors.injection import (
         matches_injection_pattern,
         has_partial_injection_signal,
     )
@@ -461,7 +353,7 @@ def check_rag_integrity(
     baseline: dict,
 ) -> list["Finding"]:
     """DMP-01a (RAG call count spike) and DMP-01c (instruction in retrieved chunk)."""
-    from consumers.security_eval.online.prompt_injection import matches_injection_pattern
+    from consumers.security_eval.detectors.injection import matches_injection_pattern
 
     findings: list["Finding"] = []
     rag_events = [e for e in events if e.get("tool_name") in RAG_TOOL_NAMES]
@@ -645,10 +537,6 @@ def check_vector_integrity(
 # Maps OW signal ID → (primary_signal_fn, description)
 # Used by post_session.py to build llm_signal_status (legacy map) and call all signals.
 SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
-    ("OW-LLM01", signal_ow_llm01),
-    ("OW-LLM01-indirect", signal_ow_llm01_indirect),  # second LLM01 sub-check
-    ("OW-LLM02", signal_ow_llm02),
-    ("OW-LLM05", signal_ow_llm05),
     ("OW-LLM06-count", signal_ow_llm06_tool_count),
     ("OW-LLM06-scope", signal_ow_llm06_scope),
     ("OW-LLM06-write", signal_ow_llm06_write_on_read),
@@ -658,14 +546,10 @@ SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
 ]
 
 SIGNAL_DESCRIPTION = {
-    "OW-LLM01":          "Prompt Injection",
-    "OW-LLM01-indirect": "Prompt Injection (indirect)",
-    "OW-LLM02":          "Sensitive Information Disclosure",
-    "OW-LLM05":          "Improper Output Handling",
-    "OW-LLM06-count":    "Excessive Agency (tool count)",
-    "OW-LLM06-scope":    "Excessive Agency (scope violation)",
-    "OW-LLM06-write":    "Excessive Agency (write on read-intent)",
-    "OW-LLM09":          "Misinformation / HITL Gap",
-    "OW-LLM10-probe":    "Unbounded Consumption (model theft probe)",
-    "OW-LLM10-spike":    "Unbounded Consumption (token spike)",
+    "OW-LLM06-count": "Excessive Agency (tool count)",
+    "OW-LLM06-scope": "Excessive Agency (scope violation)",
+    "OW-LLM06-write": "Excessive Agency (write on read-intent)",
+    "OW-LLM09":       "Misinformation / HITL Gap",
+    "OW-LLM10-probe": "Unbounded Consumption (model theft probe)",
+    "OW-LLM10-spike": "Unbounded Consumption (token spike)",
 }

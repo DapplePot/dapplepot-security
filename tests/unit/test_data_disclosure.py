@@ -2,7 +2,7 @@
 import pytest
 
 from tests.conftest import make_event
-from consumers.security_eval.online.data_disclosure import detect_pii, _redact
+from consumers.security_eval.detectors.disclosure import detect_pii, _redact
 
 
 def _llm_end(completion: str) -> dict:
@@ -97,11 +97,11 @@ def test_tool_end_reads_tool_output_field():
     assert any(f.sub_check_id == "SID-02a" for f in findings)
 
 
-def test_detection_phase_is_online():
+def test_detection_phase_is_post_session():
     event = _llm_end("Card: 4111111111111111")
     findings = detect_pii(event)
     for f in findings:
-        assert f.detection_phase == "online"
+        assert f.detection_phase == "post_session"
 
 
 def test_signal_id_format():

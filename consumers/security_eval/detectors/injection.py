@@ -128,7 +128,7 @@ def _build_finding(event: dict, sub_check_id: str, matched_text: str) -> "Findin
         category="prompt_injection",
         severity=meta["severity"],
         matched_text=matched_text,
-        detection_phase="online",
+        detection_phase="post_session",
     )
 
 
@@ -138,7 +138,9 @@ async def detect_injection(
     tenant_id: str | None = None,
 ) -> list["Finding"]:
     findings = []
-    messages = event["payload"].get("messages", [])
+    messages = (event.get("payload") or {}).get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
     blocklist = await _load_blocklist(tenant_id)
 
     for msg in messages:

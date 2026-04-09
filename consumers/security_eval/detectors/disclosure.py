@@ -109,6 +109,6 @@ def detect_pii(event: dict) -> list["Finding"]:
             severity=sig["severity"],
             matched_text=_redact(match.group(0)),
             detail=sig["name"],
-            detection_phase="online",
+            detection_phase="post_session",
         ))
     return findings

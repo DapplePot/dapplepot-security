@@ -1,5 +1,5 @@
 """
-Integration tests for online detection.
+Integration tests for per-event detectors (run post-session, replayed from ClickHouse).
 Requires: docker compose up -d from dapplepot_pipeline (Kafka, Postgres, Redis).
 """
 import pytest
@@ -9,8 +9,8 @@ import asyncpg
 from core.config import settings
 from tests.conftest import SESSION_ID, TENANT_ID, AGENT_ID, EVENT_ID, NODE_RUN_ID, make_event
 from consumers.security_eval.findings import write_findings
-from consumers.security_eval.online.prompt_injection import detect_injection
-from consumers.security_eval.online.data_disclosure import detect_pii
+from consumers.security_eval.detectors.injection import detect_injection
+from consumers.security_eval.detectors.disclosure import detect_pii
 
 
 @pytest.fixture(scope="module")
@@ -30,7 +30,7 @@ async def test_inject_prompt_scenario(pg):
 
     from unittest.mock import AsyncMock, patch
     with patch(
-        "consumers.security_eval.online.prompt_injection._load_blocklist",
+        "consumers.security_eval.detectors.injection._load_blocklist",
         new=AsyncMock(return_value=[]),
     ):
         findings = await detect_injection(event)
@@ -45,7 +45,7 @@ async def test_inject_prompt_scenario(pg):
     assert any(r["owasp_signal_id"] == "OW-LLM01" for r in rows)
     llm01_row = next(r for r in rows if r["owasp_signal_id"] == "OW-LLM01")
     assert llm01_row["severity"] in ("critical", "high")
-    assert llm01_row["detection_phase"] == "online"
+    assert llm01_row["detection_phase"] == "post_session"
 
     # Cleanup
     await pg.execute("DELETE FROM security_findings WHERE session_id = $1", SESSION_ID)
@@ -87,7 +87,7 @@ async def test_happy_checkout_scenario_no_false_positives(pg):
 
     from unittest.mock import AsyncMock, patch
     with patch(
-        "consumers.security_eval.online.prompt_injection._load_blocklist",
+        "consumers.security_eval.detectors.injection._load_blocklist",
         new=AsyncMock(return_value=[]),
     ):
         findings = await detect_injection(event)

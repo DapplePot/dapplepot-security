@@ -2,7 +2,7 @@
 import pytest
 
 from tests.conftest import SESSION_ID, TENANT_ID, AGENT_ID, EVENT_ID
-from consumers.security_eval.online.agentic_threats import (
+from consumers.security_eval.detectors.agentic import (
     detect_agent_threats_on_tool_start,
     detect_agent_threats_on_llm_start,
 )

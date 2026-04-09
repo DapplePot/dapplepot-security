@@ -89,7 +89,7 @@ def _make_finding(
         severity=severity,
         matched_text=matched_text[:300] if matched_text else None,
         detail=detail,
-        detection_phase="online",
+        detection_phase="post_session",
     )
 
 

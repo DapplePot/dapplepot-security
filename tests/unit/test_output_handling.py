@@ -2,7 +2,7 @@
 import pytest
 
 from tests.conftest import make_event
-from consumers.security_eval.online.output_handling import detect_passthrough, _lcs_ratio
+from consumers.security_eval.detectors.passthrough import detect_passthrough, _lcs_ratio
 
 
 def _tool_start(tool_input: dict) -> dict:
