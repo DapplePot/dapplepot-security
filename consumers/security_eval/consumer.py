@@ -12,19 +12,24 @@ from confluent_kafka import KafkaError
 from core.config import settings
 from core.infra.kafka import make_consumer, make_producer
 from core.infra.postgres import close_pool
-from core.infra.redis import close_redis
+from core.infra.redis import close_redis, get_redis
 
 from consumers.security_eval.findings import Finding, write_findings
-from consumers.security_eval.redis_ctx import (
+from consumers.security_eval.session_ctx import (
     get_llm_output,
     get_tool_output,
     store_llm_output,
     store_tool_output,
 )
-from consumers.security_eval.online.injection import detect_injection
-from consumers.security_eval.online.passthrough import detect_passthrough
-from consumers.security_eval.online.pii import detect_pii
-from consumers.security_eval.scorer.post_session import score_session
+from consumers.security_eval.online.prompt_injection import detect_injection
+from consumers.security_eval.online.output_handling import detect_passthrough
+from consumers.security_eval.online.data_disclosure import detect_pii
+from consumers.security_eval.online.agentic_threats import (
+    detect_agent_threats_on_tool_start,
+    detect_agent_threats_on_llm_start,
+)
+from consumers.security_eval.online.system_prompt import check_prompt_guard
+from consumers.security_eval.scorer.orchestrator import score_session
 
 LOGGING_CONFIG = {
     "version": 1,
@@ -73,8 +78,32 @@ def _send_to_dlq(raw_bytes: bytes, error: Exception, offset: int) -> None:
     except Exception:
         logger.exception('"DLQ produce failed"')
 
+
 # Per-session accumulator: session_id → list[Finding] (online findings only)
 _session_findings: dict[str, list[Finding]] = {}
+
+
+async def _store_last_user_turn(session_id: str, messages: list[dict]) -> None:
+    """Store the last user-role message in Redis for prompt_guard SPL-01b."""
+    user_turns = [
+        str(m.get("content", ""))
+        for m in reversed(messages)
+        if m.get("role") in ("user", "human")
+    ]
+    if not user_turns:
+        return
+    redis = await get_redis()
+    await redis.setex(
+        f"dp:sec:last_user:{session_id}",
+        settings.session_ctx_ttl_s,
+        user_turns[0],
+    )
+
+
+async def _get_last_user_turn(session_id: str) -> str:
+    redis = await get_redis()
+    value = await redis.get(f"dp:sec:last_user:{session_id}")
+    return value.decode() if value else ""
 
 
 async def _handle_event(event: dict) -> None:
@@ -82,6 +111,7 @@ async def _handle_event(event: dict) -> None:
     session_id = event.get("session_id")
     node_run_id = event.get("node_run_id", "")
     tenant_id = event.get("tenant_id")
+    agent_id = event.get("agent_id")
 
     if not session_id:
         return
@@ -91,17 +121,33 @@ async def _handle_event(event: dict) -> None:
     if event_type == "llm_start":
         last_tool_out = await get_tool_output(session_id, node_run_id)
         findings = await detect_injection(event, last_tool_output=last_tool_out, tenant_id=tenant_id)
+        findings += detect_agent_threats_on_llm_start(event)
+        # Store last user turn for prompt_guard (runs on llm_end)
+        messages = event.get("payload", {}).get("messages", [])
+        await _store_last_user_turn(session_id, messages)
 
     elif event_type == "llm_end":
         completion = event["payload"].get("completion", "")
         await store_llm_output(session_id, node_run_id, completion)
         findings = detect_pii(event)
+        # OW-LLM07: system prompt leakage check
+        last_user_turn = await _get_last_user_turn(session_id)
+        # agent_manifest: in a full deployment, load from a manifest store.
+        # Here we pass an empty manifest — SPL-01a only fires when a
+        # system_prompt_prefix is configured.
+        agent_manifest: dict = {}
+        pg_findings = check_prompt_guard(
+            event,
+            session_ctx={"last_user_turn": last_user_turn},
+            agent_manifest=agent_manifest,
+        )
+        findings += pg_findings
 
     elif event_type == "tool_start":
         last_llm_out = await get_llm_output(session_id, node_run_id)
-        pt_finding = await detect_passthrough(event, last_llm_output=last_llm_out)
-        if pt_finding:
-            findings = [pt_finding]
+        pt_findings = await detect_passthrough(event, last_llm_output=last_llm_out)
+        findings = pt_findings
+        findings += detect_agent_threats_on_tool_start(event)
 
     elif event_type == "tool_end":
         tool_output = event["payload"].get("tool_output", "")
@@ -109,7 +155,6 @@ async def _handle_event(event: dict) -> None:
         findings = detect_pii(event)
 
     elif event_type in ("graph_end", "graph_error"):
-        agent_id = event.get("agent_id")
         session_online_findings = _session_findings.pop(session_id, [])
         asyncio.create_task(
             score_session(
@@ -122,7 +167,6 @@ async def _handle_event(event: dict) -> None:
         return  # scorer handles its own writes
 
     if findings:
-        # Accumulate for post-session scorer
         _session_findings.setdefault(session_id, []).extend(findings)
         await write_findings(findings)
 
@@ -151,7 +195,6 @@ async def run() -> None:
 
     try:
         while not stopped.done():
-            # Poll Kafka in a thread to avoid blocking the event loop
             msg = await loop.run_in_executor(executor, lambda: consumer.poll(timeout=1.0))
 
             if msg is None:
@@ -167,8 +210,6 @@ async def run() -> None:
                 await _handle_event(event)
                 consumer.commit(msg)
             except Exception as exc:
-                # Send to DLQ so the event isn't lost and commit so the consumer
-                # doesn't stall on the same offset indefinitely.
                 logger.exception('"Processing failed, sending to DLQ offset=%s"', msg.offset())
                 _send_to_dlq(msg.value(), exc, msg.offset())
                 consumer.commit(msg)

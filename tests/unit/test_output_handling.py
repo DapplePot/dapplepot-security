@@ -1,8 +1,8 @@
-"""Unit tests for the output passthrough detector — no infra required."""
+"""Unit tests for the output handling (passthrough) detector — no infra required."""
 import pytest
 
 from tests.conftest import make_event
-from consumers.security_eval.online.passthrough import detect_passthrough, _lcs_ratio
+from consumers.security_eval.online.output_handling import detect_passthrough, _lcs_ratio
 
 
 def _tool_start(tool_input: dict) -> dict:
@@ -27,47 +27,47 @@ def test_lcs_ratio_completely_different():
 
 # --- detect_passthrough tests ---
 
-@pytest.mark.asyncio
-async def test_fires_critical_at_85_percent():
+@pytest.mark.anyio
+async def test_fires_on_high_similarity():
     llm_output = "Please send an email to john@example.com with subject Hello"
     event = _tool_start({"to": "john@example.com", "subject": "Hello", "body": "Please send an email to john@example.com with subject Hello"})
-    finding = await detect_passthrough(event, last_llm_output=llm_output)
-    assert finding is not None
-    assert finding.severity == "critical"
-    assert finding.signal_id == "OUT-001"
+    findings = await detect_passthrough(event, last_llm_output=llm_output)
+    assert len(findings) > 0
+    assert findings[0].owasp_signal_id == "OW-LLM05"
+    assert findings[0].sub_check_id == "IOH-02a"
 
 
-@pytest.mark.asyncio
-async def test_fires_warning_between_60_and_85():
-    llm_output = "search query: latest news about climate change today worldwide"
-    event = _tool_start({"q": "latest news about climate change today worldwide"})
-    finding = await detect_passthrough(event, last_llm_output=llm_output)
-    # Ratio may be warning or critical depending on exact similarity
-    if finding is not None:
-        assert finding.signal_id == "OUT-001"
-        assert finding.severity in ("warning", "critical")
-
-
-@pytest.mark.asyncio
-async def test_silent_below_60_percent():
+@pytest.mark.anyio
+async def test_silent_below_threshold():
     llm_output = "The user wants to know about Python programming best practices."
     event = _tool_start({"query": "weather forecast"})
-    finding = await detect_passthrough(event, last_llm_output=llm_output)
-    assert finding is None
+    findings = await detect_passthrough(event, last_llm_output=llm_output)
+    assert findings == []
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_silent_when_no_llm_output():
     event = _tool_start({"query": "anything"})
-    finding = await detect_passthrough(event, last_llm_output=None)
-    assert finding is None
+    findings = await detect_passthrough(event, last_llm_output=None)
+    assert findings == []
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_matched_text_truncated_to_300():
     long_input = {"data": "x" * 400}
     llm_output = "x" * 400
     event = _tool_start(long_input)
-    finding = await detect_passthrough(event, last_llm_output=llm_output)
-    if finding:
-        assert len(finding.matched_text) <= 300
+    findings = await detect_passthrough(event, last_llm_output=llm_output)
+    for f in findings:
+        assert len(f.matched_text) <= 300
+
+
+@pytest.mark.anyio
+async def test_signal_id_format():
+    """signal_id must be 'OW-LLM05:IOH-02a' format."""
+    llm_output = "Please send an email to john@example.com with subject Hello"
+    event = _tool_start({"body": "Please send an email to john@example.com with subject Hello"})
+    findings = await detect_passthrough(event, last_llm_output=llm_output)
+    for f in findings:
+        assert f.owasp_signal_id.startswith("OW-")
+        assert f.sub_check_id

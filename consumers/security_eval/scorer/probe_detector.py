@@ -1,4 +1,4 @@
-"""S-09: Cross-session model theft probe detection."""
+"""L-09: Cross-session model theft probe detection."""
 import json
 import re
 from difflib import SequenceMatcher
@@ -99,12 +99,13 @@ async def detect_model_theft_probe(
         session_id=session_id,
         event_id="00000000-0000-0000-0000-000000000000",
         event_type="post_session",
-        signal_id="S-09",
-        sig_type="scorer",
-        owasp_id="LLM10",
-        severity="warning",
+        owasp_signal_id="OW-LLM10",
+        sub_check_id="UBC-04a",
+        check_label="Cohort probe pattern detected",
+        check_score=70,
+        category="model_security",
+        severity="high",
         matched_text=None,
         detail=f"Cross-session model theft probe: {similar_count + 1} near-identical sessions for user_context_id={user_context_id}",
-        score_contrib=10,
         detection_phase="post_session",
     )

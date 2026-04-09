@@ -9,29 +9,29 @@ This script:
      detectors would have produced if the sessions had run live through Kafka).
   2. Writes those online findings to security_findings.
   3. Calls the post-session scorer directly against each session's ClickHouse
-     event history so S-05–S-10 are also computed.
+     event history so L-05–L-10 are also computed.
 
 Why online_findings must be pre-built:
-  - S-01–S-04 in the scorer only look at online_findings passed in — they do
+  - L-01–L-04 in the scorer only look at online_findings passed in — they do
     not re-run the online detectors. Passing [] means all four are silent.
 
-Why S-05 and S-10 remain silent:
+Why L-05 and L-10 remain silent:
   - Both signals query ClickHouse with `agent_id = %(agent_id)s`. The seeded
     obs_events rows store the agent name string ("langgraph_checkout") but
     score_session receives the UUID (TEST_AGENT_ID). Zero rows match →
     no baseline → both signals return None.
   - Fixing this would require modifying post_session.py (which also writes
-    agent_id to Postgres as a UUID FK). S-05/S-10 require a 7-day baseline
+    agent_id to Postgres as a UUID FK). L-05/L-10 require a 7-day baseline
     anyway — they are silent in any fresh deployment until history accumulates.
     The pre-built online findings for SES_003/004/005 already give the UI
     meaningful OWASP signals and remediation data.
 
 Expected scores after seeding:
-  SES_001  clean   (score 0)   — successful checkout, no security issues
-  SES_002  clean   (score 0)   — in-progress, no security issues
-  SES_003  medium  (score 40)  — INJ-001 → S-01 (+40)
-  SES_004  high    (score 70)  — INJ-001 + OUT-001 → S-01 (+40) + S-03 (+30)
-  SES_005  low     (score 35)  — PII-001 credit card → S-04 (+35)
+  SES_001  clean    (score 0)   — successful checkout, no security issues
+  SES_002  clean    (score 0)   — in-progress, no security issues
+  SES_003  high     (score 85)  — OW-LLM01:PI-01a (role-override injection)
+  SES_004  high     (score 79)  — OW-LLM01:PI-01a + OW-LLM05:IOH-02a (composite weighted)
+  SES_005  critical (score 90)  — OW-LLM02:SID-02b (credit card in output)
 
 Run automatically via: make setup  (after pipeline make seed-dev)
 """
@@ -60,22 +60,26 @@ SES_005 = "00000000-0000-0000-0000-000000001005"
 # during live processing. Written to security_findings before score_session
 # runs, then passed into the scorer so S-01–S-04 can aggregate them.
 # ---------------------------------------------------------------------------
-def _make_online(session_id, signal_id, sig_type, owasp_id, severity,
-                 event_type, matched_text, detail, score_contrib=0):
+def _make_online(session_id, owasp_signal_id, sub_check_id, check_label,
+                 check_score, sig_type, severity, event_type,
+                 matched_text, detail, owasp_framework="LLM"):
     from consumers.security_eval.findings import Finding
     return Finding(
         tenant_id=TEST_TENANT_ID,
         session_id=session_id,
         event_id=_NULL_UUID,
         event_type=event_type,
-        signal_id=signal_id,
+        owasp_signal_id=owasp_signal_id,
+        sub_check_id=sub_check_id,
+        check_label=check_label,
+        check_score=check_score,
         sig_type=sig_type,
-        owasp_id=owasp_id,
         severity=severity,
-        score_contrib=score_contrib,
+        score_contrib=check_score,
         detection_phase="online",
         matched_text=matched_text,
         detail=detail,
+        owasp_framework=owasp_framework,
     )
 
 
@@ -85,46 +89,51 @@ def _build_online_findings() -> dict[str, list]:
         SES_001: [],
         SES_002: [],
 
-        # SES_003 — INJ-001 in validator node llm_start → S-01 fires (+40)
+        # SES_003 — OW-LLM01:PI-01a (role-override injection)
+        #           composite LLM score ~85 → high
         SES_003: [
             _make_online(
                 SES_003,
-                signal_id="INJ-001", sig_type="injection",
-                owasp_id="LLM01", severity="critical",
+                owasp_signal_id="OW-LLM01", sub_check_id="PI-01a",
+                check_label="Role-override phrase match",
+                check_score=85, sig_type="injection", severity="high",
                 event_type="llm_start",
                 matched_text="ignore all prev***uctions...",
                 detail="Instruction override pattern matched in user message",
             ),
         ],
 
-        # SES_004 — INJ-001 + OUT-001 critical (code_exec input mirrors llm output)
-        #           S-01 (+40) + S-03 (+30) = 70 → high
+        # SES_004 — OW-LLM01:PI-01a + OW-LLM05:IOH-02a
+        #           composite = max(85)×0.6 + mean(70)×0.4 = 51+28 = 79 → high
         SES_004: [
             _make_online(
                 SES_004,
-                signal_id="INJ-001", sig_type="injection",
-                owasp_id="LLM01", severity="critical",
+                owasp_signal_id="OW-LLM01", sub_check_id="PI-01a",
+                check_label="Role-override phrase match",
+                check_score=85, sig_type="injection", severity="high",
                 event_type="llm_start",
                 matched_text="disregard prev*** instructions...",
                 detail="Instruction override pattern matched in user message",
             ),
             _make_online(
                 SES_004,
-                signal_id="OUT-001", sig_type="passthrough",
-                owasp_id="LLM02", severity="critical",
+                owasp_signal_id="OW-LLM05", sub_check_id="IOH-02a",
+                check_label="Raw LLM output as tool param",
+                check_score=70, sig_type="passthrough", severity="high",
                 event_type="tool_start",
                 matched_text="import os; os.sy***('ls')",
                 detail="tool_start input 92% similar to preceding llm_end output",
             ),
         ],
 
-        # SES_005 — PII-001 credit card number in tool_end output
-        #           S-04 (+35) = 35 → low
+        # SES_005 — OW-LLM02:SID-02b credit card
+        #           composite = 90 → critical
         SES_005: [
             _make_online(
                 SES_005,
-                signal_id="PII-001", sig_type="pii",
-                owasp_id="LLM06", severity="critical",
+                owasp_signal_id="OW-LLM02", sub_check_id="SID-02b",
+                check_label="Financial identifiers in output",
+                check_score=90, sig_type="pii", severity="critical",
                 event_type="tool_end",
                 matched_text="41**...1234",
                 detail="Credit card number detected in tool output",
@@ -144,7 +153,7 @@ SESSIONS = [
 
 async def seed() -> None:
     from consumers.security_eval.findings import write_findings
-    from consumers.security_eval.scorer.post_session import score_session
+    from consumers.security_eval.scorer.orchestrator import score_session
     from core.infra.postgres import get_pool, close_pool
 
     online_findings_map = _build_online_findings()
@@ -170,7 +179,7 @@ async def seed() -> None:
             await write_findings(online_findings)
 
         # Run post-session scorer with the UUID.
-        # S-05/S-10 baseline queries will find no ClickHouse rows (name/UUID
+        # L-05/L-10 baseline queries will find no ClickHouse rows (name/UUID
         # mismatch) and return None — acceptable for seed data.
         score = await score_session(
             tenant_id=TEST_TENANT_ID,
