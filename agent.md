@@ -651,7 +651,7 @@ tests/unit/test_llm_signals.py
 tests/unit/test_asi_signals.py
 tests/unit/test_scoring.py
 tests/unit/test_signal_registry.py
-tests/integration/test_online_detection.py
+tests/integration/test_detectors.py
 tests/integration/test_post_session_scorer.py
 ```
 
