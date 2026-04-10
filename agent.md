@@ -82,30 +82,47 @@ dapplepot_security/
 │   └── security_eval/                      ← consumer group: dp-security-eval (30 workers)
 │       ├── __init__.py
 │       ├── consumer.py                     ← Kafka poll loop; triggers score_session on graph_end/graph_error
-│       ├── findings.py                     ← Finding dataclass, PG batch writer, alert producer
+│       ├── findings.py                     ← Finding dataclass (with confidence_tier + confidence), PG batch writer, alert producer
 │       │
 │       ├── detectors/                      ← per-event detectors (replayed post-session from ClickHouse)
 │       │   ├── __init__.py
 │       │   ├── injection.py                ← OW-LLM01: PI-01a (role-override), PI-01b (delimiter),
-│       │   │                                  PI-02a (indirect from tool output)
+│       │   │                                  PI-02a (indirect), PI-05a (code injection),
+│       │   │                                  PI-07a (multimodal), PI-08a (adversarial suffix),
+│       │   │                                  PI-09a (obfuscated/encoded)
 │       │   ├── disclosure.py               ← OW-LLM02: SID-01a/c (API keys, JWT),
 │       │   │                                  SID-02a/b/c (email, card, SSN)
 │       │   ├── passthrough.py              ← OW-LLM05: IOH-01a/b/c (shell/XSS/SQL in output),
 │       │   │                                  IOH-02a (raw LLM output as tool param, LCS ratio)
-│       │   ├── agentic.py                  ← OW-ASI02: TME-01a (tool misuse), TME-03b (prod target)
+│       │   ├── agentic.py                  ← OW-ASI01: AGH-04a (doc injection on tool_end)
+│       │   │                                  OW-ASI02: TME-01a (tool misuse), TME-03b (prod target)
+│       │   │                                  OW-ASI04: ASCV-02a (MCP descriptor poisoning),
+│       │   │                                             ASCV-04a (unknown package install)
 │       │   │                                  OW-ASI05: RCE-01b (exec tool name), RCE-03a (escape path),
-│       │   │                                             RCE-03b (Docker/K8s API)
+│       │   │                                             RCE-03b (Docker/K8s API), RCE-06a (unsafe deser),
+│       │   │                                             RCE-08a (lockfile manipulation)
 │       │   │                                  OW-ASI06: MCP-01a (context injection in messages)
+│       │   │                                  OW-ASI10: RA-04a (self-replication via provisioning)
 │       │   └── prompt_guard.py             ← OW-LLM07: SPL-01a (LCS vs system prefix),
 │       │                                      SPL-01b (probe pattern + non-refusal)
 │       │
 │       └── scorer/                         ← post-session scorer (reads ClickHouse, writes PG)
 │           ├── __init__.py
-│           ├── orchestrator.py             ← score_session(): replays events, runs all signals, writes scores, fires alerts
+│           ├── orchestrator.py             ← score_session() v3: replays events, runs all signals,
+│           │                                  confidence weighting, attack chains, trust, writes scores, fires alerts
 │           ├── llm_signals.py              ← OW-LLM01..10 signal functions + sub-check helpers
-│           │                                  (check_multi_turn_jailbreak, check_rag_integrity,
-│           │                                   check_system_prompt_leakage, check_vector_integrity)
-│           ├── asi_signals.py              ← OW-ASI01..10 signal functions
+│           │                                  (check_multi_turn_jailbreak, check_payload_splitting,
+│           │                                   check_rag_integrity, check_system_prompt_leakage,
+│           │                                   check_vector_integrity, check_insecure_code_output,
+│           │                                   check_hallucinated_packages, check_ungrounded_high_stakes,
+│           │                                   check_input_size_anomaly)
+│           ├── asi_signals.py              ← OW-ASI01..10 signal functions (all v3 sub-checks)
+│           ├── cross_session.py            ← cross-session signals: SID-03a, UBC-03a/05a,
+│           │                                  IPA-05a, MCP-02a/04a, RA-02a
+│           ├── attack_chains.py            ← detect_attack_chains(fired_signals) → (chains, amplification)
+│           │                                  7 chains, max-not-product amplification
+│           ├── trust.py                    ← compute_agent_trust_score(agent_id, sessions)
+│           │                                  Bayesian Beta(2,8) prior + temporal decay (λ=0.05/day) + trend
 │           └── probe.py                    ← OW-LLM10: UBC-04a cross-session model theft probe
 │
 ├── core/
@@ -131,7 +148,11 @@ dapplepot_security/
 │       ├── 009_drop_session_fk.sql         ← drops sessions FK (race condition fix)
 │       ├── 010_signal_id_upgrade.sql       ← adds owasp_signal_id, sub_check_id, check_score, check_label
 │       ├── 011_signal_status_upgrade.sql   ← adds ow_llm_signal_status / ow_asi_signal_status JSONB + GIN idx
-│       └── 012_signal_registry.sql         ← signal_registry table (PK: owasp_signal_id + sub_check_id)
+│       ├── 012_signal_registry.sql         ← signal_registry table (PK: owasp_signal_id + sub_check_id)
+│       ├── 013_v3_scoring.sql              ← v3: confidence_tier on signal_registry + security_findings;
+│       │                                      v3_llm_composite / v3_asi_composite JSONB on session_risk_scores
+│       └── 014_trust_scores.sql            ← v3: trust_score, trust_alpha, trust_beta, trust_trend,
+│                                              trust_last_updated on agent_risk_scores
 │
 ├── tests/
 │   ├── conftest.py
@@ -139,20 +160,22 @@ dapplepot_security/
 │   │   ├── test_prompt_injection.py        ← OW-LLM01 injection detector
 │   │   ├── test_data_disclosure.py         ← OW-LLM02 disclosure detector
 │   │   ├── test_output_handling.py         ← OW-LLM05 passthrough detector
-│   │   ├── test_agentic_threats.py         ← OW-ASI02/05/06 agentic detectors
-│   │   ├── test_llm_signals.py             ← OW-LLM01..10 post-session signal functions
-│   │   ├── test_asi_signals.py             ← OW-ASI01..10 post-session signal functions
-│   │   ├── test_scoring.py                 ← v2 scoring model (compute_ow_signal_score,
-│   │   │                                      compute_composite_score, resolve_overlap_group)
-│   │   └── test_signal_registry.py         ← REGISTRY coverage; runs without DB
+│   │   ├── test_agentic_threats.py         ← OW-ASI agentic detectors (incl. AGH-04a, ASCV-02a/04a, RCE-06a/08a, RA-04a, MCP-03a)
+│   │   ├── test_llm_signals.py             ← OW-LLM01..10 (incl. PI-06a, IOH-04a, SAG-02a/03a, UBC-02a, LLM04/08 exclusion)
+│   │   ├── test_asi_signals.py             ← OW-ASI01..10 (all v3 sub-checks)
+│   │   ├── test_scoring_v3.py              ← v3: confidence weighting, composite, attack chain amplification
+│   │   ├── test_attack_chains.py           ← 7 chains fire/silent, max amplification
+│   │   ├── test_trust.py                   ← Bayesian prior, update, decay, trend
+│   │   ├── test_cross_session.py           ← SID-03a, UBC-03a/05a, IPA-05a, MCP-02a/04a, RA-02a
+│   │   └── test_signal_registry.py         ← 156 entries, all 20 signals, confidence_tier coverage; runs without DB
 │   └── integration/
 │       ├── test_detectors.py               ← detector scenarios against Postgres
-│       └── test_post_session_scorer.py     ← end-to-end scorer with mocked ClickHouse events
+│       └── test_post_session_scorer.py     ← v3 end-to-end: composite, attack chains, trust, scorer_version
 │
 └── scripts/
     ├── run_migrations.py                   ← runs db/postgres/ in numeric order
     ├── seed_signatures.py                  ← seeds injection_signatures for dapplepot_dev tenant
-    ├── seed_signal_registry.py             ← upserts all 121 sub-checks into signal_registry
+    ├── seed_signal_registry.py             ← upserts all 156 sub-checks with confidence_tier
     ├── seed_dev_scores.py                  ← backfills security_findings + session_risk_scores
     │                                          for SES_001–SES_005 (calls score_session() directly)
     └── health_check.py                     ← consumer lag check (make health)
@@ -197,28 +220,28 @@ The `signal_id` stored in `security_findings` has the format `"OW-LLM01:PI-01a"`
 All 20 signals are detected post-session. Per-event detectors run inside `score_session()`
 by replaying ClickHouse events in sequence.
 
-| Signal | Sub-checks | Detector / signal function |
-|--------|-----------|---------------------------|
-| OW-LLM01 | PI-01a (role-override, 85), PI-01b (delimiter, 90), PI-02a (indirect, 70), PI-04b (multi-turn, 92) | `injection.py` + `check_multi_turn_jailbreak` |
-| OW-LLM02 | SID-01a (API key, 95), SID-01c (JWT, 90), SID-02a (email, 75), SID-02b (card, 90), SID-02c (SSN, 95) | `disclosure.py` |
+| Signal | Key sub-checks (score, confidence_tier) | Detector / signal function |
+|--------|----------------------------------------|---------------------------|
+| OW-LLM01 | PI-01a (85, high), PI-01b (90, deterministic), PI-02a (70, high), PI-04b (92, high), PI-05a (80, high), PI-06a (88, high), PI-07a (60, low), PI-08a (75, medium), PI-09a (82, high) | `injection.py` + `check_multi_turn_jailbreak` + `check_payload_splitting` |
+| OW-LLM02 | SID-01a (95, deterministic), SID-01c (90, deterministic), SID-02a/b/c (75–95, deterministic), SID-03a (95, high, cross_session) | `disclosure.py` + `cross_session.py` |
 | OW-LLM03 | — (excluded: not detectable at inference time) | — |
-| OW-LLM04 | DMP-01a (RAG count spike, 70), DMP-01c (instruction in chunk, 85) | `llm_signals.py` |
-| OW-LLM05 | IOH-01a (shell pattern, 90), IOH-01b (XSS, 85), IOH-01c (SQL injection, 90), IOH-02a (raw passthrough, 70) | `passthrough.py` |
-| OW-LLM06 | EAG-01a (tool count > baseline, 60), EAG-02a (out-of-scope tool, 75), EAG-03a (write on read-intent, 80) | `llm_signals.py` |
-| OW-LLM07 | SPL-01a (prefix similarity, 85), SPL-01b (probe + non-refusal, 70), SPL-02a/b (75), SPL-03b (80) | `prompt_guard.py` + `llm_signals.py` |
-| OW-LLM08 | VEW-01b (vector drift, 70), VEW-02a (poisoned retrieval, 85) | `llm_signals.py` |
-| OW-LLM09 | SAG-01a (high-stakes without HITL, 65) | `llm_signals.py` |
-| OW-LLM10 | UBC-01a (token spike 4σ, 55), UBC-04a (cross-session probe, 70) | `llm_signals.py` + `probe.py` |
-| OW-ASI01 | AGH-01b (goal hijacking, 80) | `asi_signals.py` (`signal_a01`) |
-| OW-ASI02 | TME-01a (shell chain / base64, 65), TME-03b (prod target, 95) | `agentic.py` |
-| OW-ASI03 | IPA-01a (privilege escalation tool, 80) | `asi_signals.py` |
-| OW-ASI04 | ASCV-01a (unknown tools 100%, 75) | `asi_signals.py` |
-| OW-ASI05 | RCE-01b (exec tool name, 95), RCE-03a (container escape path, 98), RCE-03b (Docker/K8s API, 98) | `agentic.py` |
-| OW-ASI06 | MCP-01a (context injection phrase, 88) | `agentic.py` |
-| OW-ASI07 | IAC-01a (delegation tool, 85) | `asi_signals.py` |
-| OW-ASI08 | CF-01a (error after many tools, 75) | `asi_signals.py` |
-| OW-ASI09 | HAT-01a (authority + high-stakes, 80) | `asi_signals.py` |
-| OW-ASI10 | RA-01a (tool usage anomaly 3σ, 80) | `asi_signals.py` |
+| OW-LLM04 | DMP-01a/c — **excluded** (pre-runtime) | `llm_signals.py` returns None |
+| OW-LLM05 | IOH-01a/b/c (85–90, deterministic), IOH-02a (70, medium), IOH-03a (80, high), IOH-04a (70, medium) | `passthrough.py` + `check_insecure_code_output` |
+| OW-LLM06 | EA-01a..03b (65–98, high) | `llm_signals.py` |
+| OW-LLM07 | SPL-01a/b (70–85, medium), SPL-02a/b (50–60, medium), SPL-03a/b (80–88, medium/high) | `prompt_guard.py` + `llm_signals.py` |
+| OW-LLM08 | VEW-01b/02a — **excluded** (pre-runtime). VEW-01a/02b/03a active | `llm_signals.py` returns None for excluded |
+| OW-LLM09 | SAG-01a (65, high), SAG-02a (65, low), SAG-03a (60, medium) | `llm_signals.py` |
+| OW-LLM10 | UBC-01a (55, medium), UBC-02a (50, medium), UBC-04a (70, high), UBC-03a/05a (cross_session) | `llm_signals.py` + `probe.py` + `cross_session.py` |
+| OW-ASI01 | AGH-01a/b (80–92, high), AGH-02a (85, high), AGH-03a (70, medium), AGH-04a (80, high) | `agentic.py` + `asi_signals.py` |
+| OW-ASI02 | TME-01a/03b (65–95), TME-02a..08a (65–90, high/medium) | `agentic.py` + `asi_signals.py` |
+| OW-ASI03 | IPA-01a..03b (80–95, high), IPA-04a (65, medium), IPA-05a (75, high, cross_session) | `asi_signals.py` + `cross_session.py` |
+| OW-ASI04 | ASCV-01a..03b (70–90), ASCV-02a (80, high), ASCV-04a (85, deterministic), ASCV-05a (70, skeletal) | `agentic.py` + `asi_signals.py` |
+| OW-ASI05 | RCE-01a..03b (80–98, deterministic), RCE-04a..08a (75–92, high/deterministic) | `agentic.py` + `asi_signals.py` |
+| OW-ASI06 | MCP-01a/b (85–88, high), MCP-02a (80, high, cross_session), MCP-03a..05a (75–95) | `agentic.py` + `asi_signals.py` + `cross_session.py` |
+| OW-ASI07 | IAC-01a/b (75–88, high), IAC-02a..06a (65–85, deterministic/high/medium/skeletal) | `asi_signals.py` |
+| OW-ASI08 | CF-01a/b (70–75, high), CF-02a..04a (65–75, high/skeletal) | `asi_signals.py` |
+| OW-ASI09 | HAT-01a/b (60–65, high), HAT-02a..05a (75–90, high/medium) | `asi_signals.py` |
+| OW-ASI10 | RA-01a/b (60–78, medium/high), RA-02a (90, high, cross_session), RA-03a..05a (85–95, high/deterministic) | `asi_signals.py` + `cross_session.py` |
 
 ---
 
@@ -335,68 +358,176 @@ async def score_session(tenant_id, session_id, agent_id, online_findings) -> dic
     """
 ```
 
-### v2 Scoring model
+### v3 Scoring model
 
-**Per-signal score** = `max(check_score)` across all fired sub-checks for that signal.
-Not additive — a signal that fires 3 sub-checks at 70/80/90 scores 90.
+**Confidence tiers** (`core/config.py CONFIDENCE_WEIGHTS`):
+```python
+CONFIDENCE_WEIGHTS = {
+    "deterministic": 1.0,
+    "high":          0.9,
+    "medium":        0.7,
+    "low":           0.5,
+    "skeletal":      0.3,
+}
+```
+
+**Per-signal score** = `max(check_score × confidence_weight)` across all fired sub-checks.
+Not additive. `effective_score` is what drives the composite.
 
 **Composite score** (per framework):
 ```python
-def compute_composite_score(signal_map, framework) -> int:
-    fired = sorted([signal_map[s]["score"] for s in signal_map
-                    if s.startswith(f"OW-{framework}") and signal_map[s]["status"] == "fired"],
-                   reverse=True)
+def compute_composite_score_v3(signal_map, framework, attack_chains) -> int:
+    fired = sorted(
+        [sig["effective_score"] for sig in signal_map.values()
+         if sig["status"] == "fired"],
+        reverse=True
+    )
     if not fired: return 0
-    if len(fired) == 1: return fired[0]
-    return min(100, int(fired[0] * 0.6 + (sum(fired[1:]) / len(fired[1:])) * 0.4))
+    raw = fired[0] if len(fired) == 1 else int(fired[0] * 0.6 + (sum(fired[1:]) / len(fired[1:])) * 0.4)
+    _, amp = detect_attack_chains(set(signal_map.keys()))
+    return min(100, int(raw * amp))
+```
+
+**Attack chains** (`scorer/attack_chains.py`):
+```python
+ATTACK_CHAINS = {
+    "indirect_injection_to_exfil":  ({"OW-LLM01","OW-ASI02","OW-LLM02"}, 1.25),
+    "goal_hijack_to_rce":           ({"OW-ASI01","OW-ASI05"},             1.30),
+    "supply_chain_to_backdoor":     ({"OW-ASI04","OW-ASI05","OW-ASI10"},  1.35),
+    "memory_poison_to_exfil":       ({"OW-ASI06","OW-LLM02"},            1.20),
+    "privilege_escalation_chain":   ({"OW-ASI03","OW-LLM06","OW-ASI02"}, 1.25),
+    "trust_exploitation_to_fraud":  ({"OW-ASI09","OW-ASI01"},            1.20),
+    "cascading_failure_chain":      ({"OW-ASI08","OW-ASI10","OW-ASI07"}, 1.15),
+}
+# amplification = max(amp for matching chains) — never multiplicative
+```
+
+**Risk bands (v3)**:
+```python
+def _band(score: int) -> str:
+    if score <= 14:  return "clean"
+    if score <= 34:  return "low"
+    if score <= 59:  return "medium"
+    if score <= 84:  return "high"
+    return "critical"
+```
+
+**Trust scoring** (`scorer/trust.py`):
+```python
+def compute_agent_trust_score(agent_id, sessions) -> dict:
+    # Beta(α=2, β=8) prior → starting trust ≈ 80%
+    # Each session: α += clean_weight, β += risky_weight
+    # Temporal decay: weight = exp(-λ × days_ago), λ = 0.05
+    # Trend: linear regression on last 20 sessions → "improving" | "stable" | "degrading"
+    # trust_score = round(α / (α + β) * 100)
 ```
 
 **Alert logic:**
 ```python
 # Alert fires if:
-# (a) any individual signal score >= SIGNAL_ALERT_THRESHOLDS.get(sig_id, 80), OR
-# (b) either composite score >= COMPOSITE_ALERT_THRESHOLD (65)
+# (a) any individual signal effective_score >= SIGNAL_ALERT_THRESHOLDS.get(sig_id, 80), OR
+# (b) either composite score >= COMPOSITE_ALERT_THRESHOLD (65), OR
+# (c) agent trust_score < TRUST_ALERT_THRESHOLD for N consecutive sessions
 ```
 
-**Overlap dedup groups** (resolved in `orchestrator.py`, passed in `score_row["dedup_key"]`):
+**Overlap dedup groups v3** (resolved in `orchestrator.py`):
 ```python
-OVERLAP_GROUPS = {
+OVERLAP_GROUPS_V3 = {
     "injection":        {"OW-LLM01", "OW-ASI01", "OW-ASI06"},
     "output_exec":      {"OW-LLM05", "OW-ASI05", "OW-ASI02"},
     "supply_chain":     {"OW-LLM03", "OW-ASI04"},
     "memory_vector":    {"OW-LLM08", "OW-ASI06"},
     "excessive_agency": {"OW-LLM06", "OW-ASI02", "OW-ASI10"},
     "pii_privilege":    {"OW-LLM02", "OW-ASI03"},
+    "trust_fraud":      {"OW-ASI09", "OW-ASI01"},        # NEW
+    "cascade_rogue":    {"OW-ASI08", "OW-ASI10", "OW-ASI07"},  # NEW
 }
+```
+
+### score_session() v3 flow (`orchestrator.py`)
+
+```python
+async def score_session(tenant_id, session_id, agent_id, online_findings) -> dict:
+    """
+    1.  Fetch full event list from ClickHouse.
+    2.  Fetch session row from Postgres.
+    3.  Run per-event detectors (replay events) → per_event_findings.
+    4.  Run OW-LLM signal functions → llm_findings.
+    5.  Run OW-ASI signal functions → asi_findings.
+    6.  Run cross-session signals → cross_session_findings.         ← v3 NEW
+    7.  compute_ow_signal_score(all_findings) → per-signal scores   ← v3 CHANGED (confidence-weighted)
+    8.  detect_attack_chains(fired_signals) → chains, amplification ← v3 NEW
+    9.  compute_composite_score_v3() → composite (with amp)         ← v3 CHANGED
+    10. Write security_findings (with confidence_tier + confidence). ← v3 CHANGED
+    11. Write session_risk_scores (v3 composite JSONB columns).      ← v3 CHANGED
+    12. compute_agent_trust_score() → trust_score, trend.           ← v3 NEW
+    13. Upsert agent_risk_scores (with trust columns).              ← v3 CHANGED
+    14. Resolve dedup_key via resolve_overlap_group().
+    15. Alert if thresholds breached (score or trust).
+    scorer_version = "3.0.0"
+    """
 ```
 
 ### LLM signals (`llm_signals.py`)
 
 Each is `async def signal_ow_llm0N(events, session, tenant_id, session_id, agent_id, online_findings) -> Finding | None`.
+`signal_ow_llm04` and `signal_ow_llm08` always return `None` (pre-runtime exclusion).
 
 | Function | Signal | Sub-check | Trigger |
 |---|---|---|---|
 | `signal_ow_llm01` | OW-LLM01 | PI-01a | Any INJ-type online finding |
 | `signal_ow_llm01_indirect` | OW-LLM01 | PI-02a | Any passthrough-type finding in online_findings |
 | `signal_ow_llm02` | OW-LLM02 | SID-02b | Any PII-type finding with critical severity |
+| `signal_ow_llm04` | OW-LLM04 | — | **returns None** (pre-runtime excluded) |
 | `signal_ow_llm05` | OW-LLM05 | IOH-02a | Any passthrough-type finding |
-| `signal_ow_llm06_tool_count` | OW-LLM06 | EAG-01a | Tool count > p90 baseline (ClickHouse 7-day) |
-| `signal_ow_llm06_scope` | OW-LLM06 | EAG-02a | Tool not in `settings.get_tool_manifests()[agent_id]` |
-| `signal_ow_llm06_write_on_read` | OW-LLM06 | EAG-03a | Write/delete tool + read-intent `initial_input` |
+| `signal_ow_llm06_tool_count` | OW-LLM06 | EA-01a | Tool count > p90 baseline (ClickHouse 7-day) |
+| `signal_ow_llm06_scope` | OW-LLM06 | EA-02a | Tool not in `settings.get_tool_manifests()[agent_id]` |
+| `signal_ow_llm06_write_on_read` | OW-LLM06 | EA-03a | Write/delete tool + read-intent `initial_input` |
+| `signal_ow_llm08` | OW-LLM08 | — | **returns None** (pre-runtime excluded) |
 | `signal_ow_llm09` | OW-LLM09 | SAG-01a | High-stakes tool + no `interrupt_raised` event |
 | `signal_ow_llm10_probe` | OW-LLM10 | UBC-04a | Delegated to `probe.py` |
 | `signal_ow_llm10_token_spike` | OW-LLM10 | UBC-01a | Total tokens > 4σ above 7-day agent baseline |
 
 **Sub-check helpers** (return `list[Finding]`, called after the signal loop):
-- `check_multi_turn_jailbreak(events, session_id, tenant_id)` → PI-04b (score 92) when >= 3 turns each with partial injection fragments that together form a full pattern
-- `check_rag_integrity(events, session_id, tenant_id, baseline)` → DMP-01a (RAG call count spike) + DMP-01c (injection pattern in retrieved chunk)
-- `check_system_prompt_leakage(events, session_id, tenant_id)` → SPL-02a/b, SPL-03b
-- `check_vector_integrity(events, session_id, tenant_id)` → VEW-01b, VEW-02a
+- `check_multi_turn_jailbreak(events, ...)` → PI-04b: >= 3 turns with partial injection fragments that combine into a full pattern
+- `check_payload_splitting(events, ...)` → PI-06a: >= 3 messages with fragmented injection that reassembles
+- `check_rag_integrity(events, ...)` → DMP-01a/c (skipped when excluded=True)
+- `check_system_prompt_leakage(events, ...)` → SPL-02a/b, SPL-03b
+- `check_vector_integrity(events, ...)` → VEW-01b/02a (skipped when excluded=True)
+- `check_insecure_code_output(events, ...)` → IOH-04a: eval/hardcoded-password/SQL in code fences
+- `check_hallucinated_packages(events, ...)` → SAG-02a: known hallucinated package in pip install block
+- `check_ungrounded_high_stakes(events, ...)` → SAG-03a: medical/financial domain without retrieval tool
+- `check_input_size_anomaly(events, ...)` → UBC-02a: input size > 4σ above baseline
 
 ### ASI signals (`asi_signals.py`)
 
-Same function signature. OW-ASI01..10. Online signals (ASI02, ASI05, ASI06) passed in
-as `online_findings`. Post-session signals check the ClickHouse event history.
+Same function signature as LLM signals. OW-ASI01..10. Online signals passed in
+as `online_findings`. Post-session + cross-session signals read ClickHouse history.
+
+### Cross-session signals (`cross_session.py`)
+
+```python
+async def check_cross_user_bleed(tenant_id, session_id, user_id) -> Finding | None
+    # SID-03a: PII from user A present in user B session events (ClickHouse)
+
+async def check_request_rate_spike(tenant_id, user_id) -> Finding | None
+    # UBC-03a: user request rate > 5× their 7-day baseline (ClickHouse)
+
+async def check_cost_spike(tenant_id, user_id) -> Finding | None
+    # UBC-05a: session cost > 3× user's 30-day avg (ClickHouse)
+
+async def check_identity_sharing(tenant_id, session_id) -> Finding | None
+    # IPA-05a: same credential token appears across different user_ids (ClickHouse)
+
+async def check_cross_session_escalation(tenant_id, agent_id) -> Finding | None
+    # MCP-02a: blocked tool in prior session now succeeds (Postgres agent_risk_scores)
+
+async def check_cross_tenant_retrieval(tenant_id, session_id) -> Finding | None
+    # MCP-04a: retrieval result contains records from different tenant_id (ClickHouse)
+
+async def check_persistent_exfil(tenant_id, agent_id) -> Finding | None
+    # RA-02a: same external endpoint appears in >= 3 sessions (ClickHouse)
+```
 
 ---
 
@@ -405,31 +536,31 @@ as `online_findings`. Post-session signals check the ClickHouse event history.
 ```python
 @dataclass
 class Finding:
-    tenant_id:       str
-    session_id:      str
-    event_id:        str
-    event_type:      str
-    owasp_signal_id: str    # "OW-LLM01"
-    sub_check_id:    str    # "PI-01a"
-    check_label:     str    # "Role-override phrase match"
-    check_score:     int    # 0–100 (per-sub-check weight)
-    sig_type:        str    # injection | pii | passthrough | agent_threat | scorer
-    severity:        str    # critical | high | medium | low
-    score_contrib:   int    # = check_score (backward compat)
-    detection_phase: str    # online | post_session
-    matched_text:    str | None = None   # always redacted
-    detail:          str | None = None
-    owasp_framework: str = "LLM"   # "LLM" | "ASI"
+    tenant_id:        str
+    session_id:       str
+    event_id:         str
+    event_type:       str
+    owasp_signal_id:  str    # "OW-LLM01"
+    sub_check_id:     str    # "PI-01a"
+    check_label:      str    # "Role-override phrase match"
+    check_score:      int    # 0–100 (per-sub-check weight)
+    category:         str    # "LLM" | "ASI"
+    severity:         str    # critical | high | medium | low
+    detection_phase:  str    # per_event | post_session | cross_session | excluded
+    confidence_tier:  str    # deterministic | high | medium | low | skeletal
+    confidence:       float  # = CONFIDENCE_WEIGHTS[confidence_tier]
+    matched_text:     str | None = None   # always redacted
+    detail:           str | None = None
+    framework:        str = "LLM"   # "LLM" | "ASI"
     # Derived in __post_init__:
     signal_id: str = field(init=False)  # "OW-LLM01:PI-01a"
-    owasp_id:  str = field(init=False)  # "LLM01" (legacy UI compat)
 ```
 
 ---
 
 ## 8. Postgres schema
 
-### security_findings (with v2 columns from migration 010)
+### security_findings (v3 columns added by migration 013)
 
 ```sql
 CREATE TABLE security_findings (
@@ -438,7 +569,7 @@ CREATE TABLE security_findings (
     session_id      UUID        NOT NULL,   -- no FK (dropped in 009)
     event_id        UUID        NOT NULL,
     event_type      TEXT        NOT NULL,
-    signal_id       TEXT        NOT NULL,   -- "OW-LLM01:PI-01a" (v2) or legacy "INJ-001"
+    signal_id       TEXT        NOT NULL,   -- "OW-LLM01:PI-01a"
     sig_type        TEXT        NOT NULL,
     owasp_id        TEXT        NOT NULL,   -- "LLM01" (legacy)
     owasp_framework TEXT        NOT NULL DEFAULT 'LLM' CHECK (owasp_framework IN ('LLM','ASI')),
@@ -446,58 +577,70 @@ CREATE TABLE security_findings (
     matched_text    TEXT,
     detail          TEXT,
     score_contrib   INT         NOT NULL DEFAULT 0,
-    detection_phase TEXT        NOT NULL CHECK (detection_phase IN ('online','post_session')),
+    detection_phase TEXT        NOT NULL CHECK (detection_phase IN ('online','post_session','cross_session','excluded')),
     -- v2 columns (migration 010):
     owasp_signal_id TEXT,       -- "OW-LLM01"
     sub_check_id    TEXT,       -- "PI-01a"
     check_score     SMALLINT,   -- 0–100
     check_label     TEXT,
+    -- v3 columns (migration 013):
+    confidence_tier TEXT        CHECK (confidence_tier IN ('deterministic','high','medium','low','skeletal')),
+    confidence      NUMERIC(4,3),  -- 0.000–1.000
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-### session_risk_scores (with v2 columns from migrations 007 + 011)
+### session_risk_scores (v3 columns added by migration 013)
 
 ```sql
 CREATE TABLE session_risk_scores (
     session_id            UUID  PRIMARY KEY,
     tenant_id             UUID  NOT NULL,
     agent_id              UUID,
-    risk_score            INT   NOT NULL DEFAULT 0,
+    risk_score            INT   NOT NULL DEFAULT 0,   -- LLM composite
     risk_band             TEXT  NOT NULL,
     signal_count          INT   NOT NULL DEFAULT 0,
     signal_ids            TEXT[] NOT NULL DEFAULT '{}',
-    agent_risk_score      INT   NOT NULL DEFAULT 0,
+    agent_risk_score      INT   NOT NULL DEFAULT 0,   -- ASI composite
     agent_risk_band       TEXT  NOT NULL DEFAULT 'clean',
     agent_signal_ids      TEXT[] NOT NULL DEFAULT '{}',
-    -- legacy JSONB (backward compat)
-    llm_signal_status     JSONB,   -- { "OW-LLM01": { "status": "fired", ... }, ... }
-    agent_signal_status   JSONB,   -- { "OW-ASI05": { "status": "fired", ... }, ... }
-    -- v2 JSONB (migration 011): full sub-check detail per signal
-    ow_llm_signal_status  JSONB,   -- { "OW-LLM01": { "score": 85, "status": "fired", "sub_checks": { "PI-01a": {...} } } }
+    -- legacy JSONB (backward compat — still written)
+    llm_signal_status     JSONB,
+    agent_signal_status   JSONB,
+    -- v2 JSONB (migration 011)
+    ow_llm_signal_status  JSONB,
     ow_asi_signal_status  JSONB,
-    scorer_version        TEXT  NOT NULL,
+    -- v3 JSONB (migration 013): effective scores, attack chains, amplification
+    v3_llm_composite      JSONB,  -- { "composite": 72, "amplification": 1.25, "attack_chains_detected": [...], "signals": {...} }
+    v3_asi_composite      JSONB,
+    scorer_version        TEXT  NOT NULL,   -- "3.0.0"
     scored_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-### agent_risk_scores
+### agent_risk_scores (v3 columns added by migration 014)
 
 ```sql
 CREATE TABLE agent_risk_scores (
-    agent_id        UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    session_count   INT  NOT NULL DEFAULT 0,
-    avg_llm_score   NUMERIC(5,2) NOT NULL DEFAULT 0,
-    avg_agent_score NUMERIC(5,2) NOT NULL DEFAULT 0,
-    max_llm_score   INT  NOT NULL DEFAULT 0,
-    max_agent_score INT  NOT NULL DEFAULT 0,
-    last_scored_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    agent_id          UUID PRIMARY KEY,
+    tenant_id         UUID NOT NULL,
+    session_count     INT  NOT NULL DEFAULT 0,
+    avg_llm_score     NUMERIC(5,2) NOT NULL DEFAULT 0,
+    avg_agent_score   NUMERIC(5,2) NOT NULL DEFAULT 0,
+    max_llm_score     INT  NOT NULL DEFAULT 0,
+    max_agent_score   INT  NOT NULL DEFAULT 0,
+    -- v3 trust columns (migration 014):
+    trust_score       INT  NOT NULL DEFAULT 80,    -- 0–100 (Bayesian posterior × 100)
+    trust_alpha       NUMERIC(8,3) NOT NULL DEFAULT 2,
+    trust_beta        NUMERIC(8,3) NOT NULL DEFAULT 8,
+    trust_trend       TEXT DEFAULT 'stable' CHECK (trust_trend IN ('improving','stable','degrading')),
+    trust_last_updated TIMESTAMPTZ,
+    last_scored_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- asyncpg: pass avg scores as float(), max scores as int() to avoid AmbiguousParameterError
 ```
 
-### signal_registry (migration 012)
+### signal_registry (migrations 012 + 013)
 
 ```sql
 CREATE TABLE signal_registry (
@@ -506,14 +649,18 @@ CREATE TABLE signal_registry (
     label            TEXT NOT NULL,
     owasp_category   TEXT NOT NULL CHECK (owasp_category IN ('LLM', 'ASI')),
     owasp_number     INT  NOT NULL,
-    detection_phase  TEXT NOT NULL CHECK (detection_phase IN ('online','post_session','both','excluded')),
+    detection_phase  TEXT NOT NULL CHECK (detection_phase IN ('online','post_session','both','cross_session','excluded')),
     check_score      SMALLINT NOT NULL CHECK (check_score BETWEEN 0 AND 100),
     severity         TEXT NOT NULL CHECK (severity IN ('critical','high','medium','low')),
+    -- v3 column (migration 013):
+    confidence_tier  TEXT NOT NULL DEFAULT 'high'
+                     CHECK (confidence_tier IN ('deterministic','high','medium','low','skeletal')),
     excluded         BOOLEAN NOT NULL DEFAULT false,
     exclusion_reason TEXT,
     PRIMARY KEY (owasp_signal_id, sub_check_id)
 );
--- 121 rows seeded by scripts/seed_signal_registry.py
+-- 156 rows seeded by scripts/seed_signal_registry.py
+-- Excluded: DMP-01a/c (LLM04 pre-runtime), VEW-01b/02a (LLM08 pre-runtime), LLM03 (all)
 ```
 
 ### injection_signatures
@@ -565,16 +712,21 @@ CLICKHOUSE_PASSWORD=dapplepot
 REDIS_URL=redis://localhost:6379/0
 
 SECURITY_EVAL_WORKERS=4
-SCORER_VERSION=2.0.0
+SCORER_VERSION=3.0.0
 SIG_CACHE_TTL_S=300
 SESSION_CTX_TTL_S=120
 
-# Alert thresholds (v2 model)
+# Alert thresholds (v3 model)
 COMPOSITE_ALERT_THRESHOLD=65
+TRUST_ALERT_THRESHOLD=40        # trust_score < this triggers alert
+TRUST_ALERT_MIN_SESSIONS=3      # must be below threshold for N sessions
 # Per-signal thresholds in core/config.py SIGNAL_ALERT_THRESHOLDS dict
 
+# Confidence weights (in core/config.py CONFIDENCE_WEIGHTS dict)
+# deterministic=1.0, high=0.9, medium=0.7, low=0.5, skeletal=0.3
+
 # Tool manifest (JSON map agent_id → allowed tool names)
-# Used by EAG-02a out-of-scope tool detection
+# Used by EA-02a out-of-scope tool detection
 TOOL_MANIFESTS={}
 ```
 
@@ -592,7 +744,7 @@ cd ../dapplepot_pipeline && make setup && make seed-dev
 # Step 3: this service
 cd ../dapplepot_security
 uv sync && cp .env.example .env
-make setup          # runs migrations 001-012 + seed-sigs + seed-signal-registry + seed-dev-scores
+make setup          # runs migrations 001-014 + seed-sigs + seed-signal-registry + seed-dev-scores
 
 # Step 4-5: pipeline consumers + this service
 cd ../dapplepot_pipeline && make run-ingest  # + run-session-writer, run-event-appender, etc.
@@ -608,51 +760,62 @@ make health          # checks dp-security-eval consumer lag
 
 ### Phase 1 — Foundation
 ```
-core/config.py
+core/config.py                      ← add CONFIDENCE_WEIGHTS dict
 core/infra/kafka.py, postgres.py, clickhouse.py, redis.py
-db/postgres/001..012 (all migrations)
+db/postgres/001..014 (all migrations, including 013_v3_scoring + 014_trust_scores)
+consumers/security_eval/findings.py ← add confidence_tier, confidence fields
 scripts/run_migrations.py
 scripts/seed_signatures.py
-scripts/seed_signal_registry.py
+scripts/seed_signal_registry.py     ← 156 sub-checks with confidence_tier
 scripts/seed_dev_scores.py
 ```
 
-### Phase 2 — Per-event detectors (replayed post-session)
+### Phase 2 — Per-event detectors (new sub-checks)
 ```
-consumers/security_eval/detectors/injection.py        ← OW-LLM01
-consumers/security_eval/detectors/disclosure.py       ← OW-LLM02
-consumers/security_eval/detectors/passthrough.py      ← OW-LLM05
-consumers/security_eval/detectors/prompt_guard.py     ← OW-LLM07
-consumers/security_eval/detectors/agentic.py          ← OW-ASI02/05/06
-```
-
-### Phase 3 — Post-session scorer
-```
-consumers/security_eval/scorer/llm_signals.py         ← OW-LLM01..10
-consumers/security_eval/scorer/asi_signals.py         ← OW-ASI01..10
-consumers/security_eval/scorer/probe.py               ← UBC-04a
-consumers/security_eval/scorer/orchestrator.py        ← score_session()
+consumers/security_eval/detectors/injection.py        ← add PI-05a/07a/08a/09a
+consumers/security_eval/detectors/agentic.py          ← add AGH-04a, ASCV-02a/04a, RCE-06a/08a, RA-04a
+consumers/security_eval/detectors/disclosure.py       ← (unchanged)
+consumers/security_eval/detectors/passthrough.py      ← (unchanged)
+consumers/security_eval/detectors/prompt_guard.py     ← (unchanged)
 ```
 
-### Phase 5 — Consumer + findings writer
+### Phase 3 — Post-session signal functions (new sub-checks)
 ```
-consumers/security_eval/findings.py
-consumers/security_eval/consumer.py
+consumers/security_eval/scorer/llm_signals.py         ← add PI-06a, IOH-04a, SAG-02a/03a, UBC-02a;
+                                                         signal_ow_llm04 + signal_ow_llm08 return None
+consumers/security_eval/scorer/asi_signals.py         ← add all new ASI v3 sub-checks
+consumers/security_eval/scorer/probe.py               ← (unchanged)
+```
+
+### Phase 4 — Cross-session signals (NEW)
+```
+consumers/security_eval/scorer/cross_session.py       ← SID-03a, UBC-03a/05a, IPA-05a, MCP-02a/04a, RA-02a
+```
+
+### Phase 5 — v3 Scoring engine (NEW)
+```
+consumers/security_eval/scorer/attack_chains.py       ← detect_attack_chains(): 7 chains, max amplification
+consumers/security_eval/scorer/trust.py               ← compute_agent_trust_score(): Bayesian + decay + trend
+consumers/security_eval/scorer/orchestrator.py        ← score_session() v3: confidence, chains, trust
+consumers/security_eval/consumer.py                   ← (unchanged)
 ```
 
 ### Phase 6 — Tests
 ```
 tests/conftest.py
-tests/unit/test_prompt_injection.py
+tests/unit/test_prompt_injection.py         ← add PI-05a/07a/08a/09a
 tests/unit/test_data_disclosure.py
 tests/unit/test_output_handling.py
-tests/unit/test_agentic_threats.py
-tests/unit/test_llm_signals.py
-tests/unit/test_asi_signals.py
-tests/unit/test_scoring.py
-tests/unit/test_signal_registry.py
+tests/unit/test_agentic_threats.py          ← add AGH-04a, ASCV-02a/04a, RCE-06a/08a, RA-04a, MCP-03a
+tests/unit/test_llm_signals.py              ← add PI-06a, IOH-04a, SAG-02a/03a, UBC-02a, LLM04/08 exclusion
+tests/unit/test_asi_signals.py              ← all new v3 ASI sub-checks
+tests/unit/test_scoring_v3.py               ← NEW: confidence weighting, composite, attack chains
+tests/unit/test_attack_chains.py            ← NEW: all 7 chains
+tests/unit/test_trust.py                    ← NEW: Bayesian prior, update, decay, trend
+tests/unit/test_cross_session.py            ← NEW: all 6 cross-session functions
+tests/unit/test_signal_registry.py          ← update: 156 entries, confidence_tier, cross_session phase
 tests/integration/test_detectors.py
-tests/integration/test_post_session_scorer.py
+tests/integration/test_post_session_scorer.py  ← update: v3 composite, attack chains, trust, scorer_version
 ```
 
 ---

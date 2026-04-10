@@ -5,6 +5,7 @@ OW-LLM05 sub-checks emitted here:
   IOH-01b  HTML/JS in output without escaping
   IOH-01c  SQL fragment in tool input from LLM output
   IOH-02a  Raw LLM output passed as tool param (LCS >= 0.9 or >= 0.6)
+  IOH-03a  Email template injection in output (v3)
 """
 import json
 import re
@@ -47,8 +48,27 @@ def _lcs_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def _make_finding(event: dict, sub_check_id: str, check_label: str, check_score: int,
-                  severity: str, matched_text: str, detail: str) -> "Finding":
+# IOH-03a: Email template injection patterns
+_EMAIL_TOOL_PATTERN = re.compile(r"(?i)(email|mail|send|notify|message)")
+_EMAIL_XSS_PATTERNS = [
+    r"(?i)<script|javascript:|on\w+\s*=",
+]
+_EMAIL_LINK_PATTERN = re.compile(
+    r"(?i)(href|src)\s*=\s*['\"]https?://(?!.*(?:company_domain|localhost|127\.0\.0\.1))"
+)
+_EMAIL_HIDDEN_PATTERN = re.compile(r"(?i)<!--.*inject|hidden.*display:\s*none")
+
+
+def _make_finding(
+    event: dict,
+    sub_check_id: str,
+    check_label: str,
+    check_score: int,
+    severity: str,
+    matched_text: str,
+    detail: str,
+    confidence_tier: str = "high",
+) -> "Finding":
     from consumers.security_eval.findings import Finding
     return Finding(
         tenant_id=event["tenant_id"],
@@ -64,6 +84,7 @@ def _make_finding(event: dict, sub_check_id: str, check_label: str, check_score:
         matched_text=matched_text,
         detail=detail,
         detection_phase="post_session",
+        confidence_tier=confidence_tier,
     )
 
 
@@ -135,6 +156,44 @@ async def detect_passthrough(
                 severity=severity,
                 matched_text=tool_input[:300],
                 detail=f"tool_start input {ratio:.0%} similar to preceding llm_end output",
+                confidence_tier="medium",
             ))
+
+    # IOH-03a: Email template injection in output (v3)
+    tool_name = str(payload.get("tool_name", ""))
+    if _EMAIL_TOOL_PATTERN.search(tool_name):
+        for pat in _EMAIL_XSS_PATTERNS:
+            if re.search(pat, tool_input_str):
+                findings.append(_make_finding(
+                    event, "IOH-03a",
+                    check_label="Email template injection in output",
+                    check_score=80,
+                    severity="high",
+                    matched_text=tool_input_str[:300],
+                    detail="Email tool input contains XSS/injection pattern",
+                    confidence_tier="high",
+                ))
+                break
+        else:
+            if _EMAIL_LINK_PATTERN.search(tool_input_str):
+                findings.append(_make_finding(
+                    event, "IOH-03a",
+                    check_label="Email template injection in output",
+                    check_score=80,
+                    severity="high",
+                    matched_text=tool_input_str[:300],
+                    detail="Email tool input contains external link injection",
+                    confidence_tier="high",
+                ))
+            elif _EMAIL_HIDDEN_PATTERN.search(tool_input_str):
+                findings.append(_make_finding(
+                    event, "IOH-03a",
+                    check_label="Email template injection in output",
+                    check_score=80,
+                    severity="high",
+                    matched_text=tool_input_str[:300],
+                    detail="Email tool input contains hidden content pattern",
+                    confidence_tier="high",
+                ))
 
     return findings

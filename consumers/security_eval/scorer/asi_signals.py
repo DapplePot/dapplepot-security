@@ -359,18 +359,1264 @@ async def signal_a10(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI01 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def signal_a01_zero_click(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """AGH-02a — zero-click goal hijack: tool invocation without user turn."""
+    _INJ_PATTERNS = [
+        r"(?i)(ignore|disregard|forget).{0,30}(instruction|prompt|rule)",
+        r"(?i)(you (must|should|shall|will)).{0,40}(do|execute|perform|run)",
+        r"(?i)(override|bypass).{0,30}(filter|restriction|policy)",
+    ]
+    last_user_input_seen = False
+    tool_outputs_since_user: list[str] = []
+    consecutive_tools_no_user = 0
+
+    for ev in events:
+        etype = ev["event_type"]
+        payload = ev.get("payload") or {}
+
+        if etype == "llm_start":
+            msgs = payload.get("messages", [])
+            if any(isinstance(m, dict) and m.get("role") == "user" for m in msgs):
+                last_user_input_seen = True
+                tool_outputs_since_user = []
+                consecutive_tools_no_user = 0
+
+        elif etype == "tool_end":
+            output = payload.get("tool_output", "")
+            if not isinstance(output, str):
+                import json as _json
+                output = _json.dumps(output)
+            tool_outputs_since_user.append(output)
+
+        elif etype == "tool_start":
+            if not last_user_input_seen:
+                consecutive_tools_no_user += 1
+                for output in tool_outputs_since_user:
+                    if any(re.search(p, output) for p in _INJ_PATTERNS):
+                        return _make_finding(
+                            "OW-ASI01", "AGH-02a",
+                            "Zero-click goal hijack",
+                            85, session_id, tenant_id,
+                            severity="high",
+                            detail="Tool invoked without user input; prior tool output contains injection pattern",
+                        )
+                if consecutive_tools_no_user > 5:
+                    return _make_finding(
+                        "OW-ASI01", "AGH-02a",
+                        "Zero-click goal hijack",
+                        85, session_id, tenant_id,
+                        severity="high",
+                        detail=f"{consecutive_tools_no_user} consecutive tool calls with no user turn",
+                    )
+    return None
+
+
+async def signal_a01_goal_drift(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """AGH-03a — goal drift: session objective shifts significantly from initial intent."""
+    initial_input = session.get("initial_input", "") or ""
+    if not initial_input:
+        return None
+
+    user_messages: list[str] = []
+    tool_invocations: list[str] = []
+    for ev in events:
+        if ev["event_type"] == "llm_start":
+            payload = ev.get("payload") or {}
+            for msg in payload.get("messages", []):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    user_messages.append(str(msg.get("content", "")))
+        elif ev["event_type"] == "tool_start":
+            if ev.get("tool_name"):
+                tool_invocations.append(ev["tool_name"])
+
+    if len(user_messages) <= 5:
+        return None
+
+    initial_keywords = set(re.findall(r"\b\w{4,}\b", initial_input.lower()))
+    if not initial_keywords:
+        return None
+
+    last_msg = user_messages[-1]
+    last_keywords = set(re.findall(r"\b\w{4,}\b", last_msg.lower()))
+    overlap = len(initial_keywords & last_keywords)
+    drift_ratio = 1 - overlap / max(len(initial_keywords), 1)
+
+    if drift_ratio <= 0.85:
+        return None
+
+    # Check that last 3 tool calls use tools not in first half
+    midpoint = len(tool_invocations) // 2
+    early_tools = set(tool_invocations[:midpoint])
+    last_tools = tool_invocations[-3:] if len(tool_invocations) >= 3 else []
+    new_tools = [t for t in last_tools if t not in early_tools]
+    if not new_tools:
+        return None
+
+    return _make_finding(
+        "OW-ASI01", "AGH-03a",
+        "Goal drift across turns",
+        70, session_id, tenant_id,
+        severity="medium",
+        detail="Session goal appears to have shifted significantly from initial intent",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI02 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SENSITIVE_READ_TOOLS = re.compile(
+    r"(?i)(db_query|sql|read_file|get_secret|fetch_user|crm|lookup)"
+)
+_OUTBOUND_TOOLS = re.compile(
+    r"(?i)(send_email|http_post|webhook|slack|api_call|upload|notify|curl)"
+)
+_ADMIN_TOOLS = re.compile(
+    r"(?i)(powershell|cmd|bash|shell|admin|sudo|ssh|kubectl)"
+)
+_EXTERNAL_INDICATORS = re.compile(
+    r"(?i)(curl|wget|http://|https://|\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)"
+)
+_BENIGN_TOOLS = re.compile(r"(?i)(ping|dns|nslookup|traceroute|health_check|status)")
+_WRITE_CAPABLE = re.compile(
+    r"(?i)(admin|delete|write|create|drop|truncate|remove|purge)"
+)
+
+
+async def check_tool_descriptor_integrity(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """TME-02a — tool descriptor integrity anomaly."""
+    _DESCRIPTOR_SUSPICIOUS = [
+        r"(?i)(ignore|override|bypass).{0,30}(policy|permission|restriction)",
+        r"(?i)(send|post|exfiltrate|transmit).{0,30}(data|secret|token|key)",
+        r"(?i)(hidden|secret|covert).{0,20}(function|capability|parameter)",
+    ]
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        desc = payload.get("tool_description", "") or ""
+        if desc:
+            for pat in _DESCRIPTOR_SUSPICIOUS:
+                if re.search(pat, desc):
+                    tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+                    return _make_finding(
+                        "OW-ASI02", "TME-02a",
+                        "Tool descriptor integrity anomaly",
+                        75, session_id, tenant_id,
+                        severity="high",
+                        detail=f"Tool descriptor contains suspicious instruction: {tool_name}",
+                    )
+    return None
+
+
+async def check_over_privileged_tool(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """TME-04a — write/delete tool on read-intent session (ASI framing)."""
+    initial_input = session.get("initial_input", "") or ""
+    if not any(re.search(p, initial_input) for p in _READ_INTENT_PATTERNS):
+        return None
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if _WRITE_CAPABLE.search(tool_name):
+            return _make_finding(
+                "OW-ASI02", "TME-04a",
+                "Over-privileged tool invocation",
+                70, session_id, tenant_id,
+                severity="high",
+                detail=f"Write/delete tool '{tool_name}' invoked on read-intent session",
+            )
+    return None
+
+
+async def check_cross_tool_exfil(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """TME-05a — cross-tool exfiltration chain: sensitive read → outbound write."""
+    import json as _json
+    from difflib import SequenceMatcher
+
+    tool_list: list[dict] = []
+    pending_input: dict[str, str] = {}
+    pending_output: dict[str, str] = {}
+
+    for ev in events:
+        etype = ev["event_type"]
+        payload = ev.get("payload") or {}
+        nid = ev.get("node_run_id") or ""
+        tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+
+        if etype == "tool_start":
+            ti = payload.get("tool_input", {})
+            pending_input[nid] = _json.dumps(ti) if not isinstance(ti, str) else ti
+            tool_list.append({"name": tool_name, "input": pending_input[nid], "output": None})
+
+        elif etype == "tool_end":
+            to = payload.get("tool_output", "")
+            pending_output[nid] = _json.dumps(to) if not isinstance(to, str) else to
+            for item in reversed(tool_list):
+                if item["output"] is None and item["name"] == tool_name:
+                    item["output"] = pending_output[nid]
+                    break
+
+    for i in range(len(tool_list) - 1):
+        window = tool_list[i:i + 5]
+        for a_idx, a in enumerate(window):
+            if not _SENSITIVE_READ_TOOLS.search(a["name"]):
+                continue
+            for b in window[a_idx + 1:]:
+                if not _OUTBOUND_TOOLS.search(b["name"]):
+                    continue
+                a_out = a.get("output") or ""
+                b_inp = b.get("input") or ""
+                if a_out and b_inp:
+                    ratio = SequenceMatcher(None, a_out[:500], b_inp[:500]).ratio()
+                    if ratio >= 0.30:
+                        return _make_finding(
+                            "OW-ASI02", "TME-05a",
+                            "Cross-tool exfiltration chain",
+                            90, session_id, tenant_id,
+                            severity="critical",
+                            detail=f"Sensitive data from {a['name']} forwarded to {b['name']} (LCS {ratio:.0%})",
+                        )
+    return None
+
+
+async def check_tool_typosquatting(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """TME-06a — tool name typosquatting: invoked tool similar to manifest tool."""
+    from core.config import settings
+    from difflib import SequenceMatcher
+
+    tool_manifests = settings.get_tool_manifests()
+    known = tool_manifests.get(str(agent_id))
+    if not known:
+        return None
+
+    invoked = list(dict.fromkeys(
+        e["tool_name"] for e in events
+        if e["event_type"] == "tool_start" and e.get("tool_name")
+    ))
+
+    for name in invoked:
+        if name in known:
+            continue
+        for kn in known:
+            # Simple edit-distance approximation using SequenceMatcher
+            ratio = SequenceMatcher(None, name.lower(), kn.lower()).ratio()
+            dist_approx = int((1 - ratio) * max(len(name), len(kn)))
+            if 0 < dist_approx <= 2:
+                return _make_finding(
+                    "OW-ASI02", "TME-06a",
+                    "Tool name typosquatting",
+                    70, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Tool '{name}' not in manifest; similar to '{kn}' (edit distance ~{dist_approx})",
+                )
+    return None
+
+
+async def check_admin_chain_exfil(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """TME-07a — admin tool chain to external endpoint."""
+    import json as _json
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not _ADMIN_TOOLS.search(tool_name):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        if _EXTERNAL_INDICATORS.search(input_str):
+            return _make_finding(
+                "OW-ASI02", "TME-07a",
+                "Admin tool chain to external endpoint",
+                88, session_id, tenant_id,
+                severity="critical",
+                detail=f"Admin tool {tool_name} invoked with external endpoint in args",
+            )
+    return None
+
+
+async def check_repetitive_tool_misuse(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """TME-08a — repetitive benign tool misuse (side-channel exfil)."""
+    counts: dict[str, int] = {}
+    for ev in events:
+        if ev["event_type"] == "tool_start":
+            tn = ev.get("tool_name") or ""
+            if _BENIGN_TOOLS.search(tn):
+                counts[tn] = counts.get(tn, 0) + 1
+
+    for tn, count in counts.items():
+        if count > 10:
+            return _make_finding(
+                "OW-ASI02", "TME-08a",
+                "Repetitive benign tool misuse",
+                65, session_id, tenant_id,
+                severity="medium",
+                detail=f"{tn} invoked {count} times — possible side-channel exfiltration",
+            )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI03 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DELEGATION_TOOL = re.compile(
+    r"(?i)(delegate|dispatch|invoke_agent|call_agent|forward)"
+)
+_CREDENTIAL_PATTERNS = re.compile(
+    r"(?i)(password|token|secret|api_key|ssh_key|bearer)\s*[:=]\s*\S+"
+)
+
+
+async def check_delegation_abuse(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-02a — delegation with full/unrestricted permissions."""
+    import json as _json
+    _FULL_PERMS = re.compile(r"(?i)(\*|admin|all\s+permissions?|full\s+access)")
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not _DELEGATION_TOOL.search(tool_name):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        if _FULL_PERMS.search(input_str):
+            return _make_finding(
+                "OW-ASI03", "IPA-02a",
+                "Delegation with full permissions",
+                80, session_id, tenant_id,
+                severity="high",
+                detail="Delegation to sub-agent with unrestricted permissions",
+            )
+    return None
+
+
+async def check_credential_reuse(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-03a — cached credential reuse: same credential appears > 5 events later."""
+    import hashlib
+    import json as _json
+
+    cred_first_seen: dict[str, int] = {}
+    tool_starts = [
+        (i, ev) for i, ev in enumerate(events)
+        if ev["event_type"] == "tool_start"
+    ]
+
+    for seq_idx, ev in tool_starts:
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        for m in _CREDENTIAL_PATTERNS.finditer(input_str):
+            cred_hash = hashlib.md5(m.group(0).encode()).hexdigest()
+            if cred_hash in cred_first_seen:
+                if seq_idx - cred_first_seen[cred_hash] > 5:
+                    return _make_finding(
+                        "OW-ASI03", "IPA-03a",
+                        "Cached credential reuse",
+                        85, session_id, tenant_id,
+                        severity="critical",
+                        detail=f"Credential first seen at event {cred_first_seen[cred_hash]} reused at event {seq_idx}",
+                    )
+            else:
+                cred_first_seen[cred_hash] = seq_idx
+    return None
+
+
+async def check_stale_auth(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-04a — stale authorization: auth token reused after 1 hour with no re-validation."""
+    duration_ms = session.get("duration_ms") or 0
+    if duration_ms < 3600000:
+        return None
+
+    has_interrupt = any(e["event_type"] in ("interrupt_raised", "interrupt_resumed") for e in events)
+    if has_interrupt:
+        return None
+
+    import hashlib
+    import json as _json
+
+    early_cred_hashes: set[str] = set()
+    early_event_count = len(events) // 2  # first half
+
+    for i, ev in enumerate(events):
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        if i < early_event_count:
+            for m in _CREDENTIAL_PATTERNS.finditer(input_str):
+                early_cred_hashes.add(hashlib.md5(m.group(0).encode()).hexdigest())
+        else:
+            for m in _CREDENTIAL_PATTERNS.finditer(input_str):
+                h = hashlib.md5(m.group(0).encode()).hexdigest()
+                if h in early_cred_hashes:
+                    minutes = duration_ms // 60000
+                    return _make_finding(
+                        "OW-ASI03", "IPA-04a",
+                        "Stale authorization in long session",
+                        65, session_id, tenant_id,
+                        severity="medium",
+                        detail=f"Auth token from session start reused after {minutes}min without re-validation",
+                    )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI04 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_mcp_impersonation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """ASCV-03a — MCP server name similarity to known service."""
+    from difflib import SequenceMatcher
+    from core.config import KNOWN_MCP_SERVERS
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        server_name = payload.get("mcp_server_name", "") or ""
+        if not server_name:
+            continue
+        for known in KNOWN_MCP_SERVERS:
+            if server_name.lower() == known:
+                continue
+            ratio = SequenceMatcher(None, server_name.lower(), known).ratio()
+            dist = int((1 - ratio) * max(len(server_name), len(known)))
+            if 0 < dist <= 2:
+                return _make_finding(
+                    "OW-ASI04", "ASCV-03a",
+                    "MCP server impersonation",
+                    75, session_id, tenant_id,
+                    severity="high",
+                    detail=f"MCP server name '{server_name}' similar to known service '{known}'",
+                )
+    return None
+
+
+async def check_agent_card_anomaly(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """ASCV-05a — agent card descriptor anomaly (skeletal; multi-agent prep)."""
+    # Skeleton: multi-agent only, single-agent sessions return None
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        if payload.get("agent_card") or payload.get("agent_descriptor"):
+            return None  # TODO: implement when A2A protocol events available
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI05 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EXEC_TOOLS = re.compile(
+    r"(?i)(exec|execute|run|eval|shell|bash|sh|cmd|code_interpreter)"
+)
+
+
+async def check_exec_loop(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """RCE-04a — execution loop: same exec-matching tool invoked >= 5 times consecutively."""
+    tool_names = [
+        ev["tool_name"] for ev in events
+        if ev["event_type"] == "tool_start" and ev.get("tool_name")
+    ]
+
+    max_consecutive: dict[str, int] = {}
+    current: dict[str, int] = {}
+    prev = None
+
+    for tn in tool_names:
+        if _EXEC_TOOLS.search(tn):
+            if tn == prev:
+                current[tn] = current.get(tn, 1) + 1
+            else:
+                current[tn] = 1
+            max_consecutive[tn] = max(max_consecutive.get(tn, 0), current[tn])
+        prev = tn
+
+    for tn, count in max_consecutive.items():
+        if count >= 5:
+            return _make_finding(
+                "OW-ASI05", "RCE-04a",
+                "Execution loop (runaway)",
+                80, session_id, tenant_id,
+                severity="high",
+                detail=f"{tn} invoked {count} consecutive times — possible runaway execution",
+            )
+    return None
+
+
+_BACKDOOR_PATTERNS = [
+    r"(?i)reverse.{0,10}shell",
+    r"(?i)socket\.connect\s*\(\s*\(",
+    r"(?i)bind\s*\(\s*\(\s*['\"]0\.0\.0\.0",
+    r"(?i)nc\s+-[lv]*\s+.*\d+",
+    r"(?i)subprocess\.Popen\s*\(\s*\[.*sh.*-c",
+    r"(?i)crypto\.createCipher",
+    r"(?i)btoa\s*\(.*document\.cookie",
+    r"(?i)fetch\s*\(\s*['\"]https?://\d{1,3}\.\d{1,3}",
+]
+_CODE_FENCE_PAT = re.compile(r"```[\s\S]*?```")
+
+
+async def check_code_backdoor(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """RCE-05a — backdoor pattern in generated code."""
+    import json as _json
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        payload = ev.get("payload") or {}
+        completion = payload.get("completion", "")
+        if not isinstance(completion, str):
+            completion = _json.dumps(completion)
+        for block in _CODE_FENCE_PAT.findall(completion):
+            for pat in _BACKDOOR_PATTERNS:
+                if re.search(pat, block):
+                    return _make_finding(
+                        "OW-ASI05", "RCE-05a",
+                        "Backdoor pattern in generated code",
+                        85, session_id, tenant_id,
+                        severity="critical",
+                        detail="Potential backdoor pattern in generated code",
+                    )
+    return None
+
+
+async def check_multi_tool_chain_exploit(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """RCE-07a — multi-tool chain exploitation: upload → traversal → execute."""
+    import json as _json
+    _UPLOAD_TOOLS = re.compile(r"(?i)(upload|write_file|save|store)")
+    _EXEC_LOAD = re.compile(r"(?i)(exec|run|load|import|require|eval)")
+    _TRAVERSAL = re.compile(r"\.\./|\.\.\\|%2e%2e")
+
+    tool_events = [
+        ev for ev in events if ev["event_type"] == "tool_start"
+    ]
+
+    for i in range(len(tool_events)):
+        window = tool_events[i:i + 5]
+        has_upload = False
+        has_traversal = False
+        has_exec = False
+        for ev in window:
+            tn = ev.get("tool_name") or ""
+            payload = ev.get("payload") or {}
+            ti = payload.get("tool_input", {})
+            input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+            if _UPLOAD_TOOLS.search(tn):
+                has_upload = True
+            if _TRAVERSAL.search(input_str):
+                has_traversal = True
+            if _EXEC_LOAD.search(tn):
+                has_exec = True
+        if has_upload and has_traversal and has_exec:
+            return _make_finding(
+                "OW-ASI05", "RCE-07a",
+                "Multi-tool chain exploitation",
+                92, session_id, tenant_id,
+                severity="critical",
+                detail="Multi-tool chain: upload→traversal→execution detected",
+            )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI06 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_memory_write_after_injection(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    all_findings: list | None = None,
+) -> "Finding | None":
+    """MCP-05a — memory write after injection signal detected."""
+    _MEMORY_WRITE = re.compile(
+        r"(?i)(memory|remember|store|persist|save_context)"
+    )
+    INJECTION_SIGNAL_IDS = {"OW-LLM01", "OW-ASI01"}
+
+    injection_event_id: str | None = None
+    if all_findings:
+        for f in all_findings:
+            if f.owasp_signal_id in INJECTION_SIGNAL_IDS:
+                injection_event_id = f.event_id
+                break
+
+    if not injection_event_id:
+        return None
+
+    injection_seen = False
+    for ev in events:
+        if ev.get("event_id") == injection_event_id:
+            injection_seen = True
+        if injection_seen and ev["event_type"] == "tool_start":
+            if _MEMORY_WRITE.search(ev.get("tool_name") or ""):
+                return _make_finding(
+                    "OW-ASI06", "MCP-05a",
+                    "Memory write after injection signal",
+                    88, session_id, tenant_id,
+                    severity="critical",
+                    detail=f"Memory write occurred after injection signal at event {injection_event_id}",
+                )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI07 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_replay_attack(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IAC-03a — duplicate request/message IDs (replay attack)."""
+    import json as _json
+    seen: set[str] = set()
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        for id_field in ("request_id", "message_id", "correlation_id"):
+            val = payload.get(id_field) or (
+                payload.get("tool_input", {}).get(id_field)
+                if isinstance(payload.get("tool_input"), dict)
+                else None
+            )
+            if val:
+                val = str(val)
+                if val in seen:
+                    return _make_finding(
+                        "OW-ASI07", "IAC-03a",
+                        "Replay attack (duplicate request ID)",
+                        75, session_id, tenant_id,
+                        severity="high",
+                        detail=f"Duplicate request ID '{val}' detected — possible replay attack",
+                    )
+                seen.add(val)
+    return None
+
+
+async def check_unknown_agent_delegation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IAC-05a — delegation to unknown agent ID."""
+    import json as _json
+    _DELEGATION_PATTERNS = [
+        r"(?i)(delegate|dispatch|invoke_agent|call_agent|forward_to_agent)"
+    ]
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not any(re.search(p, tool_name) for p in _DELEGATION_PATTERNS):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        if isinstance(ti, str):
+            try:
+                ti = _json.loads(ti)
+            except Exception:
+                ti = {}
+        target_id = ti.get("target_agent_id") or ti.get("agent_id")
+        if not target_id:
+            continue
+        from core.infra.postgres import get_pool
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            "SELECT agent_id FROM agents WHERE agent_id = $1 AND tenant_id = $2",
+            str(target_id), tenant_id,
+        )
+        if not row:
+            return _make_finding(
+                "OW-ASI07", "IAC-05a",
+                "Unknown agent in delegation chain",
+                85, session_id, tenant_id,
+                severity="critical",
+                detail=f"Delegation to unknown agent ID '{target_id}'",
+            )
+    return None
+
+
+async def check_mcp_inter_agent_data(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IAC-04a — disproportionate data volume in inter-agent MCP call."""
+    import json as _json
+    _INTER_AGENT = re.compile(r"(?i)(agent_handoff|delegate|sub_agent|call_agent|invoke_agent)")
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not _INTER_AGENT.search(tool_name):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        to = payload.get("tool_output", "")
+        input_size = len(_json.dumps(ti) if not isinstance(ti, str) else ti)
+        output_size = len(_json.dumps(to) if not isinstance(to, str) else to)
+        if input_size > 0 and output_size > input_size * 10:
+            return _make_finding(
+                "OW-ASI07", "IAC-04a",
+                "MCP-routed inter-agent data anomaly",
+                80, session_id, tenant_id,
+                severity="high",
+                detail="Disproportionate data volume in inter-agent MCP call",
+            )
+    return None
+
+
+async def check_unencrypted_inter_agent(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IAC-02a — inter-agent communication over unencrypted HTTP or with plaintext credential."""
+    import json as _json
+    _DELEGATION_PATTERNS = [r"(?i)(agent_handoff|delegate|call_agent|invoke_agent)"]
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not any(re.search(p, tool_name) for p in _DELEGATION_PATTERNS):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        if re.search(r"^http://", input_str):
+            return _make_finding(
+                "OW-ASI07", "IAC-02a",
+                "Unencrypted inter-agent communication",
+                80, session_id, tenant_id,
+                severity="high",
+                detail="Inter-agent communication over unencrypted HTTP",
+            )
+        if _CREDENTIAL_PATTERNS.search(input_str):
+            return _make_finding(
+                "OW-ASI07", "IAC-02a",
+                "Unencrypted inter-agent communication",
+                80, session_id, tenant_id,
+                severity="high",
+                detail="Credential transmitted in plaintext during inter-agent call",
+            )
+    return None
+
+
+async def check_semantics_split_brain(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IAC-06a — semantics split-brain (skeletal; multi-agent only)."""
+    return None  # skeletal — returns None for single-agent sessions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI08 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_multi_node_error_propagation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """CF-02a — multi-node error propagation (>= 3 distinct nodes with errors)."""
+    errored_nodes: set[str] = set()
+    tool_errors_after_node_error = 0
+    node_errored = False
+
+    for ev in events:
+        etype = ev["event_type"]
+        node_name = ev.get("node_name") or ""
+        if etype == "node_error" and node_name:
+            errored_nodes.add(node_name)
+            node_errored = True
+        elif node_errored and etype == "tool_error":
+            tool_errors_after_node_error += 1
+
+    if len(errored_nodes) >= 3:
+        return _make_finding(
+            "OW-ASI08", "CF-02a",
+            "Multi-node error propagation",
+            75, session_id, tenant_id,
+            severity="high",
+            detail=f"{len(errored_nodes)} distinct nodes failed — possible cascading failure",
+        )
+    if node_errored and tool_errors_after_node_error > 3:
+        return _make_finding(
+            "OW-ASI08", "CF-02a",
+            "Multi-node error propagation",
+            75, session_id, tenant_id,
+            severity="high",
+            detail=f"node_error followed by {tool_errors_after_node_error} tool errors",
+        )
+    return None
+
+
+async def check_auto_remediation_loop(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """CF-03a — auto-remediation feedback loop (node error-retry-error cycles)."""
+    # Count node_start → node_error → node_start → node_error cycles per node
+    node_sequences: dict[str, list[str]] = {}
+    for ev in events:
+        etype = ev["event_type"]
+        node_name = ev.get("node_name") or ""
+        if not node_name or etype not in ("node_start", "node_error"):
+            continue
+        node_sequences.setdefault(node_name, []).append(etype)
+
+    for node_name, seq in node_sequences.items():
+        # Count how many error→start transitions (retry cycles) happen
+        cycles = 0
+        for i in range(1, len(seq)):
+            if seq[i - 1] == "node_error" and seq[i] == "node_start":
+                cycles += 1
+        if cycles >= 3:
+            return _make_finding(
+                "OW-ASI08", "CF-03a",
+                "Auto-remediation feedback loop",
+                70, session_id, tenant_id,
+                severity="high",
+                detail=f"Node '{node_name}' in error-retry loop ({cycles} cycles)",
+            )
+    return None
+
+
+async def check_hallucination_propagation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """CF-04a — hallucination propagation in defense agents (skeletal)."""
+    return None  # skeletal — multi-agent prep
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI09 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CREDENTIAL_REQUEST_PATTERNS = [
+    r"(?i)(please\s+)?(enter|provide|share|give|type|input).{0,20}(password|credential|token|api.?key|secret|ssn|social\s+security)",
+    r"(?i)(what\s+is\s+your|can\s+you\s+share).{0,20}(password|login|credential)",
+    r"(?i)(verify|confirm).{0,15}(identity|account).{0,20}(password|pin|security\s+code)",
+]
+_PAYMENT_PATTERNS = [
+    r"(?i)(transfer|send|pay|wire).{0,30}(to\s+account|to\s+bank|IBAN|routing\s+number)",
+    r"(?i)(urgent|immediate).{0,20}(payment|transfer|wire)",
+    r"(?i)(updated?\s+)?bank.{0,10}(detail|account|info)",
+]
+_DESTRUCTIVE_TOOLS_PAT = re.compile(
+    r"(?i)(delete|drop|remove|purge|terminate|destroy|shutdown|wipe)"
+)
+_CONFIDENT_RATIONALE = re.compile(
+    r"(?i)(this is (necessary|required|safe|recommended)|I've (verified|confirmed|checked))"
+)
+_PREVIEW_TOOLS = re.compile(r"(?i)(preview|view|read|inspect|show|display)")
+_SIDE_EFFECT_PATTERNS = [
+    r"(?i)(webhook|callback|notify|trigger)",
+    r"(?i)(POST|PUT|DELETE|PATCH)",
+]
+
+
+async def check_credential_request_output(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """HAT-02a — credential request in agent output without HITL."""
+    import json as _json
+    has_interrupt = any(e["event_type"] == "interrupt_raised" for e in events)
+    if has_interrupt:
+        return None
+
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        payload = ev.get("payload") or {}
+        completion = payload.get("completion", "")
+        if not isinstance(completion, str):
+            completion = _json.dumps(completion)
+        for pat in _CREDENTIAL_REQUEST_PATTERNS:
+            if re.search(pat, completion):
+                return _make_finding(
+                    "OW-ASI09", "HAT-02a",
+                    "Credential request in agent output",
+                    85, session_id, tenant_id,
+                    severity="critical",
+                    detail="Agent output requests user credentials without HITL safeguard",
+                )
+    return None
+
+
+async def check_payment_detail_manipulation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """HAT-03a — payment detail manipulation in agent output."""
+    import json as _json
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        payload = ev.get("payload") or {}
+        completion = payload.get("completion", "")
+        if not isinstance(completion, str):
+            completion = _json.dumps(completion)
+        for pat in _PAYMENT_PATTERNS:
+            if re.search(pat, completion):
+                return _make_finding(
+                    "OW-ASI09", "HAT-03a",
+                    "Payment detail manipulation",
+                    90, session_id, tenant_id,
+                    severity="critical",
+                    detail="Agent output contains payment/transfer instruction",
+                )
+    return None
+
+
+async def check_fabricated_rationale(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """HAT-04a — fabricated rationale before destructive action."""
+    import json as _json
+
+    last_completion = ""
+    last_completion_idx = -1
+
+    for i, ev in enumerate(events):
+        if ev["event_type"] == "llm_end":
+            payload = ev.get("payload") or {}
+            c = payload.get("completion", "")
+            if not isinstance(c, str):
+                c = _json.dumps(c)
+            last_completion = c
+            last_completion_idx = i
+
+        elif ev["event_type"] == "tool_start":
+            tool_name = ev.get("tool_name") or ""
+            if not _DESTRUCTIVE_TOOLS_PAT.search(tool_name):
+                continue
+            if last_completion_idx < 0:
+                continue
+
+            # Check if confident rationale present but no verification tool between rationale and action
+            if not _CONFIDENT_RATIONALE.search(last_completion):
+                continue
+
+            # Check no retrieval/verification between rationale and this action
+            verify_between = any(
+                ev2["event_type"] == "tool_start"
+                and re.search(r"(?i)(search|verify|check|validate|retrieve)", ev2.get("tool_name") or "")
+                for ev2 in events[last_completion_idx + 1:i]
+            )
+            if not verify_between:
+                return _make_finding(
+                    "OW-ASI09", "HAT-04a",
+                    "Fabricated rationale before destructive act",
+                    80, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Destructive action '{tool_name}' preceded by unverified rationale",
+                )
+    return None
+
+
+async def check_side_effect_on_preview(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """HAT-05a — side-effect on preview/read-only action."""
+    import json as _json
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not _PREVIEW_TOOLS.search(tool_name):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        for pat in _SIDE_EFFECT_PATTERNS:
+            if re.search(pat, input_str):
+                return _make_finding(
+                    "OW-ASI09", "HAT-05a",
+                    "Side-effect on preview/read-only action",
+                    75, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Preview/read tool '{tool_name}' has side-effect indicators in args",
+                )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-ASI10 new sub-checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+_APPROVAL_TOOLS = re.compile(r"(?i)(approve|review|authorize|validate|sign_off)")
+_DESTRUCTIVE_COST_ACTIONS = [
+    r"(?i)(delete|remove|drop).{0,20}(backup|replica|snapshot|archive|log|cache)",
+    r"(?i)(terminate|shutdown|stop).{0,20}(instance|service|worker|replica)",
+    r"(?i)(reduce|downgrade|remove).{0,20}(redundancy|replication|failover)",
+]
+_OPTIMIZATION_INTENT = re.compile(
+    r"(?i)(optimize|reduce\s+cost|improve\s+metric|minimize)"
+)
+
+
+async def check_self_approval(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """RA-03a — agent self-approved action without external validation."""
+    import json as _json
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not _APPROVAL_TOOLS.search(tool_name):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        # Self-approval: approver field references same agent_id
+        if agent_id and agent_id in input_str:
+            return _make_finding(
+                "OW-ASI10", "RA-03a",
+                "Self-approval in workflow",
+                85, session_id, tenant_id,
+                severity="critical",
+                detail="Agent self-approved action without external validation",
+            )
+    return None
+
+
+async def check_destructive_optimization(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """RA-05a — destructive optimization (reward hacking)."""
+    import json as _json
+    initial_input = session.get("initial_input", "") or ""
+    if not _OPTIMIZATION_INTENT.search(initial_input):
+        return None
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        for pat in _DESTRUCTIVE_COST_ACTIONS:
+            if re.search(pat, input_str):
+                tool_name = ev.get("tool_name") or ""
+                return _make_finding(
+                    "OW-ASI10", "RA-05a",
+                    "Destructive optimization (reward hacking)",
+                    85, session_id, tenant_id,
+                    severity="critical",
+                    detail=f"Destructive action '{tool_name}' during optimization task",
+                )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Signal registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     # signal_a01 is called separately in orchestrator with per-event findings
+    # v2 signals
     ("OW-ASI03", signal_a03),
     ("OW-ASI04", signal_a04),
-    # signal_a02/a05/a06 were wrappers around per-event findings; removed now that
-    # _run_per_event_detectors produces those findings directly.
     ("OW-ASI07", signal_a07),
     ("OW-ASI08", signal_a08),
     ("OW-ASI09", signal_a09),
     ("OW-ASI10", signal_a10),
+    # v3: OW-ASI01 additions
+    ("OW-ASI01-zero-click",  signal_a01_zero_click),
+    ("OW-ASI01-goal-drift",  signal_a01_goal_drift),
+    # v3: OW-ASI02 additions
+    ("OW-ASI02-descriptor",  check_tool_descriptor_integrity),
+    ("OW-ASI02-overpriv",    check_over_privileged_tool),
+    ("OW-ASI02-exfil-chain", check_cross_tool_exfil),
+    ("OW-ASI02-typosquat",   check_tool_typosquatting),
+    ("OW-ASI02-admin-chain", check_admin_chain_exfil),
+    ("OW-ASI02-rep-misuse",  check_repetitive_tool_misuse),
+    # v3: OW-ASI03 additions
+    ("OW-ASI03-deleg",       check_delegation_abuse),
+    ("OW-ASI03-cred-reuse",  check_credential_reuse),
+    ("OW-ASI03-stale-auth",  check_stale_auth),
+    # v3: OW-ASI04 additions
+    ("OW-ASI04-mcp-imp",     check_mcp_impersonation),
+    ("OW-ASI04-agent-card",  check_agent_card_anomaly),
+    # v3: OW-ASI05 additions
+    ("OW-ASI05-exec-loop",   check_exec_loop),
+    ("OW-ASI05-backdoor",    check_code_backdoor),
+    ("OW-ASI05-chain-exp",   check_multi_tool_chain_exploit),
+    # v3: OW-ASI07 additions
+    ("OW-ASI07-unencrypted", check_unencrypted_inter_agent),
+    ("OW-ASI07-replay",      check_replay_attack),
+    ("OW-ASI07-mcp-data",    check_mcp_inter_agent_data),
+    ("OW-ASI07-unk-agent",   check_unknown_agent_delegation),
+    ("OW-ASI07-splitbrain",  check_semantics_split_brain),
+    # v3: OW-ASI08 additions
+    ("OW-ASI08-multi-node",  check_multi_node_error_propagation),
+    ("OW-ASI08-autofix",     check_auto_remediation_loop),
+    ("OW-ASI08-hallprop",    check_hallucination_propagation),
+    # v3: OW-ASI09 additions
+    ("OW-ASI09-cred-req",    check_credential_request_output),
+    ("OW-ASI09-payment",     check_payment_detail_manipulation),
+    ("OW-ASI09-rationale",   check_fabricated_rationale),
+    ("OW-ASI09-sideeffect",  check_side_effect_on_preview),
+    # v3: OW-ASI10 additions
+    ("OW-ASI10-selfapprove", check_self_approval),
+    ("OW-ASI10-dest-opt",    check_destructive_optimization),
 ]
 
 AGENT_SIGNAL_DESCRIPTION = {

@@ -531,6 +531,277 @@ def check_vector_integrity(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v3: OW-LLM04 / OW-LLM08 — pre-runtime exclusions (return not_observed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def signal_ow_llm04(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> None:
+    """OW-LLM04 — pre-runtime data/model poisoning. Not observable at inference time."""
+    return None  # pre-runtime exclusion
+
+
+def signal_ow_llm08(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> None:
+    """OW-LLM08 — pre-runtime vector/embedding weakness. Not observable at inference time."""
+    return None  # pre-runtime exclusion
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: PI-06a — Payload splitting across messages (OW-LLM01)
+# ─────────────────────────────────────────────────────────────────────────────
+def check_payload_splitting(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """PI-06a — split payload detected across consecutive user messages."""
+    from consumers.security_eval.detectors.injection import (
+        _REGEX_SIGNATURES,
+        INSTRUCTION_PATTERNS,
+    )
+
+    all_user_messages: list[str] = []
+    for ev in events:
+        if ev["event_type"] != "llm_start":
+            continue
+        payload = ev.get("payload") or {}
+        for msg in payload.get("messages", []):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                all_user_messages.append(str(msg.get("content", "")))
+
+    if len(all_user_messages) < 3:
+        return []
+
+    all_patterns = [sig["pattern"] for sig in _REGEX_SIGNATURES] + INSTRUCTION_PATTERNS
+
+    def individual_matches(text: str) -> bool:
+        return any(re.search(p, text) for p in all_patterns)
+
+    for i in range(len(all_user_messages) - 2):
+        window = all_user_messages[i:i + 3]
+        combined = " ".join(window)
+        if individual_matches(combined):
+            if not any(individual_matches(m) for m in window):
+                return [_make_finding(
+                    "OW-LLM01", "PI-06a",
+                    "Payload splitting across messages",
+                    88, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Split payload detected across messages {i}..{i + 2}",
+                )]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: IOH-04a — Insecure code pattern in generated output (OW-LLM05)
+# ─────────────────────────────────────────────────────────────────────────────
+_INSECURE_CODE_PATTERNS = [
+    r"eval\s*\(",
+    r"(?i)password\s*=\s*['\"][^'\"]+['\"]",
+    r"(?i)verify\s*=\s*False",
+    r"(?i)shell\s*=\s*True",
+    r"(?i)innerHTML\s*=",
+    r"(?i)SELECT\s.+FROM\s.+WHERE\s.+['\"]?\s*\+\s*",
+    r"(?i)pickle\.loads?\s*\(",
+    r"(?i)yaml\.load\s*\(",
+]
+_CODE_FENCE = re.compile(r"```[\s\S]*?```")
+
+
+def check_insecure_code_output(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """IOH-04a — insecure code pattern in LLM-generated code blocks."""
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        payload = ev.get("payload") or {}
+        completion = payload.get("completion", "")
+        if not isinstance(completion, str):
+            completion = json.dumps(completion)
+
+        code_blocks = _CODE_FENCE.findall(completion)
+        if not code_blocks:
+            continue
+
+        matched_patterns: list[str] = []
+        for block in code_blocks:
+            for pat in _INSECURE_CODE_PATTERNS:
+                if re.search(pat, block):
+                    matched_patterns.append(pat)
+
+        if matched_patterns:
+            return [_make_finding(
+                "OW-LLM05", "IOH-04a",
+                "Insecure code pattern in generated output",
+                70, session_id, tenant_id,
+                severity="high",
+                detail=f"Insecure pattern(s) in generated code: {matched_patterns[:3]}",
+            )]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: SAG-02a — Hallucinated package reference (OW-LLM09)
+# ─────────────────────────────────────────────────────────────────────────────
+_PIP_INSTALL = re.compile(r"pip\s+install\s+([\w\-\.]+)", re.IGNORECASE)
+_NPM_INSTALL = re.compile(r"npm\s+install\s+([\w\-@/]+)", re.IGNORECASE)
+
+
+def check_hallucinated_packages(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """SAG-02a — potentially hallucinated package name in generated code."""
+    from core.config import KNOWN_HALLUCINATED_PACKAGES, HALLUCINATED_SHORT_WORDS
+
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        payload = ev.get("payload") or {}
+        completion = payload.get("completion", "")
+        if not isinstance(completion, str):
+            continue
+
+        code_blocks = _CODE_FENCE.findall(completion)
+        if not code_blocks:
+            continue
+
+        for block in code_blocks:
+            for match in _PIP_INSTALL.finditer(block):
+                pkg = match.group(1).strip()
+                if pkg in KNOWN_HALLUCINATED_PACKAGES or (
+                    len(pkg) < 4 and pkg.lower() in HALLUCINATED_SHORT_WORDS
+                ):
+                    return [_make_finding(
+                        "OW-LLM09", "SAG-02a",
+                        "Hallucinated package reference",
+                        65, session_id, tenant_id,
+                        severity="medium",
+                        detail=f"Potentially hallucinated package: {pkg}",
+                    )]
+            for match in _NPM_INSTALL.finditer(block):
+                pkg = match.group(1).strip()
+                if pkg in KNOWN_HALLUCINATED_PACKAGES:
+                    return [_make_finding(
+                        "OW-LLM09", "SAG-02a",
+                        "Hallucinated package reference",
+                        65, session_id, tenant_id,
+                        severity="medium",
+                        detail=f"Potentially hallucinated npm package: {pkg}",
+                    )]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: SAG-03a — High-stakes domain without grounding (OW-LLM09)
+# ─────────────────────────────────────────────────────────────────────────────
+_HIGH_STAKES_DOMAINS = {
+    "medical":   r"(?i)(dosage|prescri|diagnos|medication|symptom|treatment|drug\s+interact)",
+    "legal":     r"(?i)(legal\s+advice|lawsuit|liability|statute|regulation\s+require)",
+    "financial": r"(?i)(invest|buy\s+stock|sell\s+stock|financial\s+advice|guaranteed\s+return)",
+}
+_RETRIEVAL_TOOL = re.compile(r"(?i)(search|retrieve|lookup|query|fetch|rag)")
+
+
+def check_ungrounded_high_stakes(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """SAG-03a — high-stakes domain output without retrieval grounding or HITL."""
+    has_retrieval = any(
+        ev["event_type"] == "tool_start"
+        and _RETRIEVAL_TOOL.search(ev.get("tool_name", ""))
+        for ev in events
+    )
+    has_interrupt = any(ev["event_type"] == "interrupt_raised" for ev in events)
+    if has_retrieval or has_interrupt:
+        return []
+
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        payload = ev.get("payload") or {}
+        completion = payload.get("completion", "")
+        if not isinstance(completion, str):
+            continue
+
+        for domain, pattern in _HIGH_STAKES_DOMAINS.items():
+            if re.search(pattern, completion):
+                return [_make_finding(
+                    "OW-LLM09", "SAG-03a",
+                    "High-stakes domain without grounding",
+                    60, session_id, tenant_id,
+                    severity="medium",
+                    detail=f"High-stakes {domain} output without retrieval grounding or HITL",
+                )]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3: UBC-02a — Input size anomaly (OW-LLM10)
+# ─────────────────────────────────────────────────────────────────────────────
+async def check_input_size_anomaly(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    agent_id: str,
+) -> list["Finding"]:
+    """UBC-02a — session input tokens > 4σ above 7-day baseline for this agent."""
+    session_input_tokens = sum(
+        e.get("llm_input_tokens") or 0
+        for e in events
+        if e["event_type"] == "llm_end"
+    )
+
+    from core.infra import clickhouse as ch
+    baseline_rows = await ch.fetch(
+        """
+        SELECT session_id, SUM(llm_input_tokens) AS input_tokens
+        FROM obs_events
+        WHERE agent_id   = %(agent_id)s
+          AND event_type = 'llm_end'
+          AND emitted_at >= now() - INTERVAL 7 DAY
+        GROUP BY session_id
+        """,
+        agent_id=str(agent_id),
+    )
+    if len(baseline_rows) < 5:
+        return []
+
+    counts = [float(r["input_tokens"]) for r in baseline_rows]
+    mean = sum(counts) / len(counts)
+    variance = sum((c - mean) ** 2 for c in counts) / len(counts)
+    stddev = variance ** 0.5
+    if stddev == 0:
+        return []
+
+    if session_input_tokens > mean + 4 * stddev:
+        return [_make_finding(
+            "OW-LLM10", "UBC-02a",
+            "Input size anomaly",
+            50, session_id, tenant_id,
+            severity="medium",
+            detail=f"Input tokens {session_input_tokens} exceeds 4σ above baseline {mean:.0f}",
+        )]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Signal registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 

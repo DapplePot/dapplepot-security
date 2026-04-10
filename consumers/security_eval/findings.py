@@ -5,7 +5,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from core.config import settings, SIGNAL_ALERT_THRESHOLDS, COMPOSITE_ALERT_THRESHOLD
+from core.config import (
+    settings,
+    SIGNAL_ALERT_THRESHOLDS,
+    COMPOSITE_ALERT_THRESHOLD,
+    SIGNAL_ALERT_THRESHOLDS_V3,
+    COMPOSITE_ALERT_THRESHOLD_V3,
+    CONFIDENCE_WEIGHTS,
+)
 
 _producer = None
 
@@ -30,9 +37,12 @@ class Finding:
     check_score: int        # per-sub-check weight 0–100
     category: str           # threat category e.g. "prompt_injection", "data_disclosure"
     severity: str           # critical | high | medium | low
-    detection_phase: str    # online | post_session
+    detection_phase: str    # online | post_session | cross_session
     matched_text: str | None = None
     detail: str | None = None
+    # v3 confidence fields
+    confidence_tier: str = "high"   # deterministic | high | medium | low | skeletal
+    confidence: float = field(init=False)
     # Derived in __post_init__ — not init params
     framework: str = field(init=False)  # "LLM" | "ASI" | future frameworks
 
@@ -40,6 +50,8 @@ class Finding:
         # Derive framework from owasp_signal_id: "OW-LLM01" → "LLM", "OW-ASI03" → "ASI"
         parts = self.owasp_signal_id.split("-")
         self.framework = parts[1][:3] if len(parts) >= 2 else "LLM"
+        # Derive confidence float from tier
+        self.confidence = CONFIDENCE_WEIGHTS.get(self.confidence_tier, 0.9)
 
 
 async def write_findings(findings: list[Finding]) -> None:
@@ -52,8 +64,9 @@ async def write_findings(findings: list[Finding]) -> None:
         INSERT INTO security_findings
             (tenant_id, session_id, event_id, event_type,
              framework, owasp_signal_id, sub_check_id, check_label, check_score,
-             category, severity, detection_phase, matched_text, detail)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             category, severity, detection_phase, matched_text, detail,
+             confidence_tier, confidence)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         ON CONFLICT (session_id, sub_check_id) DO UPDATE SET
             check_score     = GREATEST(security_findings.check_score, EXCLUDED.check_score),
             severity        = CASE
@@ -64,7 +77,9 @@ async def write_findings(findings: list[Finding]) -> None:
                               END,
             detection_phase = EXCLUDED.detection_phase,
             detail          = COALESCE(EXCLUDED.detail, security_findings.detail),
-            matched_text    = COALESCE(security_findings.matched_text, EXCLUDED.matched_text)
+            matched_text    = COALESCE(security_findings.matched_text, EXCLUDED.matched_text),
+            confidence_tier = EXCLUDED.confidence_tier,
+            confidence      = EXCLUDED.confidence
         WHERE EXCLUDED.check_score >= security_findings.check_score
         """,
         [
@@ -83,6 +98,8 @@ async def write_findings(findings: list[Finding]) -> None:
                 f.detection_phase,
                 f.matched_text,
                 f.detail,
+                f.confidence_tier,
+                f.confidence,
             )
             for f in findings
         ],
@@ -94,6 +111,11 @@ async def write_agent_risk_score(
     tenant_id: str,
     llm_score: int,
     asi_score: int,
+    trust_score: float = 80.0,
+    trust_trend: str = "stable",
+    trust_trend_slope: float = 0.0,
+    trust_alpha: float = 2.0,
+    trust_beta: float = 8.0,
 ) -> None:
     """Upsert per-agent aggregate risk in agent_risk_scores (rolling stats)."""
     from core.infra.postgres import get_pool
@@ -103,19 +125,26 @@ async def write_agent_risk_score(
         INSERT INTO agent_risk_scores
             (agent_id, tenant_id, session_count,
              avg_llm_score, avg_asi_score,
-             max_llm_score, max_asi_score, last_scored_at)
-        VALUES ($1, $2, 1, $3, $4, $5, $6, now())
+             max_llm_score, max_asi_score, last_scored_at,
+             trust_score, trust_trend, trust_trend_slope,
+             trust_alpha, trust_beta)
+        VALUES ($1, $2, 1, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11)
         ON CONFLICT (agent_id) DO UPDATE SET
-            session_count  = agent_risk_scores.session_count + 1,
-            avg_llm_score  = (
+            session_count       = agent_risk_scores.session_count + 1,
+            avg_llm_score       = (
                 agent_risk_scores.avg_llm_score * agent_risk_scores.session_count + $3
             ) / (agent_risk_scores.session_count + 1),
-            avg_asi_score  = (
+            avg_asi_score       = (
                 agent_risk_scores.avg_asi_score * agent_risk_scores.session_count + $4
             ) / (agent_risk_scores.session_count + 1),
-            max_llm_score  = GREATEST(agent_risk_scores.max_llm_score, $5),
-            max_asi_score  = GREATEST(agent_risk_scores.max_asi_score, $6),
-            last_scored_at = now()
+            max_llm_score       = GREATEST(agent_risk_scores.max_llm_score, $5),
+            max_asi_score       = GREATEST(agent_risk_scores.max_asi_score, $6),
+            last_scored_at      = now(),
+            trust_score         = $7,
+            trust_trend         = $8,
+            trust_trend_slope   = $9,
+            trust_alpha         = $10,
+            trust_beta          = $11
         """,
         agent_id,
         tenant_id,
@@ -123,6 +152,11 @@ async def write_agent_risk_score(
         float(asi_score),
         llm_score,
         asi_score,
+        trust_score,
+        trust_trend,
+        trust_trend_slope,
+        trust_alpha,
+        trust_beta,
     )
 
 
@@ -159,11 +193,13 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
             "sub_check_id":    f.sub_check_id,
             "check_label":     f.check_label,
             "check_score":     f.check_score,
+            "effective_score": round(f.check_score * f.confidence),
+            "confidence_tier": f.confidence_tier,
             "category":        f.category,
             "severity":        f.severity,
             "detail":          f.detail,
         }
-        for f in sorted(findings, key=lambda x: x.check_score, reverse=True)[:5]
+        for f in sorted(findings, key=lambda x: x.check_score * x.confidence, reverse=True)[:5]
     ]
 
     alert = {
@@ -191,6 +227,12 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
             # Signal status maps (OW-canonical)
             "llm_signal_status": llm_status,
             "asi_signal_status": asi_status,
+            # v3: attack chains, amplification, confidence, trust
+            "attack_chains_detected": score_row.get("attack_chains_detected", []),
+            "amplification":          score_row.get("amplification", 1.0),
+            "confidence_band":        score_row.get("confidence_band", "high"),
+            "trust_score":            score_row.get("trust_score"),
+            "trust_trend":            score_row.get("trust_trend"),
             # Top findings
             "top_findings": top_findings,
             "summary": {
@@ -199,7 +241,7 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
                 "asi_signals_fired": asi_fired,
                 "asi_signals_clean": asi_clean,
             },
-            "signal_taxonomy_version": "2.0",
+            "signal_taxonomy_version": "3.0",
             "scorer_version": score_row["scorer_version"],
         },
     }

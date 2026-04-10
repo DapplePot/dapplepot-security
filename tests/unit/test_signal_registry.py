@@ -20,8 +20,8 @@ ALL_EXPECTED_SIGNALS = {
 }
 
 
-def test_registry_has_at_least_80_entries():
-    assert len(REGISTRY) >= 80, f"Expected >= 80, got {len(REGISTRY)}"
+def test_registry_has_at_least_156_entries():
+    assert len(REGISTRY) >= 156, f"Expected >= 156, got {len(REGISTRY)}"
 
 
 def test_all_20_parent_signals_represented():
@@ -58,7 +58,7 @@ def test_categories_are_valid():
 
 
 def test_detection_phases_are_valid():
-    valid_phases = {"online", "post_session", "both", "excluded"}
+    valid_phases = {"online", "post_session", "both", "excluded", "cross_session"}
     invalid = [(row[0], row[1], row[5]) for row in REGISTRY if row[5] not in valid_phases]
     assert not invalid, f"Invalid detection_phase: {invalid}"
 
@@ -67,7 +67,7 @@ def test_excluded_checks_have_reason():
     missing_reason = [
         (row[0], row[1])
         for row in REGISTRY
-        if row[8] is True and not row[9]  # excluded=True but no exclusion_reason
+        if row[9] is True and not row[10]  # excluded=True but no exclusion_reason
     ]
     assert not missing_reason, f"Excluded checks without reason: {missing_reason}"
 
@@ -75,7 +75,21 @@ def test_excluded_checks_have_reason():
 def test_llm03_is_excluded():
     llm03_entries = [row for row in REGISTRY if row[0] == "OW-LLM03"]
     assert llm03_entries, "OW-LLM03 must have at least one entry"
-    assert all(row[8] for row in llm03_entries), "All OW-LLM03 entries must be excluded=True"
+    assert all(row[9] for row in llm03_entries), "All OW-LLM03 entries must be excluded=True"
+
+
+def test_dmp_and_vew_exclusions():
+    """DMP-01a/c and VEW-01b/02a must be marked excluded (pre-runtime signals)."""
+    expected_excluded = {"DMP-01a", "DMP-01c", "VEW-01b", "VEW-02a"}
+    excluded_ids = {row[1] for row in REGISTRY if row[9] is True}
+    missing = expected_excluded - excluded_ids
+    assert not missing, f"Expected excluded sub-checks not found: {missing}"
+
+
+def test_confidence_tier_values_are_valid():
+    valid_tiers = {"deterministic", "high", "medium", "low", "skeletal"}
+    invalid = [(row[0], row[1], row[8]) for row in REGISTRY if row[8] not in valid_tiers]
+    assert not invalid, f"Invalid confidence_tier values: {invalid}"
 
 
 def test_critical_sub_checks_have_high_scores():
@@ -83,6 +97,6 @@ def test_critical_sub_checks_have_high_scores():
     low_critical = [
         (row[0], row[1], row[6])
         for row in REGISTRY
-        if row[7] == "critical" and row[6] < 85 and not row[8]
+        if row[7] == "critical" and row[6] < 85 and not row[9]
     ]
     assert not low_critical, f"Critical sub-checks with check_score < 85: {low_critical}"
