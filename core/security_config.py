@@ -294,13 +294,19 @@ async def get_agent_security_config(
                 agent_id,
             )
             if alert_row:
-                # Shared fallback (legacy)
-                cfg_dict["composite_alert_threshold"] = alert_row["composite_threshold"]
-                # Per-framework overrides (NULL → keep model default of 60)
-                if alert_row["llm_composite_threshold"] is not None:
-                    cfg_dict["llm_composite_alert_threshold"] = alert_row["llm_composite_threshold"]
-                if alert_row["asi_composite_threshold"] is not None:
-                    cfg_dict["asi_composite_alert_threshold"] = alert_row["asi_composite_threshold"]
+                composite = alert_row["composite_threshold"]
+                cfg_dict["composite_alert_threshold"] = composite
+                # Per-framework: NULL → fall back to shared composite_threshold
+                cfg_dict["llm_composite_alert_threshold"] = (
+                    alert_row["llm_composite_threshold"]
+                    if alert_row["llm_composite_threshold"] is not None
+                    else composite
+                )
+                cfg_dict["asi_composite_alert_threshold"] = (
+                    alert_row["asi_composite_threshold"]
+                    if alert_row["asi_composite_threshold"] is not None
+                    else composite
+                )
                 sig_thresholds = alert_row["signal_thresholds"]
                 if isinstance(sig_thresholds, str):
                     sig_thresholds = json.loads(sig_thresholds)

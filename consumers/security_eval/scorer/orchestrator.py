@@ -546,16 +546,23 @@ async def score_session(
             if sig_cfg is None or sig_cfg.enabled:
                 all_findings.append(finding)
 
-    # Additional sub-check helpers (return lists)
-    all_findings.extend(check_multi_turn_jailbreak(events, session_id, tenant_id))
-    all_findings.extend(check_payload_splitting(events, session_id, tenant_id))
-    all_findings.extend(check_rag_integrity(events, session_id, tenant_id, baseline={}))
-    all_findings.extend(check_system_prompt_leakage(events, session_id, tenant_id))
-    all_findings.extend(check_vector_integrity(events, session_id, tenant_id))
-    all_findings.extend(check_insecure_code_output(events, session_id, tenant_id))
-    all_findings.extend(check_hallucinated_packages(events, session_id, tenant_id))
-    all_findings.extend(check_ungrounded_high_stakes(events, session_id, tenant_id))
-    all_findings.extend(await check_input_size_anomaly(events, session_id, tenant_id, agent_id))
+    # Additional sub-check helpers (return lists) — filter by per-signal enabled flag.
+    def _extend_if_enabled(findings: list) -> None:
+        for f in findings:
+            sig_id  = getattr(f, "owasp_signal_id", None)
+            sig_cfg = sec_config.signals.get(sig_id) if sig_id else None
+            if sig_cfg is None or sig_cfg.enabled:
+                all_findings.append(f)
+
+    _extend_if_enabled(check_multi_turn_jailbreak(events, session_id, tenant_id))
+    _extend_if_enabled(check_payload_splitting(events, session_id, tenant_id))
+    _extend_if_enabled(check_rag_integrity(events, session_id, tenant_id, baseline={}))
+    _extend_if_enabled(check_system_prompt_leakage(events, session_id, tenant_id))
+    _extend_if_enabled(check_vector_integrity(events, session_id, tenant_id))
+    _extend_if_enabled(check_insecure_code_output(events, session_id, tenant_id))
+    _extend_if_enabled(check_hallucinated_packages(events, session_id, tenant_id))
+    _extend_if_enabled(check_ungrounded_high_stakes(events, session_id, tenant_id))
+    _extend_if_enabled(await check_input_size_anomaly(events, session_id, tenant_id, agent_id))
 
     # ─── Session-level OW-ASI signals ────────────────────────────────────────
     from consumers.security_eval.scorer.asi_signals import signal_a01
