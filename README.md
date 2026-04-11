@@ -66,7 +66,7 @@ Kafka obs.events.v1  (same topic as dapplepot_pipeline, separate consumer group)
               │     ├── Confidence-weighted per-signal scores
               │     ├── Attack chain detection + amplification (7 chains)
               │     ├── v3 composite score (0–100) per framework
-              │     └── Alert fires when composite >= COMPOSITE_ALERT_THRESHOLD (65)
+              │     └── Alert fires when composite >= composite threshold (default 60, per-agent configurable)
               │
               └── Trust scoring — trust.py                         ← v3 NEW
                     Bayesian Beta(α=2,β=8) prior + temporal decay + trend detection
@@ -214,6 +214,8 @@ dapplepot_security/
 │
 ├── core/
 │   ├── config.py                   ← pydantic-settings: Kafka, PG, CH, Redis, CONFIDENCE_WEIGHTS, thresholds
+│   ├── security_config.py          ← AgentSecurityConfig: per-agent signal toggles, composite thresholds,
+│   │                                  online sub-check detection; Redis-cached (TTL 300s)
 │   └── infra/
 │       ├── kafka.py
 │       ├── postgres.py
@@ -224,18 +226,17 @@ dapplepot_security/
 │   └── postgres/
 │       ├── 001_security_findings.sql
 │       ├── 002_session_risk_scores.sql
-│       ├── 003_injection_signatures.sql
-│       ├── 004_indexes.sql
-│       ├── 005_agent_security_schema.sql
-│       ├── 006_reporting_views.sql
-│       ├── 007_signal_status.sql
-│       ├── 008_agent_profile_views.sql
-│       ├── 009_drop_session_fk.sql
-│       ├── 010_signal_id_upgrade.sql
-│       ├── 011_signal_status_upgrade.sql
-│       ├── 012_signal_registry.sql
-│       ├── 013_v3_scoring.sql      ← v3: confidence_tier on signal_registry + findings, v3 composite JSONB
-│       └── 014_trust_scores.sql    ← v3: trust_score + trust columns on agent_risk_scores
+│       ├── 003_agent_risk_scores.sql
+│       ├── 004_injection_signatures.sql
+│       ├── 005_signal_registry.sql
+│       ├── 006_indexes.sql
+│       ├── 007_views.sql
+│       ├── 008_findings_dedup.sql
+│       ├── 013_v3_scoring.sql          ← v3: confidence_tier on signal_registry + findings, v3 composite JSONB
+│       ├── 014_cross_session_indexes.sql
+│       ├── 016_subcheck_online_toggle.sql  ← agent_subcheck_overrides table
+│       ├── 017_agent_alert_config.sql      ← agent_alert_config table (per-agent thresholds)
+│       └── 018_split_composite_thresholds.sql ← llm/asi composite threshold columns
 │
 ├── tests/
 │   ├── unit/
@@ -285,7 +286,7 @@ cd dapplepot_security
 uv sync
 cp .env.example .env
 
-make setup          # migrations 001-014 + seed-sigs + seed-signal-registry + seed-dev-scores
+make setup          # migrations 001-018 + seed-sigs + seed-signal-registry + seed-dev-scores
 make run            # starts dp-security-eval Kafka consumer
 ```
 
@@ -331,6 +332,21 @@ Key columns: `owasp_signal_id`, `sub_check_id` (PK), `label`, `owasp_category`,
 
 Tenant-specific injection detection patterns. Cached in Redis at
 `dp:sec:sigs:{tenant_id}`, TTL 300s.
+
+### `agent_subcheck_overrides`
+
+Per-agent sub-check online detection toggles. Key: `(tenant_id, agent_id)`.
+`overrides` JSONB maps `sub_check_id → {online_detection: bool}`.
+When a sub-check is toggled online, the post-session scorer skips it to avoid
+double-counting with the SDK's real-time detection.
+
+### `agent_alert_config`
+
+Per-agent alert threshold overrides. Key: `(tenant_id, agent_id)`.
+Columns: `composite_threshold` (shared fallback), `llm_composite_threshold`,
+`asi_composite_threshold` (NULL = use shared fallback), `signal_thresholds` JSONB
+(map of `signal_id → threshold` overrides). Absent entries fall back to platform
+defaults in `SIGNAL_ALERT_THRESHOLDS_V3`.
 
 ---
 
@@ -424,9 +440,11 @@ Trend detection: linear regression on last 20 sessions → `improving` / `stable
 
 ### Alert thresholds
 Alert fires when:
-- Any individual signal score >= `SIGNAL_ALERT_THRESHOLDS[signal_id]` (per-signal), OR
-- Either composite score >= `COMPOSITE_ALERT_THRESHOLD` (default 65), OR
+- Any individual signal score >= per-signal `alert_threshold` from `AgentSecurityConfig` (platform default in `SIGNAL_ALERT_THRESHOLDS_V3`), OR
+- LLM composite >= `llm_composite_alert_threshold` (default 60), OR ASI composite >= `asi_composite_alert_threshold` (default 60), OR
 - Agent `trust_score` < `TRUST_ALERT_THRESHOLD` for N consecutive sessions
+
+Thresholds are configurable per-agent via `agent_alert_config` (Postgres) + Redis cache.
 
 ### Overlap dedup groups (v3)
 
@@ -448,6 +466,10 @@ Alert fires when:
 | Key pattern | Owner | TTL |
 |-------------|-------|-----|
 | `dp:sec:sigs:{tenant_id}` | `detectors/injection.py` | 300s |
+| `dp:sec:defaults` | `core/security_config.py` | no expiry |
+| `dp:sec:{tenant_id}:overrides` | `core/security_config.py` | no expiry (reserved) |
+| `dp:sec:{tenant_id}:agent:{agent_id}:overrides` | `core/security_config.py` | no expiry (reserved) |
+| `dp:sec:{tenant_id}:agent:{agent_id}:cfg` | `core/security_config.py` | 300s |
 
 ---
 
@@ -517,7 +539,7 @@ make health ARGS="--max-lag 5000"  # custom threshold
 Step 1  cd dapplepot_pipeline && docker compose up -d
 Step 2  cd dapplepot_pipeline && make setup        # topics + PG migrations + ClickHouse
 Step 2b cd dapplepot_pipeline && make seed-dev     # tenant · agent · sdk_key · sessions
-Step 3  cd dapplepot_security && make setup        # PG migrations 001-014 + seed-sigs + seed-scores
+Step 3  cd dapplepot_security && make setup        # PG migrations 001-018 + seed-sigs + seed-scores
 Step 4  cd dapplepot_pipeline && make run-ingest   # + run-session-writer + run-event-appender
                                                    # + run-policy-evaluator + run-alert-router
 Step 5  cd dapplepot_security && make run          # dp-security-eval

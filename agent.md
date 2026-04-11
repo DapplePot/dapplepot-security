@@ -128,6 +128,10 @@ dapplepot_security/
 ├── core/
 │   ├── __init__.py
 │   ├── config.py                           ← pydantic-settings: Kafka, PG, CH, Redis, thresholds
+│   ├── security_config.py                  ← AgentSecurityConfig (Pydantic): per-agent signal on/off,
+│   │                                          alert thresholds, online sub-check toggles;
+│   │                                          get_agent_security_config(), push_agent_defaults(),
+│   │                                          ensure_platform_defaults(), invalidate_agent_config_cache()
 │   └── infra/
 │       ├── __init__.py
 │       ├── kafka.py                        ← confluent-kafka consumer + producer factory
@@ -139,20 +143,19 @@ dapplepot_security/
 │   └── postgres/
 │       ├── 001_security_findings.sql       ← security_findings table
 │       ├── 002_session_risk_scores.sql     ← session_risk_scores table
-│       ├── 003_injection_signatures.sql    ← injection_signatures table
-│       ├── 004_indexes.sql                 ← all indexes
-│       ├── 005_agent_security_schema.sql   ← owasp_framework column + agent_risk_scores table
-│       ├── 006_reporting_views.sql
-│       ├── 007_signal_status.sql           ← llm_signal_status + agent_signal_status columns
-│       ├── 008_agent_profile_views.sql
-│       ├── 009_drop_session_fk.sql         ← drops sessions FK (race condition fix)
-│       ├── 010_signal_id_upgrade.sql       ← adds owasp_signal_id, sub_check_id, check_score, check_label
-│       ├── 011_signal_status_upgrade.sql   ← adds ow_llm_signal_status / ow_asi_signal_status JSONB + GIN idx
-│       ├── 012_signal_registry.sql         ← signal_registry table (PK: owasp_signal_id + sub_check_id)
+│       ├── 003_agent_risk_scores.sql       ← agent_risk_scores table
+│       ├── 004_injection_signatures.sql    ← injection_signatures table
+│       ├── 005_signal_registry.sql         ← signal_registry table (PK: owasp_signal_id + sub_check_id)
+│       ├── 006_indexes.sql                 ← all indexes
+│       ├── 007_views.sql                   ← reporting views
+│       ├── 008_findings_dedup.sql          ← dedup constraint on security_findings
 │       ├── 013_v3_scoring.sql              ← v3: confidence_tier on signal_registry + security_findings;
 │       │                                      v3_llm_composite / v3_asi_composite JSONB on session_risk_scores
-│       └── 014_trust_scores.sql            ← v3: trust_score, trust_alpha, trust_beta, trust_trend,
-│                                              trust_last_updated on agent_risk_scores
+│       ├── 014_cross_session_indexes.sql   ← v3: trust_score + trust columns on agent_risk_scores;
+│       │                                      cross-session indexes
+│       ├── 016_subcheck_online_toggle.sql  ← agent_subcheck_overrides table
+│       ├── 017_agent_alert_config.sql      ← agent_alert_config table (per-agent alert thresholds)
+│       └── 018_split_composite_thresholds.sql ← adds llm_composite_threshold / asi_composite_threshold
 │
 ├── tests/
 │   ├── conftest.py
@@ -424,10 +427,16 @@ def compute_agent_trust_score(agent_id, sessions) -> dict:
 
 **Alert logic:**
 ```python
+# orchestrator.py loads AgentSecurityConfig from Redis (get_agent_security_config) on each session.
 # Alert fires if:
-# (a) any individual signal effective_score >= SIGNAL_ALERT_THRESHOLDS.get(sig_id, 80), OR
-# (b) either composite score >= COMPOSITE_ALERT_THRESHOLD (65), OR
+# (a) any individual signal effective_score >= sec_config.signals[sig_id].alert_threshold
+#     (platform default: SIGNAL_ALERT_THRESHOLDS_V3; overridable per-agent via agent_alert_config), OR
+# (b) LLM composite >= sec_config.llm_composite_alert_threshold (default 60), OR
+#     ASI composite >= sec_config.asi_composite_alert_threshold (default 60), OR
 # (c) agent trust_score < TRUST_ALERT_THRESHOLD for N consecutive sessions
+#
+# Sub-checks with is_online=True in sec_config are skipped in post-session to avoid
+# double-counting with the SDK's real-time detection pass.
 ```
 
 **Overlap dedup groups v3** (resolved in `orchestrator.py`):
@@ -449,9 +458,11 @@ OVERLAP_GROUPS_V3 = {
 ```python
 async def score_session(tenant_id, session_id, agent_id, online_findings) -> dict:
     """
+    0.  Load AgentSecurityConfig from Redis via get_agent_security_config().
+        Determines per-signal enabled/threshold and which sub-checks to skip (online_ids).
     1.  Fetch full event list from ClickHouse.
     2.  Fetch session row from Postgres.
-    3.  Run per-event detectors (replay events) → per_event_findings.
+    3.  Run per-event detectors (replay events), skip sub-checks in online_ids → per_event_findings.
     4.  Run OW-LLM signal functions → llm_findings.
     5.  Run OW-ASI signal functions → asi_findings.
     6.  Run cross-session signals → cross_session_findings.         ← v3 NEW
@@ -463,7 +474,7 @@ async def score_session(tenant_id, session_id, agent_id, online_findings) -> dic
     12. compute_agent_trust_score() → trust_score, trend.           ← v3 NEW
     13. Upsert agent_risk_scores (with trust columns).              ← v3 CHANGED
     14. Resolve dedup_key via resolve_overlap_group().
-    15. Alert if thresholds breached (score or trust).
+    15. Alert if thresholds breached using sec_config per-agent thresholds.
     scorer_version = "3.0.0"
     """
 ```
@@ -528,6 +539,71 @@ async def check_cross_tenant_retrieval(tenant_id, session_id) -> Finding | None
 async def check_persistent_exfil(tenant_id, agent_id) -> Finding | None
     # RA-02a: same external endpoint appears in >= 3 sessions (ClickHouse)
 ```
+
+---
+
+## 6b. Security configuration system (`core/security_config.py`)
+
+Two-level per-agent security config, Redis-cached (TTL 300s).
+
+### Models
+
+```python
+class SignalConfig(BaseModel):
+    enabled: bool = True
+    alert_threshold: int = 70   # fires threshold-based alert when signal >= this
+
+class SubCheckOverride(BaseModel):
+    online_detection: bool = False  # True → SDK handles it; post-session scorer skips it
+
+class AgentSecurityConfig(BaseModel):
+    signals: dict[str, SignalConfig]          # keyed by OW-LLM01..OW-ASI10
+    composite_alert_threshold:     int = 60   # shared fallback
+    llm_composite_alert_threshold: int = 60
+    asi_composite_alert_threshold: int = 60
+    subcheck_overrides: dict[str, SubCheckOverride]  # keyed by sub_check_id
+
+    def is_online(self, sub_check_id: str) -> bool: ...
+    def online_subcheck_ids(self) -> frozenset[str]: ...
+```
+
+### Redis key layout
+
+| Key | Content | TTL |
+|-----|---------|-----|
+| `dp:sec:defaults` | Platform-default `AgentSecurityConfig` JSON | no expiry |
+| `dp:sec:{tenant_id}:overrides` | Tenant-wide override dict (reserved) | no expiry |
+| `dp:sec:{tenant_id}:agent:{agent_id}:overrides` | Agent-specific override dict (reserved) | no expiry |
+| `dp:sec:{tenant_id}:agent:{agent_id}:cfg` | Merged effective config (cached) | 300s |
+
+### Merge order (later wins)
+1. Platform defaults (`dp:sec:defaults`)
+2. Tenant-wide overrides
+3. Agent-specific overrides
+4. Sub-check online toggles from `agent_subcheck_overrides` (Postgres)
+5. Alert threshold overrides from `agent_alert_config` (Postgres)
+
+### Public API
+
+```python
+async def ensure_platform_defaults(redis) -> None
+    # Seeds dp:sec:defaults if absent. Called at startup.
+
+async def push_agent_defaults(redis, tenant_id, agent_id) -> AgentSecurityConfig
+    # Called on agent_created Kafka event. Writes merged config to Redis cache.
+
+async def get_agent_security_config(redis, tenant_id, agent_id) -> AgentSecurityConfig
+    # Returns cached merged config, or rebuilds from scratch on cache miss.
+
+async def invalidate_agent_config_cache(redis, tenant_id, agent_id) -> None
+    # Called by the external API after writing to agent_alert_config or agent_subcheck_overrides.
+```
+
+### Platform default thresholds (`_DEFAULT_THRESHOLDS`)
+
+Mirrors `SIGNAL_ALERT_THRESHOLDS_V3` in `core/config.py`. Excluded signals
+(`OW-LLM03`, `OW-LLM04`) get `enabled=False`. OW-LLM08 is `enabled=True` with
+`alert_threshold=999` (partial pre-runtime exclusion).
 
 ---
 
@@ -680,6 +756,38 @@ CREATE TABLE injection_signatures (
 -- Redis-cached per tenant: dp:sec:sigs:{tenant_id}, TTL 300s
 ```
 
+### agent_subcheck_overrides (migration 016)
+
+```sql
+CREATE TABLE agent_subcheck_overrides (
+    tenant_id   TEXT        NOT NULL,
+    agent_id    TEXT        NOT NULL,
+    overrides   JSONB       NOT NULL DEFAULT '{}',
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, agent_id)
+);
+-- overrides JSONB: { "PI-01a": {"online_detection": true}, ... }
+-- When online_detection=true for a sub-check, the post-session scorer skips it.
+-- Written by the external API; invalidates Redis cfg cache after write.
+```
+
+### agent_alert_config (migrations 017 + 018)
+
+```sql
+CREATE TABLE agent_alert_config (
+    tenant_id               TEXT        NOT NULL,
+    agent_id                TEXT        NOT NULL,
+    composite_threshold     INT         NOT NULL DEFAULT 60,  -- shared fallback
+    llm_composite_threshold INT,        -- NULL → use composite_threshold
+    asi_composite_threshold INT,        -- NULL → use composite_threshold
+    signal_thresholds       JSONB       NOT NULL DEFAULT '{}', -- {"OW-LLM01": 70, ...}
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, agent_id)
+);
+-- Absent rows → platform defaults from SIGNAL_ALERT_THRESHOLDS_V3 + COMPOSITE_ALERT_THRESHOLD_V3
+-- Written by the external API; invalidates Redis cfg cache after write.
+```
+
 ---
 
 ## 9. Technology stack
@@ -717,10 +825,11 @@ SIG_CACHE_TTL_S=300
 SESSION_CTX_TTL_S=120
 
 # Alert thresholds (v3 model)
-COMPOSITE_ALERT_THRESHOLD=65
+# COMPOSITE_ALERT_THRESHOLD_V3=60  (legacy COMPOSITE_ALERT_THRESHOLD=65 kept for backward compat)
 TRUST_ALERT_THRESHOLD=40        # trust_score < this triggers alert
 TRUST_ALERT_MIN_SESSIONS=3      # must be below threshold for N sessions
-# Per-signal thresholds in core/config.py SIGNAL_ALERT_THRESHOLDS dict
+# Per-signal thresholds: SIGNAL_ALERT_THRESHOLDS_V3 in core/config.py
+# Per-agent overrides: agent_alert_config (Postgres) → Redis cache dp:sec:{tid}:agent:{aid}:cfg
 
 # Confidence weights (in core/config.py CONFIDENCE_WEIGHTS dict)
 # deterministic=1.0, high=0.9, medium=0.7, low=0.5, skeletal=0.3
@@ -744,7 +853,7 @@ cd ../dapplepot_pipeline && make setup && make seed-dev
 # Step 3: this service
 cd ../dapplepot_security
 uv sync && cp .env.example .env
-make setup          # runs migrations 001-014 + seed-sigs + seed-signal-registry + seed-dev-scores
+make setup          # runs migrations 001-018 + seed-sigs + seed-signal-registry + seed-dev-scores
 
 # Step 4-5: pipeline consumers + this service
 cd ../dapplepot_pipeline && make run-ingest  # + run-session-writer, run-event-appender, etc.
@@ -760,9 +869,10 @@ make health          # checks dp-security-eval consumer lag
 
 ### Phase 1 — Foundation
 ```
-core/config.py                      ← add CONFIDENCE_WEIGHTS dict
+core/config.py                      ← CONFIDENCE_WEIGHTS dict, SIGNAL_ALERT_THRESHOLDS_V3, COMPOSITE_ALERT_THRESHOLD_V3
+core/security_config.py             ← AgentSecurityConfig, get_agent_security_config(), push_agent_defaults()
 core/infra/kafka.py, postgres.py, clickhouse.py, redis.py
-db/postgres/001..014 (all migrations, including 013_v3_scoring + 014_trust_scores)
+db/postgres/001-008 + 013 + 014 + 016-018 (all migrations)
 consumers/security_eval/findings.py ← add confidence_tier, confidence fields
 scripts/run_migrations.py
 scripts/seed_signatures.py
@@ -796,8 +906,9 @@ consumers/security_eval/scorer/cross_session.py       ← SID-03a, UBC-03a/05a, 
 ```
 consumers/security_eval/scorer/attack_chains.py       ← detect_attack_chains(): 7 chains, max amplification
 consumers/security_eval/scorer/trust.py               ← compute_agent_trust_score(): Bayesian + decay + trend
-consumers/security_eval/scorer/orchestrator.py        ← score_session() v3: confidence, chains, trust
-consumers/security_eval/consumer.py                   ← (unchanged)
+consumers/security_eval/scorer/orchestrator.py        ← score_session() v3: confidence, chains, trust,
+                                                         AgentSecurityConfig integration
+consumers/security_eval/consumer.py                   ← passes security config to online detectors
 ```
 
 ### Phase 6 — Tests
