@@ -213,12 +213,18 @@ async def _run_per_event_detectors(
     events: list[dict],
     tenant_id: str,
     session_id: str,
+    skip_sub_checks: frozenset[str] | None = None,
 ) -> list:
     """
     Replay the session event sequence and run all per-event detectors with
     in-memory cross-event context (replaces the Redis context used during
     online processing). All findings are tagged post_session.
+
+    skip_sub_checks: sub-check IDs that have already been handled by the
+    SDK (online mode). Findings for these are filtered out to avoid
+    double-counting when the scorer merges SDK findings later.
     """
+    _skip = skip_sub_checks or frozenset()
     from consumers.security_eval.detectors.injection import detect_injection
     from consumers.security_eval.detectors.passthrough import detect_passthrough
     from consumers.security_eval.detectors.disclosure import detect_pii
@@ -281,6 +287,12 @@ async def _run_per_event_detectors(
                 ev.get("event_id"),
             )
 
+        # Drop any finding whose sub_check_id is handled online by the SDK
+        if _skip:
+            ev_findings = [
+                f for f in ev_findings
+                if getattr(f, "sub_check_id", None) not in _skip
+            ]
         findings.extend(ev_findings)
 
     return findings
@@ -365,20 +377,73 @@ async def score_session(
     )
     session = dict(session_row) if session_row else {}
 
+    # ─── Fetch / auto-init agent security config from Redis ───────────────────
+    from core.infra.redis import get_redis
+    from core.security_config import get_agent_security_config
+    _redis = await get_redis()
+    sec_config = await get_agent_security_config(_redis, tenant_id, agent_id)
+
+    # ─── Load SDK online findings from Postgres ───────────────────────────────
+    # Online findings were written directly to security_findings (detection_phase='online')
+    # by the consumer when security_finding events arrived. Fetch them here so the
+    # post-session scorer can skip their sub_check_ids and merge them into the final score.
+    online_ids = sec_config.online_subcheck_ids()
+    sdk_findings: list = []
+    if online_ids:
+        try:
+            import dataclasses
+            from consumers.security_eval.findings import Finding
+            _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
+            rows = await pool.fetch(
+                """
+                SELECT tenant_id, session_id, event_id, event_type,
+                       owasp_signal_id, sub_check_id, check_label, check_score,
+                       category, severity, detection_phase,
+                       matched_text, detail, confidence_tier
+                FROM security_findings
+                WHERE session_id = $1
+                  AND detection_phase = 'online'
+                """,
+                session_id,
+            )
+            for row in rows:
+                sdk_findings.append(Finding(**{k: v for k, v in dict(row).items() if k in _init_fields}))
+            if sdk_findings:
+                logger.info(
+                    '"loaded %d SDK online findings from Postgres session_id=%s"',
+                    len(sdk_findings),
+                    session_id,
+                )
+        except Exception:
+            logger.exception('"failed to load online findings from Postgres session_id=%s"', session_id)
+
     # ─── Per-event detectors (replayed post-session) ──────────────────────────
-    all_findings = await _run_per_event_detectors(events, tenant_id, session_id)
+    # Skip sub-checks that the SDK already handled online — avoids double-counting.
+    all_findings = await _run_per_event_detectors(
+        events, tenant_id, session_id, skip_sub_checks=online_ids
+    )
+    # Merge SDK online findings in
+    all_findings.extend(sdk_findings)
 
     # ─── Session-level OW-LLM signals ────────────────────────────────────────
     for signal_key, signal_fn in SIGNAL_ID_FUNCTIONS:
-        finding = await signal_fn(
+        sig_params = set(_inspect.signature(signal_fn).parameters.keys())
+        kwargs: dict = dict(
             events=events,
             session=session,
             tenant_id=tenant_id,
             session_id=session_id,
             agent_id=agent_id,
         )
+        if "sec_config" in sig_params:
+            kwargs["sec_config"] = sec_config
+        finding = await signal_fn(**kwargs) if _inspect.iscoroutinefunction(signal_fn) else signal_fn(**kwargs)
         if finding:
-            all_findings.append(finding)
+            # Respect per-signal enabled flag from config
+            sig_id = getattr(finding, "owasp_signal_id", None)
+            sig_cfg = sec_config.signals.get(sig_id) if sig_id else None
+            if sig_cfg is None or sig_cfg.enabled:
+                all_findings.append(finding)
 
     # Additional sub-check helpers (return lists)
     all_findings.extend(check_multi_turn_jailbreak(events, session_id, tenant_id))
@@ -407,7 +472,6 @@ async def score_session(
         all_findings.append(a01_finding)
 
     for signal_key, signal_fn in AGENT_SIGNAL_ID_FUNCTIONS:
-        import inspect as _inspect
         sig_params = set(_inspect.signature(signal_fn).parameters.keys())
         kwargs: dict = dict(
             events=events,
@@ -418,9 +482,14 @@ async def score_session(
         )
         if "all_findings" in sig_params:
             kwargs["all_findings"] = all_findings
+        if "sec_config" in sig_params:
+            kwargs["sec_config"] = sec_config
         finding = await signal_fn(**kwargs)
         if finding:
-            all_findings.append(finding)
+            sig_id = getattr(finding, "owasp_signal_id", None)
+            sig_cfg = sec_config.signals.get(sig_id) if sig_id else None
+            if sig_cfg is None or sig_cfg.enabled:
+                all_findings.append(finding)
 
     # ─── Cross-session signals ────────────────────────────────────────────────
     from consumers.security_eval.scorer.cross_session import CROSS_SESSION_FUNCTIONS
@@ -601,15 +670,23 @@ async def score_session(
         else f"security:{session_id}"
     )
 
+    # Use sec_config composite threshold (admin can lower/raise it per agent)
+    _composite_threshold = sec_config.composite_alert_threshold
+
     should_alert = (
-        llm_score >= COMPOSITE_ALERT_THRESHOLD_V3
-        or asi_score >= COMPOSITE_ALERT_THRESHOLD_V3
+        llm_score >= _composite_threshold
+        or asi_score >= _composite_threshold
     )
 
     if not should_alert:
         for sig_id, sig_data in {**llm_signal_map, **asi_signal_map}.items():
             if sig_data["status"] == "fired":
-                threshold = SIGNAL_ALERT_THRESHOLDS_V3.get(sig_id, 80)
+                # Per-signal threshold: sec_config wins over platform default
+                sig_cfg = sec_config.signals.get(sig_id)
+                if sig_cfg is not None:
+                    threshold = sig_cfg.alert_threshold
+                else:
+                    threshold = SIGNAL_ALERT_THRESHOLDS_V3.get(sig_id, 80)
                 if sig_data["effective_score"] >= threshold:
                     should_alert = True
                     break

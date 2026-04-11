@@ -76,19 +76,72 @@ async def _run_scorer(tenant_id: str, session_id: str, agent_id: str) -> None:
         logger.exception('"score_session failed session_id=%s"', session_id)
 
 
+async def _init_agent_security_config(tenant_id: str, agent_id: str) -> None:
+    """
+    Push platform default security config to Redis for a newly-created agent.
+    Called on agent_created events so the config is ready before the first session.
+    """
+    try:
+        from core.infra.redis import get_redis
+        from core.security_config import push_agent_defaults
+        redis = await get_redis()
+        await push_agent_defaults(redis, tenant_id, agent_id)
+    except Exception:
+        logger.exception(
+            '"failed to init security config tenant_id=%s agent_id=%s"',
+            tenant_id,
+            agent_id,
+        )
+
+
+async def _persist_sdk_finding(session_id: str, payload: dict) -> None:
+    """
+    Write an SDK-emitted online security_finding directly to Postgres security_findings.
+    Online findings land in the same table as post-session findings (detection_phase='online').
+    The uq_findings_session_subcheck constraint prevents duplicates if the event is replayed.
+    """
+    try:
+        import dataclasses
+        from consumers.security_eval.findings import Finding, write_findings
+        _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
+        finding = Finding(**{k: v for k, v in payload.items() if k in _init_fields})
+        await write_findings([finding])
+    except Exception:
+        logger.exception('"failed to persist SDK online finding session_id=%s"', session_id)
+
+
 async def _handle_event(event: dict) -> None:
     event_type = event.get("event_type")
     session_id = event.get("session_id")
+    tenant_id  = event.get("tenant_id")
+    agent_id   = event.get("agent_id")
+
+    # New agent created → push default security config to Redis immediately
+    # so it's available before the first session scores.
+    if event_type == "agent_created":
+        if tenant_id and agent_id:
+            asyncio.create_task(
+                _init_agent_security_config(tenant_id=tenant_id, agent_id=agent_id)
+            )
+        return
 
     if not session_id:
+        return
+
+    # SDK online detection findings — write straight to Postgres (durable, no Redis buffer)
+    if event_type == "security_finding":
+        if session_id:
+            asyncio.create_task(
+                _persist_sdk_finding(session_id=session_id, payload=event.get("payload") or {})
+            )
         return
 
     if event_type in ("graph_end", "graph_error"):
         asyncio.create_task(
             _run_scorer(
-                tenant_id=event.get("tenant_id"),
+                tenant_id=tenant_id,
                 session_id=session_id,
-                agent_id=event.get("agent_id"),
+                agent_id=agent_id,
             )
         )
 
