@@ -72,9 +72,13 @@ class AgentSecurityConfig(BaseModel):
     Future:     per-signal overrides, blocked_tools, custom_checkpoints, etc.
     """
     signals: dict[str, SignalConfig] = Field(default_factory=dict)
-    # Composite threshold: alert if LLM or ASI composite ≥ this value.
+    # Composite thresholds: alert if the respective composite ≥ this value.
     # Mirrors COMPOSITE_ALERT_THRESHOLD_V3 = 60.
-    composite_alert_threshold: int = 60
+    # llm_composite_alert_threshold / asi_composite_alert_threshold can be set
+    # independently; composite_alert_threshold is kept as a shared fallback.
+    composite_alert_threshold:     int = 60
+    llm_composite_alert_threshold: int = 60
+    asi_composite_alert_threshold: int = 60
     # Per-sub-check online detection overrides.
     # Key = sub_check_id (e.g. "PI-01a"), value = SubCheckOverride.
     # Only populated for sub-checks that have been toggled; absent = post_session default.
@@ -258,26 +262,56 @@ async def get_agent_security_config(
         if raw_agent:
             _deep_merge(cfg_dict, json.loads(raw_agent))
 
-    # Fold in subcheck online toggles from Postgres (authoritative source)
+    # Fold in subcheck online toggles + alert threshold overrides from Postgres
     if agent_id:
         try:
             from core.infra.postgres import get_pool
             pool = await get_pool()
-            row = await pool.fetchrow(
+
+            # Sub-check online detection toggles
+            sc_row = await pool.fetchrow(
                 "SELECT overrides FROM agent_subcheck_overrides "
                 "WHERE tenant_id = $1 AND agent_id = $2",
                 tenant_id,
                 agent_id,
             )
-            if row and row["overrides"]:
-                subcheck_overrides_raw = row["overrides"]
+            if sc_row and sc_row["overrides"]:
+                subcheck_overrides_raw = sc_row["overrides"]
                 if isinstance(subcheck_overrides_raw, str):
                     subcheck_overrides_raw = json.loads(subcheck_overrides_raw)
                 cfg_dict.setdefault("subcheck_overrides", {})
                 cfg_dict["subcheck_overrides"].update(subcheck_overrides_raw)
+
+            # Per-agent alert threshold overrides
+            alert_row = await pool.fetchrow(
+                "SELECT composite_threshold, "
+                "       llm_composite_threshold, "
+                "       asi_composite_threshold, "
+                "       signal_thresholds "
+                "FROM agent_alert_config "
+                "WHERE tenant_id = $1 AND agent_id = $2",
+                tenant_id,
+                agent_id,
+            )
+            if alert_row:
+                # Shared fallback (legacy)
+                cfg_dict["composite_alert_threshold"] = alert_row["composite_threshold"]
+                # Per-framework overrides (NULL → keep model default of 60)
+                if alert_row["llm_composite_threshold"] is not None:
+                    cfg_dict["llm_composite_alert_threshold"] = alert_row["llm_composite_threshold"]
+                if alert_row["asi_composite_threshold"] is not None:
+                    cfg_dict["asi_composite_alert_threshold"] = alert_row["asi_composite_threshold"]
+                sig_thresholds = alert_row["signal_thresholds"]
+                if isinstance(sig_thresholds, str):
+                    sig_thresholds = json.loads(sig_thresholds)
+                if sig_thresholds:
+                    cfg_dict.setdefault("signals", {})
+                    for sig_id, threshold in sig_thresholds.items():
+                        cfg_dict["signals"].setdefault(sig_id, {})
+                        cfg_dict["signals"][sig_id]["alert_threshold"] = threshold
         except Exception:
             logger.exception(
-                '"failed to load subcheck_overrides from postgres tenant_id=%s agent_id=%s"',
+                '"failed to load agent overrides from postgres tenant_id=%s agent_id=%s"',
                 tenant_id,
                 agent_id,
             )

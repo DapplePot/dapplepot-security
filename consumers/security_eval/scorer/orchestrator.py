@@ -3,14 +3,53 @@
 All detection (per-event and session-level) runs here after the full event
 history is available from ClickHouse.
 
-v3 scoring model:
-  - Per-signal score = confidence-weighted max(check_score × confidence_weight).
-  - Composite = highest-score signal × 60% + mean of rest × 40%.
-  - Attack chain amplification: if multiple signals match a known attack chain,
-    composite is multiplied by the chain's amplification factor (capped at 100).
-  - Cross-session Bayesian agent trust: updated each session with temporal decay.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v3 Scoring Model
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1.  Sub-check detection
+    Each detector fires one Finding per triggered sub-check.  A Finding
+    carries check_score (0–100, from signal_registry) and a confidence_tier.
+
+2.  Confidence weighting
+    confidence_weight = { deterministic:1.0, high:0.9, medium:0.7, low:0.5, skeletal:0.3 }
+    effective_score = check_score × confidence_weight
+
+3.  Per-signal score (compute_ow_signal_score)
+    Findings are grouped by owasp_signal_id.
+      raw_score       = max(check_score)          across fired sub-checks
+      effective_score = max(check_score × weight) across fired sub-checks
+    Both are stored so the UI can compare raw vs confidence-adjusted values.
+
+4.  Composite score per framework (compute_composite_score_v3)
+    Inputs: effective_score for each fired signal.
+      raw_composite = top_signal × 0.60 + mean(rest) × 0.40   (if N ≥ 2)
+                    = top_signal                               (if N = 1)
+    The 60/40 split ensures a dominant signal drives the score while a
+    cluster of supporting signals still raises it.
+
+5.  Attack chain amplification
+    detect_attack_chains() matches fired signal IDs against known multi-step
+    attack patterns.  If ≥ 2 signals from a chain are present the composite
+    is multiplied by the chain's factor (1.05–1.35, capped at 100).
+      composite = min(100, int(raw_composite × amplification_factor))
+
+6.  Risk bands
+      clean 0–14 · low 15–34 · medium 35–59 · high 60–84 · critical 85–100
+
+7.  Confidence band
+    avg_conf of fired signals: ≥0.85 → high · ≥0.60 → medium · else low
+
+8.  Bayesian agent trust (compute_agent_trust_score)
+    Beta(α=2, β=8) prior → starting trust ≈ 80.
+    Each session updates α (clean evidence) or β (risk evidence) weighted by
+    temporal decay exp(−0.05 × days_old).
+    trust_score = 100 × (1 − α / (α + β)).
+    Alert when trust < 50 for 3+ consecutive sessions.
+
+Notes:
   - v2 columns still written for backward compatibility.
-  - New v3_llm_composite / v3_asi_composite JSONB columns carry full v3 detail.
+  - v3_llm_composite / v3_asi_composite JSONB columns carry full v3 detail.
 """
 import asyncio
 import inspect as _inspect
@@ -72,6 +111,26 @@ def compute_ow_signal_score(fired_findings: list) -> dict[str, dict]:
     """
     Group findings by owasp_signal_id and compute v3 per-signal scores.
 
+    Scoring model — per signal
+    ──────────────────────────
+    Each sub-check that fired contributes two values:
+      • raw_score      = check_score  (0–100, defined in signal_registry)
+      • effective_score = check_score × confidence_weight
+
+    Confidence weights by tier:
+      deterministic → 1.0   (pattern / regex match, no ambiguity)
+      high          → 0.9   (strong heuristic or embeddings similarity)
+      medium        → 0.7   (LLM judge, good recall)
+      low           → 0.5   (weak heuristic, noisy)
+      skeletal      → 0.3   (structural indicator only, no content match)
+
+    The signal's headline figures are taken from the *best* sub-check:
+      signal.raw_score       = max(check_score)          across fired sub-checks
+      signal.effective_score = max(check_score × weight) across fired sub-checks
+
+    All fired sub-checks are preserved in sub_checks{} so the UI can show
+    which specific detection triggered and why.
+
     Returns per-signal dict with:
       raw_score, confidence_score, effective_score, confidence, status, sub_checks
     """
@@ -94,6 +153,7 @@ def compute_ow_signal_score(fired_findings: list) -> dict[str, dict]:
                 "sub_checks": {},
             }
 
+        # effective = check_score × confidence_weight; track the best sub-check
         eff = score * conf
         if eff > signal_map[sig]["confidence_score"]:
             signal_map[sig]["confidence_score"] = eff
@@ -158,6 +218,43 @@ def compute_composite_score_v3(
 ) -> dict:
     """
     Full v3 composite result dict including amplification details.
+
+    Composite formula (per framework — LLM or ASI)
+    ───────────────────────────────────────────────
+    Inputs: effective_score for each fired signal (0–100 after confidence weighting).
+
+    Step 1 — weighted blend of fired signals
+        If 1 signal fired:  composite_raw = effective_score[0]
+        If N > 1 signals:   composite_raw = top_signal × 0.60
+                                          + mean(rest)    × 0.40
+
+    Rationale: the highest-severity signal dominates (60 %) but a cluster of
+    lower signals still lifts the score (40 %), preventing a single noisy
+    detector from drowning out a genuine multi-signal attack.
+
+    Step 2 — attack chain amplification
+        detect_attack_chains() checks whether the fired signal IDs match any
+        known multi-step attack pattern (e.g. injection → exfiltration).
+        Each chain carries an amplification factor (1.05–1.35).  The maximum
+        factor across detected chains is applied:
+
+            composite = min(100, int(composite_raw × amplification_factor))
+
+        raw_composite (pre-amplification) is preserved so the UI can show
+        "what the score would have been without the chain bonus".
+
+    Step 3 — confidence band
+        avg_conf = mean of per-signal confidence values for fired signals.
+            ≥ 0.85  → "high"    (mostly deterministic / high-tier checks)
+            ≥ 0.60  → "medium"
+            <  0.60 → "low"
+
+    Risk bands (applied to the final composite):
+        clean    0–14
+        low     15–34
+        medium  35–59
+        high    60–84
+        critical 85–100
     """
     from consumers.security_eval.scorer.attack_chains import detect_attack_chains
 
@@ -184,15 +281,19 @@ def compute_composite_score_v3(
     scores = [f[1] for f in fired]
     confidences = [f[2] for f in fired]
 
+    # Step 1: weighted blend — top signal × 60% + mean(rest) × 40%
     raw = scores[0] if len(scores) == 1 else (
         scores[0] * 0.6 + (sum(scores[1:]) / len(scores[1:])) * 0.4
     )
 
+    # Step 2: attack chain amplification (pass both frameworks' fired IDs so
+    # cross-framework chains like OW-LLM01 → OW-ASI06 are detected)
     chains_detected, amplification = detect_attack_chains(
         {f[0] for f in fired} | all_fired_signal_ids
     )
     composite = min(100, int(raw * amplification))
 
+    # Step 3: confidence band from average signal confidence
     avg_conf = sum(confidences) / len(confidences)
     confidence_band = (
         "high" if avg_conf >= 0.85
@@ -543,6 +644,26 @@ async def score_session(
     )
 
     # ─── Bayesian agent trust score ───────────────────────────────────────────
+    # Model: Beta-Binomial with temporal decay.
+    #
+    # Prior: Beta(α=2, β=8) → starting trust ≈ 80 (trust = 1 − α/(α+β))
+    #
+    # Each scored session updates α and β:
+    #   clean session   → α += decay_weight   (trust evidence)
+    #   risky session   → β += decay_weight   (distrust evidence)
+    #
+    # Decay weight = exp(−λ × days_since_session), λ=0.05/day.
+    # Sessions older than ~60 days contribute < 5 % of their original weight,
+    # so recent behaviour dominates.
+    #
+    # Final trust_score = 100 × (1 − α / (α + β)), clamped to [0, 100].
+    #
+    # Trend is computed as the slope of the last N trust estimates (linear
+    # regression over time).  Thresholds: improving ≥ +0.5/session,
+    # degrading ≤ −0.5/session, otherwise stable.
+    #
+    # Alert fires when trust_score < AGENT_TRUST_ALERT_THRESHOLD (50) for
+    # AGENT_TRUST_CONSECUTIVE_SESSIONS (3) consecutive sessions.
     trust_result = {"trust_score": 80.0, "trend": "stable", "trend_slope": 0.0,
                     "alpha": 2.0, "beta": 8.0}
     if agent_id:
@@ -670,12 +791,13 @@ async def score_session(
         else f"security:{session_id}"
     )
 
-    # Use sec_config composite threshold (admin can lower/raise it per agent)
-    _composite_threshold = sec_config.composite_alert_threshold
+    # Use per-framework thresholds; fall back to shared composite_alert_threshold
+    _llm_threshold = sec_config.llm_composite_alert_threshold
+    _asi_threshold = sec_config.asi_composite_alert_threshold
 
     should_alert = (
-        llm_score >= _composite_threshold
-        or asi_score >= _composite_threshold
+        llm_score >= _llm_threshold
+        or asi_score >= _asi_threshold
     )
 
     if not should_alert:
