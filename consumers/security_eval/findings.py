@@ -160,8 +160,16 @@ async def write_agent_risk_score(
     )
 
 
-_SECURITY_RULE_ID   = "00000000-0000-0000-0000-000000000001"
-_SECURITY_RULE_NAME = "Security Risk Score"
+_SECURITY_RULE_ID    = "00000000-0000-0000-0000-000000000001"
+_SECURITY_RULE_NAME  = "Security Risk Score"
+_ONLINE_RULE_ID      = "00000000-0000-0000-0000-000000000002"
+_ONLINE_RULE_NAME    = "Online Security Detection"
+
+# Actions that warrant an immediate alert from Zone 6.
+_ALERTABLE_ACTIONS: frozenset[str] = frozenset({"alert", "block_call", "terminate_session"})
+
+# Actions that require an audit row in session_actions.
+_AUDITABLE_ACTIONS: frozenset[str] = frozenset({"block_call", "terminate_session"})
 
 _RISK_BAND_TO_SEVERITY = {
     "clean":    "info",
@@ -169,6 +177,12 @@ _RISK_BAND_TO_SEVERITY = {
     "medium":   "medium",
     "high":     "warning",
     "critical": "critical",
+}
+
+_ACTION_TO_SEVERITY = {
+    "alert":             "medium",
+    "block_call":        "high",
+    "terminate_session": "critical",
 }
 
 
@@ -236,10 +250,16 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
             # Top findings
             "top_findings": top_findings,
             "summary": {
-                "llm_signals_fired": llm_fired,
-                "llm_signals_clean": llm_clean,
-                "asi_signals_fired": asi_fired,
-                "asi_signals_clean": asi_clean,
+                "llm_signals_fired":    llm_fired,
+                "llm_signals_clean":    llm_clean,
+                "asi_signals_fired":    asi_fired,
+                "asi_signals_clean":    asi_clean,
+                # How many of these findings were already actioned online
+                # (block_call / terminate_session raised in real time).
+                # Consumers can use this to de-duplicate notifications.
+                "online_actioned_count": sum(
+                    1 for f in findings if f.detection_phase == "online"
+                ),
             },
             "signal_taxonomy_version": "3.0",
             "scorer_version": score_row["scorer_version"],
@@ -249,6 +269,86 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
     producer.produce(
         settings.kafka_alerts_topic,
         key=session_id.encode(),
+        value=json.dumps(alert).encode(),
+    )
+    producer.flush()
+
+
+async def write_session_action(
+    finding: Finding, action_taken: str, agent_id: str | None = None
+) -> None:
+    """Persist an auditable online action (block_call / terminate_session) to session_actions."""
+    from core.infra.postgres import get_pool
+    pool = await get_pool()
+    await pool.execute(
+        """
+        INSERT INTO session_actions
+            (session_id, tenant_id, agent_id,
+             sub_check_id, owasp_signal_id, severity, action_taken)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        finding.session_id,
+        finding.tenant_id,
+        agent_id,
+        finding.sub_check_id,
+        finding.owasp_signal_id,
+        finding.severity,
+        action_taken,
+    )
+
+
+async def produce_online_alert(
+    finding: Finding, action_taken: str, agent_id: str | None = None
+) -> None:
+    """Produce an immediate alert to obs.alerts.v1 for an online security detection.
+
+    Fires only when action_taken is in {alert, block_call, terminate_session}.
+    Dedup key is per-session per-sub-check so duplicate SDK emissions don't
+    double-alert (the dp-alert-router deduplicates on this key).
+    """
+    severity = _ACTION_TO_SEVERITY.get(action_taken, "medium")
+    # Escalate severity if sub-check is critical regardless of action
+    if finding.severity == "critical" and severity == "medium":
+        severity = "high"
+
+    alert = {
+        "alert_id":     str(uuid.uuid4()),
+        "tenant_id":    finding.tenant_id,
+        "session_id":   finding.session_id,
+        "rule_id":      _ONLINE_RULE_ID,
+        "rule_name":    _ONLINE_RULE_NAME,
+        "severity":     severity,
+        "triggered_at": datetime.now(timezone.utc).isoformat(),
+        "dedup_key":    f"online:{finding.session_id}:{finding.sub_check_id}",
+        "channels":     [],
+        "channel_config": {},
+        "payload": {
+            "title":           f"Online Detection: {finding.check_label} [{action_taken}]",
+            "message": (
+                f"{finding.owasp_signal_id}:{finding.sub_check_id} fired during live session. "
+                f"Action taken: {action_taken}."
+            ),
+            "rule_type":       "online_security_action",
+            "source":          "security",
+            "agent_id":        agent_id,
+            "sub_check_id":    finding.sub_check_id,
+            "owasp_signal_id": finding.owasp_signal_id,
+            "check_label":     finding.check_label,
+            "check_score":     finding.check_score,
+            "effective_score": round(finding.check_score * finding.confidence),
+            "confidence_tier": finding.confidence_tier,
+            "severity":        finding.severity,
+            "category":        finding.category,
+            "action_taken":    action_taken,
+            "detection_phase": "online",
+            "matched_text":    finding.matched_text,
+            "signal_taxonomy_version": "3.0",
+        },
+    }
+    producer = _get_producer()
+    producer.produce(
+        settings.kafka_alerts_topic,
+        key=finding.session_id.encode(),
         value=json.dumps(alert).encode(),
     )
     producer.flush()

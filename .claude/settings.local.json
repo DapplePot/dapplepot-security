@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(pnpm migrate:*)",
-      "Bash(make migrate:*)"
+      "Bash(make migrate:*)",
+      "Bash(timeout 15 uv run python -u -c ':*)",
+      "Bash(echo \"EXIT: $?\")"
     ]
   }
 }

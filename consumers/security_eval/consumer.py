@@ -3,6 +3,16 @@
 All detection runs post-session inside score_session(); the consumer's only
 job is to fan out the scoring task when a session closes.
 """
+# ── Windows: asyncpg.connect_utils calls platform.uname() at import time,
+#    which triggers a WMI subprocess query that hangs on some Windows machines.
+#    Stub it out before asyncpg is imported so the consumer can start.
+import sys as _sys
+if _sys.platform == "win32":
+    import platform as _plat
+    _plat.uname = lambda _r=_plat.uname_result("Windows", "", "", "", ""): _r
+    del _plat
+del _sys
+
 import asyncio
 import json
 import logging
@@ -94,18 +104,48 @@ async def _init_agent_security_config(tenant_id: str, agent_id: str) -> None:
         )
 
 
-async def _persist_sdk_finding(session_id: str, payload: dict) -> None:
+async def _persist_sdk_finding(session_id: str, agent_id: str | None, payload: dict) -> None:
     """
-    Write an SDK-emitted online security_finding directly to Postgres security_findings.
-    Online findings land in the same table as post-session findings (detection_phase='online').
-    The uq_findings_session_subcheck constraint prevents duplicates if the event is replayed.
+    Process an SDK-emitted online security_finding event.
+
+    Steps:
+      1. Persist finding to security_findings (detection_phase='online').
+      2. If action_taken is auditable (block_call / terminate_session):
+         write an audit row to session_actions.
+      3. If action_taken warrants an alert (alert / block_call / terminate_session):
+         produce an immediate alert to obs.alerts.v1.
+
+    The uq_findings_session_subcheck constraint prevents duplicate findings if
+    the Kafka event is replayed.  The dedup_key on online alerts prevents the
+    alert router from notifying twice for the same sub-check within one session.
     """
     try:
         import dataclasses
-        from consumers.security_eval.findings import Finding, write_findings
+        from consumers.security_eval.findings import (
+            Finding,
+            write_findings,
+            write_session_action,
+            produce_online_alert,
+            _ALERTABLE_ACTIONS,
+            _AUDITABLE_ACTIONS,
+        )
+
+        action_taken: str = payload.get("action_taken", "monitor")
+
         _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
         finding = Finding(**{k: v for k, v in payload.items() if k in _init_fields})
+
+        # Step 1 — persist finding
         await write_findings([finding])
+
+        # Step 2 — audit row for hard actions
+        if action_taken in _AUDITABLE_ACTIONS:
+            await write_session_action(finding, action_taken, agent_id=agent_id)
+
+        # Step 3 — immediate alert
+        if action_taken in _ALERTABLE_ACTIONS:
+            await produce_online_alert(finding, action_taken, agent_id=agent_id)
+
     except Exception:
         logger.exception('"failed to persist SDK online finding session_id=%s"', session_id)
 
@@ -132,7 +172,11 @@ async def _handle_event(event: dict) -> None:
     if event_type == "security_finding":
         if session_id:
             asyncio.create_task(
-                _persist_sdk_finding(session_id=session_id, payload=event.get("payload") or {})
+                _persist_sdk_finding(
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    payload=event.get("payload") or {},
+                )
             )
         return
 
@@ -163,8 +207,12 @@ async def run() -> None:
         loop.add_signal_handler(os_signal.SIGINT, _stop)
         loop.add_signal_handler(os_signal.SIGTERM, _stop)
     else:
-        os_signal.signal(os_signal.SIGINT, _stop)
-        os_signal.signal(os_signal.SIGTERM, _stop)
+        # SIGTERM is not supported on Windows — only wire SIGINT (Ctrl+C).
+        # Use call_soon_threadsafe so the Future is set from within the loop.
+        os_signal.signal(
+            os_signal.SIGINT,
+            lambda *_: loop.call_soon_threadsafe(_stop),
+        )
 
     executor = ThreadPoolExecutor(max_workers=1)
 

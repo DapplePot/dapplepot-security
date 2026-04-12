@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Literal
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -55,13 +56,26 @@ class SignalConfig(BaseModel):
 
 
 class SubCheckOverride(BaseModel):
-    """Per-sub-check online detection toggle.
+    """Per-sub-check online detection toggle and action config.
 
     online_detection=True  → the langgraph-sdk runs this check in real time.
                              The post-session scorer will skip it to avoid double-counting.
     online_detection=False → default; post-session scorer handles it.
+
+    action: what the SDK does when this sub-check fires (only relevant when
+            online_detection=True).  Zone 6 reads action_taken from the emitted
+            security_finding event to decide whether to alert.
+
+        monitor           → SDK continues; Zone 6 stores finding, no alert.
+        alert             → SDK continues; Zone 6 stores finding + fires alert.
+        block_call        → SDK returns synthetic refusal for the in-flight
+                            LLM/tool call; Zone 6 stores finding + fires alert.
+        terminate_session → SDK raises SecurityViolationError to kill graph
+                            execution; Zone 6 stores finding + session_action
+                            + fires critical alert.
     """
     online_detection: bool = False
+    action: Literal["monitor", "alert", "block_call", "terminate_session"] = "monitor"
 
 
 class AgentSecurityConfig(BaseModel):

@@ -857,7 +857,16 @@ async def score_session(
                 pass
 
     if should_alert:
-        from consumers.security_eval.findings import produce_security_alert
-        await produce_security_alert(score_row, all_session_findings)
+        # If every finding in this session was already caught by online detection,
+        # the operator has already received real-time online_security_action alerts
+        # for each one.  Suppress the redundant post-session security_risk alert to
+        # avoid double-paging.  Any session with at least one post-session finding
+        # still fires — the scorer saw something the SDK didn't catch in real time.
+        all_online = bool(all_session_findings) and all(
+            f.detection_phase == "online" for f in all_session_findings
+        )
+        if not all_online:
+            from consumers.security_eval.findings import produce_security_alert
+            await produce_security_alert(score_row, all_session_findings)
 
     return score_row
