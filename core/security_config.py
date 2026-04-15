@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +66,28 @@ class SubCheckOverride(BaseModel):
             online_detection=True).  Zone 6 reads action_taken from the emitted
             security_finding event to decide whether to alert.
 
-        monitor           → SDK continues; Zone 6 stores finding, no alert.
-        alert             → SDK continues; Zone 6 stores finding + fires alert.
-        block_call        → SDK returns synthetic refusal for the in-flight
-                            LLM/tool call; Zone 6 stores finding + fires alert.
+        alert             → SDK continues; Zone 6 stores finding + fires combined alert.
+        sanitize          → SDK strips the harmful content (e.g. PII, injected
+                            directives) from the message/response in-flight and
+                            allows the session to continue with the cleaned
+                            content; Zone 6 stores finding + session_action
+                            + fires combined alert.
         terminate_session → SDK raises SecurityViolationError to kill graph
                             execution; Zone 6 stores finding + session_action
-                            + fires critical alert.
+                            + fires combined alert.
     """
     online_detection: bool = False
-    action: Literal["monitor", "alert", "block_call", "terminate_session"] = "monitor"
+    action: Literal["alert", "sanitize", "terminate_session"] = "alert"
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _migrate_action(cls, v: str) -> str:
+        """Migrate stale action values stored in Redis before the 3-action model."""
+        if v in ("monitor",):
+            return "alert"
+        if v in ("block_call",):
+            return "terminate_session"
+        return v
 
 
 class AgentSecurityConfig(BaseModel):

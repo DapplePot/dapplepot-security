@@ -40,6 +40,9 @@ class Finding:
     detection_phase: str    # online | post_session | cross_session
     matched_text: str | None = None
     detail: str | None = None
+    # SDK event emission time — stored so the UI timeline uses the real event
+    # timestamp rather than the DB insert time (created_at).
+    emitted_at: str | None = None
     # v3 confidence fields
     confidence_tier: str = "high"   # deterministic | high | medium | low | skeletal
     confidence: float = field(init=False)
@@ -65,8 +68,8 @@ async def write_findings(findings: list[Finding]) -> None:
             (tenant_id, session_id, event_id, event_type,
              framework, owasp_signal_id, sub_check_id, check_label, check_score,
              category, severity, detection_phase, matched_text, detail,
-             confidence_tier, confidence)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+             confidence_tier, confidence, emitted_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         ON CONFLICT (session_id, sub_check_id) DO UPDATE SET
             check_score     = GREATEST(security_findings.check_score, EXCLUDED.check_score),
             severity        = CASE
@@ -79,7 +82,8 @@ async def write_findings(findings: list[Finding]) -> None:
             detail          = COALESCE(EXCLUDED.detail, security_findings.detail),
             matched_text    = COALESCE(security_findings.matched_text, EXCLUDED.matched_text),
             confidence_tier = EXCLUDED.confidence_tier,
-            confidence      = EXCLUDED.confidence
+            confidence      = EXCLUDED.confidence,
+            emitted_at      = COALESCE(security_findings.emitted_at, EXCLUDED.emitted_at)
         WHERE EXCLUDED.check_score >= security_findings.check_score
         """,
         [
@@ -100,6 +104,7 @@ async def write_findings(findings: list[Finding]) -> None:
                 f.detail,
                 f.confidence_tier,
                 f.confidence,
+                datetime.fromisoformat(f.emitted_at.replace("Z", "+00:00")) if isinstance(f.emitted_at, str) else f.emitted_at,
             )
             for f in findings
         ],
@@ -165,11 +170,12 @@ _SECURITY_RULE_NAME  = "Security Risk Score"
 _ONLINE_RULE_ID      = "00000000-0000-0000-0000-000000000002"
 _ONLINE_RULE_NAME    = "Online Security Detection"
 
-# Actions that warrant an immediate alert from Zone 6.
-_ALERTABLE_ACTIONS: frozenset[str] = frozenset({"alert", "block_call", "terminate_session"})
+# Actions that warrant a combined alert from Zone 6 at session end.
+_ALERTABLE_ACTIONS: frozenset[str] = frozenset({"alert", "sanitize", "terminate_session"})
 
 # Actions that require an audit row in session_actions.
-_AUDITABLE_ACTIONS: frozenset[str] = frozenset({"block_call", "terminate_session"})
+# sanitize is auditable because content was actively modified in-flight.
+_AUDITABLE_ACTIONS: frozenset[str] = frozenset({"sanitize", "terminate_session"})
 
 _RISK_BAND_TO_SEVERITY = {
     "clean":    "info",
@@ -181,12 +187,12 @@ _RISK_BAND_TO_SEVERITY = {
 
 _ACTION_TO_SEVERITY = {
     "alert":             "medium",
-    "block_call":        "high",
+    "sanitize":          "medium",
     "terminate_session": "critical",
 }
 
 
-async def produce_security_alert(score_row: dict, findings: list[Finding]) -> None:
+async def produce_security_alert(score_row: dict, findings: list[Finding], *, trust_triggered: bool = False) -> None:
     """Produce an alert to obs.alerts.v1 conforming to AlertMessage schema."""
     llm_band   = score_row.get("llm_band", "medium")
     severity   = _RISK_BAND_TO_SEVERITY.get(llm_band, "medium")
@@ -228,9 +234,18 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
         "channels":      [],
         "channel_config": {},
         "payload": {
-            "title":   f"Security Risk: {llm_band.capitalize()} ({score_row['llm_score']}/100)",
-            "message": f"LLM: {llm_fired} signals fired · ASI: {asi_fired} signals fired",
-            "rule_type":  "security_risk",
+            "title":   (
+                f"Agent Trust Alert: Score degrading ({int(score_row.get('trust_score', 0))}/100)"
+                if trust_triggered else
+                f"Security Risk: {llm_band.capitalize()} ({score_row['llm_score']}/100)"
+            ),
+            "message": (
+                f"Agent trust score has been consistently below threshold across recent sessions · "
+                f"Trust trend: {score_row.get('trust_trend', 'degrading')}"
+                if trust_triggered else
+                f"LLM: {llm_fired} signals fired · ASI: {asi_fired} signals fired"
+            ),
+            "rule_type":  "trust_degradation" if trust_triggered else "security_risk",
             "source":     "security",
             "agent_id":   score_row.get("agent_id"),
             # Composite scores
@@ -255,7 +270,7 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
                 "asi_signals_fired":    asi_fired,
                 "asi_signals_clean":    asi_clean,
                 # How many of these findings were already actioned online
-                # (block_call / terminate_session raised in real time).
+                # (sanitize / terminate_session raised in real time).
                 # Consumers can use this to de-duplicate notifications.
                 "online_actioned_count": sum(
                     1 for f in findings if f.detection_phase == "online"
@@ -277,7 +292,7 @@ async def produce_security_alert(score_row: dict, findings: list[Finding]) -> No
 async def write_session_action(
     finding: Finding, action_taken: str, agent_id: str | None = None
 ) -> None:
-    """Persist an auditable online action (block_call / terminate_session) to session_actions."""
+    """Persist an auditable online action (sanitize / terminate_session) to session_actions."""
     from core.infra.postgres import get_pool
     pool = await get_pool()
     await pool.execute(
@@ -297,58 +312,102 @@ async def write_session_action(
     )
 
 
-async def produce_online_alert(
-    finding: Finding, action_taken: str, agent_id: str | None = None
+async def produce_combined_online_alert(
+    session_id: str,
+    tenant_id: str,
+    agent_id: str | None,
+    findings: list[Finding],
+    action_map: dict[str, str],
 ) -> None:
-    """Produce an immediate alert to obs.alerts.v1 for an online security detection.
+    """Produce ONE combined alert for all online detections in a session.
 
-    Fires only when action_taken is in {alert, block_call, terminate_session}.
-    Dedup key is per-session per-sub-check so duplicate SDK emissions don't
-    double-alert (the dp-alert-router deduplicates on this key).
+    Called at session end (post-session scorer) so every online finding for the
+    session is reported in a single alert instead of one per sub-check.
+
+    action_map: sub_check_id → action_taken, built from session_actions rows
+    (covers sanitize / terminate_session).  Findings absent from the map had
+    action alert — session continued with an alert raised.
     """
-    severity = _ACTION_TO_SEVERITY.get(action_taken, "medium")
-    # Escalate severity if sub-check is critical regardless of action
-    if finding.severity == "critical" and severity == "medium":
-        severity = "high"
+    if not findings:
+        return
 
+    _severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    _action_rank   = {"terminate_session": 2, "sanitize": 1, "alert": 0}
+
+    # Overall alert severity: highest of finding severity or action severity
+    top_finding_sev = max(findings, key=lambda f: _severity_rank.get(f.severity, 0)).severity
+    top_action      = max(action_map.values(), key=lambda a: _action_rank.get(a, 0)) \
+                      if action_map else "monitor"
+    action_sev      = _ACTION_TO_SEVERITY.get(top_action, "medium")
+    severity        = top_finding_sev \
+                      if _severity_rank.get(top_finding_sev, 0) >= _severity_rank.get(action_sev, 0) \
+                      else action_sev
+
+    # Count by action bucket
+    action_counts: dict[str, int] = {}
+    for f in findings:
+        bucket = action_map.get(f.sub_check_id, "monitor")
+        action_counts[bucket] = action_counts.get(bucket, 0) + 1
+
+    detections = [
+        {
+            "sub_check_id":    f.sub_check_id,
+            "owasp_signal_id": f.owasp_signal_id,
+            "check_label":     f.check_label,
+            "check_score":     f.check_score,
+            "effective_score": round(f.check_score * f.confidence),
+            "confidence_tier": f.confidence_tier,
+            "severity":        f.severity,
+            "category":        f.category,
+            "action_taken":    action_map.get(f.sub_check_id, "monitor"),
+            "matched_text":    f.matched_text,
+        }
+        for f in findings
+    ]
+
+    n = len(findings)
+
+    # Sorted detections list (highest effective score first) — used in message and payload
+    sorted_detections = sorted(detections, key=lambda d: d["effective_score"], reverse=True)
+
+    # Human-readable check lines: "PI-01a · Role-override phrase match [block_call, high]"
+    check_lines = [
+        f"{d['sub_check_id']} · {d['check_label']} [{d['action_taken']}, {d['severity']}]"
+        for d in sorted_detections
+    ]
+    checks_text = "; ".join(check_lines)
+
+    action_summary = ", ".join(
+        f"{v} {k}" for k, v in action_counts.items() if v > 0
+    )
     alert = {
-        "alert_id":     str(uuid.uuid4()),
-        "tenant_id":    finding.tenant_id,
-        "session_id":   finding.session_id,
-        "rule_id":      _ONLINE_RULE_ID,
-        "rule_name":    _ONLINE_RULE_NAME,
-        "severity":     severity,
-        "triggered_at": datetime.now(timezone.utc).isoformat(),
-        "dedup_key":    f"online:{finding.session_id}:{finding.sub_check_id}",
-        "channels":     [],
+        "alert_id":      str(uuid.uuid4()),
+        "tenant_id":     tenant_id,
+        "session_id":    session_id,
+        "rule_id":       _ONLINE_RULE_ID,
+        "rule_name":     _ONLINE_RULE_NAME,
+        "severity":      severity,
+        "triggered_at":  datetime.now(timezone.utc).isoformat(),
+        # One dedup key per session — alert router discards duplicates if scorer retries.
+        "dedup_key":     f"online_summary:{session_id}",
+        "channels":      [],
         "channel_config": {},
         "payload": {
-            "title":           f"Online Detection: {finding.check_label} [{action_taken}]",
-            "message": (
-                f"{finding.owasp_signal_id}:{finding.sub_check_id} fired during live session. "
-                f"Action taken: {action_taken}."
-            ),
-            "rule_type":       "online_security_action",
+            "title":           f"Online Detections: {n} check{'s' if n != 1 else ''} fired",
+            "message":         f"{checks_text}. Actions: {action_summary}.",
+            "rule_type":       "online_security_summary",
             "source":          "security",
             "agent_id":        agent_id,
-            "sub_check_id":    finding.sub_check_id,
-            "owasp_signal_id": finding.owasp_signal_id,
-            "check_label":     finding.check_label,
-            "check_score":     finding.check_score,
-            "effective_score": round(finding.check_score * finding.confidence),
-            "confidence_tier": finding.confidence_tier,
-            "severity":        finding.severity,
-            "category":        finding.category,
-            "action_taken":    action_taken,
-            "detection_phase": "online",
-            "matched_text":    finding.matched_text,
+            "detection_count": n,
+            "action_counts":   action_counts,
+            "detections":      sorted_detections,
             "signal_taxonomy_version": "3.0",
         },
     }
     producer = _get_producer()
     producer.produce(
         settings.kafka_alerts_topic,
-        key=finding.session_id.encode(),
+        key=session_id.encode(),
         value=json.dumps(alert).encode(),
     )
     producer.flush()

@@ -518,6 +518,20 @@ async def score_session(
         except Exception:
             logger.exception('"failed to load online findings from Postgres session_id=%s"', session_id)
 
+    # ─── Build action_map for online findings (sub_check_id → action_taken) ───
+    # session_actions rows cover auditable actions (sanitize / block_call /
+    # terminate_session).  Findings absent from the map were monitor / alert.
+    online_action_map: dict[str, str] = {}
+    if sdk_findings:
+        try:
+            action_rows = await pool.fetch(
+                "SELECT sub_check_id, action_taken FROM session_actions WHERE session_id = $1",
+                session_id,
+            )
+            online_action_map = {r["sub_check_id"]: r["action_taken"] for r in action_rows}
+        except Exception:
+            logger.exception('"failed to load session_actions session_id=%s"', session_id)
+
     # ─── Per-event detectors (replayed post-session) ──────────────────────────
     # Skip sub-checks that the SDK already handled online — avoids double-counting.
     all_findings = await _run_per_event_detectors(
@@ -806,6 +820,7 @@ async def score_session(
         llm_score >= _llm_threshold
         or asi_score >= _asi_threshold
     )
+    trust_alert_triggered = False
 
     if not should_alert:
         for sig_id, sig_data in {**llm_signal_map, **asi_signal_map}.items():
@@ -853,20 +868,37 @@ async def score_session(
                     # If we have enough sessions and trust is below threshold, alert
                     if low_trust_sessions and int(low_trust_sessions[0]["cnt"]) >= AGENT_TRUST_CONSECUTIVE_SESSIONS:
                         should_alert = True
+                        trust_alert_triggered = True
             except Exception:
                 pass
 
+    # ─── Combined online alert (one per session) ─────────────────────────────
+    # Produced here — at session end — so all online findings are known and can
+    # be bundled into a single alert (sanitize / terminate_session / alert actions).
+    if sdk_findings:
+        try:
+            from consumers.security_eval.findings import produce_combined_online_alert
+            await produce_combined_online_alert(
+                session_id=session_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                findings=sdk_findings,
+                action_map=online_action_map,
+            )
+        except Exception:
+            logger.exception('"failed to produce combined online alert session_id=%s"', session_id)
+
     if should_alert:
-        # If every finding in this session was already caught by online detection,
-        # the operator has already received real-time online_security_action alerts
-        # for each one.  Suppress the redundant post-session security_risk alert to
-        # avoid double-paging.  Any session with at least one post-session finding
-        # still fires — the scorer saw something the SDK didn't catch in real time.
+        # Suppress the post-session risk-score alert when every finding was already
+        # caught by the SDK online — the combined online alert above covers it.
+        # Any session with at least one post-session finding still fires the risk
+        # alert since the scorer saw something the SDK didn't catch in real time.
         all_online = bool(all_session_findings) and all(
             f.detection_phase == "online" for f in all_session_findings
         )
         if not all_online:
             from consumers.security_eval.findings import produce_security_alert
-            await produce_security_alert(score_row, all_session_findings)
+            await produce_security_alert(score_row, all_session_findings,
+                                         trust_triggered=trust_alert_triggered)
 
     return score_row

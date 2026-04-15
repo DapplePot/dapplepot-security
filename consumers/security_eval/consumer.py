@@ -104,20 +104,18 @@ async def _init_agent_security_config(tenant_id: str, agent_id: str) -> None:
         )
 
 
-async def _persist_sdk_finding(session_id: str, agent_id: str | None, payload: dict) -> None:
+async def _persist_sdk_finding(session_id: str, agent_id: str | None, payload: dict, emitted_at: str | None = None) -> None:
     """
     Process an SDK-emitted online security_finding event.
 
     Steps:
       1. Persist finding to security_findings (detection_phase='online').
-      2. If action_taken is auditable (block_call / terminate_session):
+      2. If action_taken is auditable (sanitize / block_call / terminate_session):
          write an audit row to session_actions.
-      3. If action_taken warrants an alert (alert / block_call / terminate_session):
-         produce an immediate alert to obs.alerts.v1.
 
-    The uq_findings_session_subcheck constraint prevents duplicate findings if
-    the Kafka event is replayed.  The dedup_key on online alerts prevents the
-    alert router from notifying twice for the same sub-check within one session.
+    No per-finding alert is produced here.  A single combined alert covering
+    all online detections for the session is produced at session end by the
+    post-session scorer (produce_combined_online_alert).
     """
     try:
         import dataclasses
@@ -125,8 +123,6 @@ async def _persist_sdk_finding(session_id: str, agent_id: str | None, payload: d
             Finding,
             write_findings,
             write_session_action,
-            produce_online_alert,
-            _ALERTABLE_ACTIONS,
             _AUDITABLE_ACTIONS,
         )
 
@@ -134,6 +130,10 @@ async def _persist_sdk_finding(session_id: str, agent_id: str | None, payload: d
 
         _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
         finding = Finding(**{k: v for k, v in payload.items() if k in _init_fields})
+        # Preserve the SDK event emission time (from the envelope) so the timeline
+        # shows the real event timestamp, not the DB insert time.
+        if emitted_at:
+            finding.emitted_at = emitted_at
 
         # Step 1 — persist finding
         await write_findings([finding])
@@ -141,10 +141,6 @@ async def _persist_sdk_finding(session_id: str, agent_id: str | None, payload: d
         # Step 2 — audit row for hard actions
         if action_taken in _AUDITABLE_ACTIONS:
             await write_session_action(finding, action_taken, agent_id=agent_id)
-
-        # Step 3 — immediate alert
-        if action_taken in _ALERTABLE_ACTIONS:
-            await produce_online_alert(finding, action_taken, agent_id=agent_id)
 
     except Exception:
         logger.exception('"failed to persist SDK online finding session_id=%s"', session_id)
@@ -176,6 +172,7 @@ async def _handle_event(event: dict) -> None:
                     session_id=session_id,
                     agent_id=agent_id,
                     payload=event.get("payload") or {},
+                    emitted_at=event.get("emitted_at"),
                 )
             )
         return
