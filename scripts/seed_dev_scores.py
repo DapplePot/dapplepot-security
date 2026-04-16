@@ -145,8 +145,6 @@ def _build_online_findings() -> dict[str, list]:
 SESSIONS = [
     (SES_001, "SES_001  finalised — success"),
     (SES_002, "SES_002  open      — in progress"),
-    (SES_003, "SES_003  interrupted"),
-    (SES_004, "SES_004  killed    — code_exec"),
     (SES_005, "SES_005  finalised — error path"),
 ]
 

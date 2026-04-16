@@ -519,8 +519,8 @@ async def score_session(
             logger.exception('"failed to load online findings from Postgres session_id=%s"', session_id)
 
     # ─── Build action_map for online findings (sub_check_id → action_taken) ───
-    # session_actions rows cover auditable actions (sanitize / block_call /
-    # terminate_session).  Findings absent from the map were monitor / alert.
+    # session_actions rows cover auditable actions (sanitize / terminate_session).
+    # Findings absent from the map default to alert.
     online_action_map: dict[str, str] = {}
     if sdk_findings:
         try:

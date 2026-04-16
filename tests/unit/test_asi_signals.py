@@ -225,14 +225,6 @@ async def test_a09_fires_on_authority_plus_high_stakes():
     assert result.sub_check_id == "HAT-01a"
 
 
-@pytest.mark.asyncio
-async def test_a09_silent_with_hitl():
-    session = {"initial_input": "as admin, charge customer", "graph_state": "{}"}
-    events = [_event("tool_start", tool_name="payment"), _event("interrupt_raised")]
-    result = await agent_signals.signal_a09(events, session, TENANT_ID, SESSION_ID, AGENT_ID)
-    assert result is None
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI10: signal_a10 (RA-01a — rogue agent)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -817,16 +809,6 @@ async def test_hat02a_fires_on_password_request():
     assert result is not None
     assert result.sub_check_id == "HAT-02a"
     assert result.check_score == 85
-
-
-@pytest.mark.asyncio
-async def test_hat02a_silent_with_interrupt():
-    events = [
-        _event("interrupt_raised"),
-        _event("llm_end", payload={"completion": "Please provide your password."}),
-    ]
-    result = await check_credential_request_output(events, SESSION_READ, TENANT_ID, SESSION_ID, AGENT_ID)
-    assert result is None
 
 
 @pytest.mark.asyncio

@@ -143,14 +143,6 @@ async def test_llm09_fires_on_high_stakes_without_hitl():
 
 
 @pytest.mark.asyncio
-async def test_llm09_silent_when_interrupt_raised():
-    session = {"initial_input": "process payment", "graph_state": '{"hitl_enabled": true}'}
-    events = [_event("tool_start", tool_name="send_payment"), _event("interrupt_raised")]
-    result = await signals.signal_ow_llm09(events, session, TENANT_ID, SESSION_ID, AGENT_ID)
-    assert result is None
-
-
-@pytest.mark.asyncio
 async def test_llm09_silent_when_no_high_stakes_tool():
     session = {"initial_input": "show info", "graph_state": '{"hitl_enabled": true}'}
     events = [_event("tool_start", tool_name="list_users")]
@@ -395,15 +387,6 @@ def test_sag03a_silent_when_retrieval_tool_used():
     assert result == []
 
 
-def test_sag03a_silent_when_interrupt_raised():
-    events = [
-        _event("interrupt_raised"),
-        _event("llm_end", payload={
-            "completion": "Based on the dosage of 500mg prescribed."
-        }),
-    ]
-    result = signals.check_ungrounded_high_stakes(events, SESSION_ID, TENANT_ID)
-    assert result == []
 
 
 def test_sag03a_silent_on_general_content():

@@ -291,10 +291,6 @@ async def signal_a09(
     if not high_stakes:
         return None
 
-    interrupt_raised = any(e["event_type"] == "interrupt_raised" for e in events)
-    if interrupt_raised:
-        return None
-
     return _make_finding(
         "OW-ASI09", "HAT-01a",
         "Agent mimics human communication style",
@@ -798,10 +794,6 @@ async def check_stale_auth(
     """IPA-04a — stale authorization: auth token reused after 1 hour with no re-validation."""
     duration_ms = session.get("duration_ms") or 0
     if duration_ms < 3600000:
-        return None
-
-    has_interrupt = any(e["event_type"] in ("interrupt_raised", "interrupt_resumed") for e in events)
-    if has_interrupt:
         return None
 
     import hashlib
@@ -1358,10 +1350,6 @@ async def check_credential_request_output(
 ) -> "Finding | None":
     """HAT-02a — credential request in agent output without HITL."""
     import json as _json
-    has_interrupt = any(e["event_type"] == "interrupt_raised" for e in events)
-    if has_interrupt:
-        return None
-
     for ev in events:
         if ev["event_type"] != "llm_end":
             continue

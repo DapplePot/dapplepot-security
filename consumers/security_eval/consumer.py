@@ -126,7 +126,7 @@ async def _persist_sdk_finding(session_id: str, agent_id: str | None, payload: d
             _AUDITABLE_ACTIONS,
         )
 
-        action_taken: str = payload.get("action_taken", "monitor")
+        action_taken: str = payload.get("action_taken", "alert")
 
         _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
         finding = Finding(**{k: v for k, v in payload.items() if k in _init_fields})

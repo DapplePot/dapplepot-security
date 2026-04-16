@@ -206,10 +206,6 @@ async def signal_ow_llm09(
     if not high_stakes:
         return None
 
-    interrupt_raised = any(e["event_type"] == "interrupt_raised" for e in events)
-    if interrupt_raised:
-        return None
-
     graph_state = session.get("graph_state") or {}
     if isinstance(graph_state, str):
         try:
@@ -728,8 +724,7 @@ def check_ungrounded_high_stakes(
         and _RETRIEVAL_TOOL.search(ev.get("tool_name", ""))
         for ev in events
     )
-    has_interrupt = any(ev["event_type"] == "interrupt_raised" for ev in events)
-    if has_retrieval or has_interrupt:
+    if has_retrieval:
         return []
 
     for ev in events:

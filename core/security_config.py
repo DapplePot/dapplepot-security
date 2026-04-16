@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -78,16 +78,6 @@ class SubCheckOverride(BaseModel):
     """
     online_detection: bool = False
     action: Literal["alert", "sanitize", "terminate_session"] = "alert"
-
-    @field_validator("action", mode="before")
-    @classmethod
-    def _migrate_action(cls, v: str) -> str:
-        """Migrate stale action values stored in Redis before the 3-action model."""
-        if v in ("monitor",):
-            return "alert"
-        if v in ("block_call",):
-            return "terminate_session"
-        return v
 
 
 class AgentSecurityConfig(BaseModel):

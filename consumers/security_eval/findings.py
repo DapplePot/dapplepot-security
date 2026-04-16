@@ -337,7 +337,7 @@ async def produce_combined_online_alert(
     # Overall alert severity: highest of finding severity or action severity
     top_finding_sev = max(findings, key=lambda f: _severity_rank.get(f.severity, 0)).severity
     top_action      = max(action_map.values(), key=lambda a: _action_rank.get(a, 0)) \
-                      if action_map else "monitor"
+                      if action_map else "alert"
     action_sev      = _ACTION_TO_SEVERITY.get(top_action, "medium")
     severity        = top_finding_sev \
                       if _severity_rank.get(top_finding_sev, 0) >= _severity_rank.get(action_sev, 0) \
@@ -346,7 +346,7 @@ async def produce_combined_online_alert(
     # Count by action bucket
     action_counts: dict[str, int] = {}
     for f in findings:
-        bucket = action_map.get(f.sub_check_id, "monitor")
+        bucket = action_map.get(f.sub_check_id, "alert")
         action_counts[bucket] = action_counts.get(bucket, 0) + 1
 
     detections = [
@@ -359,7 +359,7 @@ async def produce_combined_online_alert(
             "confidence_tier": f.confidence_tier,
             "severity":        f.severity,
             "category":        f.category,
-            "action_taken":    action_map.get(f.sub_check_id, "monitor"),
+            "action_taken":    action_map.get(f.sub_check_id, "alert"),
             "matched_text":    f.matched_text,
         }
         for f in findings
