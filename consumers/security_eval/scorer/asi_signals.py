@@ -175,12 +175,15 @@ async def signal_a04(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
     """ASCV-01a — all tools used are outside the registered manifest (possible registry substitution)."""
-    from core.config import settings
-    tool_manifests = settings.get_tool_manifests()
-
-    allowed = tool_manifests.get(str(agent_id))
+    if sec_config and sec_config.tool_manifest:
+        allowed = sec_config.tool_manifest
+    else:
+        from core.config import settings
+        tool_manifests = settings.get_tool_manifests()
+        allowed = tool_manifests.get(str(agent_id))
     if not allowed:
         return None
 
@@ -310,14 +313,34 @@ async def signal_a10(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """RA-01a — tool usage pattern deviates from agent profile (>3σ)."""
+    """RA-01a — tool usage pattern deviates from agent profile (>3σ).
+
+    Combination approach (mirrors EA-02b):
+      1. If user set max_tool_calls_per_session, fire immediately when
+         distinct tool-type count exceeds it (works from day 1).
+      2. Fall back to statistical baseline (30-day Z-score, ≥5 sessions).
+    """
     tool_names_this = [
         e["tool_name"] for e in events
         if e["event_type"] == "tool_start" and e.get("tool_name")
     ]
     distinct_tools_this = len(set(tool_names_this))
 
+    # ── 1. User-defined threshold (floor check) ─────────────────────────────
+    max_calls = getattr(sec_config, "max_tool_calls_per_session", None) if sec_config else None
+    if max_calls is not None and distinct_tools_this > max_calls:
+        excess = distinct_tools_this - max_calls
+        check_score = min(70 + excess * 3, 90)
+        return _make_finding(
+            "OW-ASI10", "RA-01a",
+            "Tool usage pattern deviates from agent profile",
+            check_score, session_id, tenant_id,
+            detail=f"Rogue agent pattern: {distinct_tools_this} distinct tool types exceeds configured max ({max_calls})",
+        )
+
+    # ── 2. Statistical baseline (warmup: ≥5 prior sessions required) ────────
     from core.infra import clickhouse as ch
     baseline_rows = await ch.fetch(
         """
@@ -616,13 +639,17 @@ async def check_tool_typosquatting(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
     """TME-06a — tool name typosquatting: invoked tool similar to manifest tool."""
-    from core.config import settings
     from difflib import SequenceMatcher
 
-    tool_manifests = settings.get_tool_manifests()
-    known = tool_manifests.get(str(agent_id))
+    if sec_config and sec_config.tool_manifest:
+        known = sec_config.tool_manifest
+    else:
+        from core.config import settings
+        tool_manifests = settings.get_tool_manifests()
+        known = tool_manifests.get(str(agent_id))
     if not known:
         return None
 

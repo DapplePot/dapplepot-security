@@ -488,9 +488,13 @@ async def score_session(
     # Online findings were written directly to security_findings (detection_phase='online')
     # by the consumer when security_finding events arrived. Fetch them here so the
     # post-session scorer can skip their sub_check_ids and merge them into the final score.
-    online_ids = sec_config.online_subcheck_ids()
+    #
+    # Use the set of sub-check IDs that *actually fired* (from DB rows) as the skip
+    # set — not the config's online_subcheck_ids(). A sub-check may be toggled online
+    # in config but have no SDK implementation, in which case no finding arrives and
+    # the post-session scorer must still handle it.
     sdk_findings: list = []
-    if online_ids:
+    if sec_config.online_subcheck_ids():
         try:
             import dataclasses
             from consumers.security_eval.findings import Finding
@@ -532,6 +536,11 @@ async def score_session(
         except Exception:
             logger.exception('"failed to load session_actions session_id=%s"', session_id)
 
+    # Build the skip set from sub-checks that actually fired online — not from config.
+    # This ensures sub-checks toggled online but lacking an SDK implementation still
+    # run post-session (the SDK produces no finding for them, so they shouldn't be skipped).
+    online_ids: frozenset[str] = frozenset(f.sub_check_id for f in sdk_findings)
+
     # ─── Per-event detectors (replayed post-session) ──────────────────────────
     # Skip sub-checks that the SDK already handled online — avoids double-counting.
     all_findings = await _run_per_event_detectors(
@@ -554,6 +563,8 @@ async def score_session(
             kwargs["sec_config"] = sec_config
         finding = await signal_fn(**kwargs) if _inspect.iscoroutinefunction(signal_fn) else signal_fn(**kwargs)
         if finding:
+            if getattr(finding, "sub_check_id", None) in online_ids:
+                continue  # already handled online; action is the SDK-configured one
             # Respect per-signal enabled flag from config
             sig_id = getattr(finding, "owasp_signal_id", None)
             sig_cfg = sec_config.signals.get(sig_id) if sig_id else None
@@ -563,6 +574,8 @@ async def score_session(
     # Additional sub-check helpers (return lists) — filter by per-signal enabled flag.
     def _extend_if_enabled(findings: list) -> None:
         for f in findings:
+            if getattr(f, "sub_check_id", None) in online_ids:
+                continue  # already handled online
             sig_id  = getattr(f, "owasp_signal_id", None)
             sig_cfg = sec_config.signals.get(sig_id) if sig_id else None
             if sig_cfg is None or sig_cfg.enabled:
@@ -590,7 +603,7 @@ async def score_session(
         agent_id=agent_id,
         online_findings=all_findings,
     )
-    if a01_finding:
+    if a01_finding and getattr(a01_finding, "sub_check_id", None) not in online_ids:
         all_findings.append(a01_finding)
 
     for signal_key, signal_fn in AGENT_SIGNAL_ID_FUNCTIONS:
@@ -608,6 +621,8 @@ async def score_session(
             kwargs["sec_config"] = sec_config
         finding = await signal_fn(**kwargs)
         if finding:
+            if getattr(finding, "sub_check_id", None) in online_ids:
+                continue  # already handled online; action is the SDK-configured one
             sig_id = getattr(finding, "owasp_signal_id", None)
             sig_cfg = sec_config.signals.get(sig_id) if sig_id else None
             if sig_cfg is None or sig_cfg.enabled:
@@ -626,7 +641,7 @@ async def score_session(
                 agent_id=agent_id,
             )
             cs_finding = await cs_fn(**cs_kwargs)
-            if cs_finding:
+            if cs_finding and getattr(cs_finding, "sub_check_id", None) not in online_ids:
                 all_findings.append(cs_finding)
         except Exception:
             logger.exception('"cross-session signal failed key=%s"', _cs_key)

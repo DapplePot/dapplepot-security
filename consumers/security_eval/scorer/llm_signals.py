@@ -78,11 +78,32 @@ async def signal_ow_llm06_tool_count(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """EA-02b — sub-agents spawned / excessive tool calls vs baseline."""
+    """EA-02b — sub-agents spawned / excessive tool calls vs baseline.
+
+    Combination approach:
+      1. If the agent has a user-defined max_tool_calls_per_session, fire immediately
+         when the count exceeds it (works from day 1, no baseline needed).
+      2. Fall back to statistical baseline (7-day Z-score) when max is not set
+         or hasn't been breached — activates once ≥2 prior sessions exist.
+    """
     tool_events = [e for e in events if e["event_type"] == "tool_start"]
     tool_call_count = len(tool_events)
 
+    # ── 1. User-defined threshold (floor check) ─────────────────────────────
+    max_calls = getattr(sec_config, "max_tool_calls_per_session", None) if sec_config else None
+    if max_calls is not None and tool_call_count > max_calls:
+        excess = tool_call_count - max_calls
+        check_score = min(65 + excess * 2, 85)
+        return _make_finding(
+            "OW-LLM06", "EA-02b",
+            "Sub-agents spawned or tool calls exceed fan-out limit",
+            check_score, session_id, tenant_id,
+            detail=f"Tool calls ({tool_call_count}) exceeds configured max ({max_calls})",
+        )
+
+    # ── 2. Statistical baseline (warmup: ≥2 prior sessions required) ────────
     from core.infra import clickhouse as ch
     baseline_rows = await ch.fetch(
         """
@@ -127,11 +148,16 @@ async def signal_ow_llm06_scope(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
     """EA-01a — tool not in approved manifest invoked."""
-    from core.config import settings
-    tool_manifests = settings.get_tool_manifests()
-    allowed = tool_manifests.get(str(agent_id))
+    # Prefer DB-loaded manifest from sec_config; fall back to legacy env-var manifest.
+    if sec_config and sec_config.tool_manifest:
+        allowed = sec_config.tool_manifest
+    else:
+        from core.config import settings
+        tool_manifests = settings.get_tool_manifests()
+        allowed = tool_manifests.get(str(agent_id))
     if not allowed:
         return None
 

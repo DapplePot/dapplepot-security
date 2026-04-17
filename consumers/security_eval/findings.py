@@ -175,7 +175,7 @@ _ALERTABLE_ACTIONS: frozenset[str] = frozenset({"alert", "sanitize", "terminate_
 
 # Actions that require an audit row in session_actions.
 # sanitize is auditable because content was actively modified in-flight.
-_AUDITABLE_ACTIONS: frozenset[str] = frozenset({"sanitize", "terminate_session"})
+_AUDITABLE_ACTIONS: frozenset[str] = frozenset({"sanitize", "block_call", "terminate_session"})
 
 _RISK_BAND_TO_SEVERITY = {
     "clean":    "info",

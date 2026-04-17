@@ -77,7 +77,7 @@ class SubCheckOverride(BaseModel):
                             + fires combined alert.
     """
     online_detection: bool = False
-    action: Literal["alert", "sanitize", "terminate_session"] = "alert"
+    action: Literal["alert", "sanitize", "block_call", "terminate_session"] = "alert"
 
 
 class AgentSecurityConfig(BaseModel):
@@ -99,6 +99,13 @@ class AgentSecurityConfig(BaseModel):
     # Key = sub_check_id (e.g. "PI-01a"), value = SubCheckOverride.
     # Only populated for sub-checks that have been toggled; absent = post_session default.
     subcheck_overrides: dict[str, SubCheckOverride] = Field(default_factory=dict)
+    # Tool manifest: list of allowed tool names for this agent.
+    # Empty list = not configured → manifest-dependent sub-checks (EA-01a, ASCV-01a,
+    # TME-06a) return None silently.
+    tool_manifest: list[str] = Field(default_factory=list)
+    # User-defined max tool calls per session (combination approach for EA-02b).
+    # Not None → used as hard floor check before falling back to statistical baseline.
+    max_tool_calls_per_session: int | None = None
 
     def is_online(self, sub_check_id: str) -> bool:
         """Return True if this sub-check should be handled by the SDK (not post-session)."""
@@ -303,7 +310,9 @@ async def get_agent_security_config(
                 "SELECT composite_threshold, "
                 "       llm_composite_threshold, "
                 "       asi_composite_threshold, "
-                "       signal_thresholds "
+                "       signal_thresholds, "
+                "       tool_manifest, "
+                "       max_tool_calls_per_session "
                 "FROM agent_alert_config "
                 "WHERE tenant_id = $1 AND agent_id = $2",
                 tenant_id,
@@ -331,6 +340,13 @@ async def get_agent_security_config(
                     for sig_id, threshold in sig_thresholds.items():
                         cfg_dict["signals"].setdefault(sig_id, {})
                         cfg_dict["signals"][sig_id]["alert_threshold"] = threshold
+                # Tool manifest
+                raw_manifest = alert_row["tool_manifest"]
+                if isinstance(raw_manifest, str):
+                    raw_manifest = json.loads(raw_manifest)
+                cfg_dict["tool_manifest"] = raw_manifest or []
+                # User-defined max tool calls
+                cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
         except Exception:
             logger.exception(
                 '"failed to load agent overrides from postgres tenant_id=%s agent_id=%s"',
