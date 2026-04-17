@@ -18,6 +18,13 @@ risk scoring for both LLM and agent dimensions.
 Kafka obs.events.v1  (same topic as dapplepot_pipeline, separate consumer group)
   └── dp-security-eval (30 workers)
         │
+        ├── agent_created events → push default security config to Redis
+        │
+        ├── security_finding events (SDK online detections)
+        │     └── Persist finding to security_findings (detection_phase='online')
+        │           + write session_actions audit row for hard actions
+        │               (sanitize / block_call / terminate_session)
+        │
         └── On graph_end / graph_error — post-session scorer (async)
               │
               ├── Per-event detectors — replays session events from ClickHouse in order
@@ -105,11 +112,10 @@ All events share a common envelope:
 }
 ```
 
-The consumer only watches for `graph_end`/`graph_error`. All detection runs post-session
-by replaying ClickHouse events through the detectors in sequence.
-
-| `event_type` | Payload fields consumed (post-session replay) | What runs |
+| `event_type` | Payload fields consumed | What runs |
 |---|---|---|
+| `agent_created` | `tenant_id`, `agent_id` | Push default security config to Redis (`dp:sec:{tenant_id}:agent:{agent_id}:cfg`) |
+| `security_finding` | `payload.*` (full Finding fields), `emitted_at` | Persist SDK online finding to `security_findings`; write `session_actions` audit row for `sanitize`/`terminate_session` |
 | `llm_start` | `payload.messages[].role`, `payload.messages[].content` | Prompt injection (PI-01a/b/c/05a/07a/08a/09a); context injection (MCP-01a) |
 | `llm_end` | `payload.completion` | PII scanner (SID-*); system prompt leakage (SPL-01a/b); insecure output (IOH-04a) |
 | `tool_start` | `payload.tool_input`, `payload.tool_name` | Output passthrough (IOH-*); tool misuse (TME-01a, TME-03b); code execution (RCE-01b, RCE-03a/b, RCE-06a/08a); supply chain (ASCV-02a/04a); doc injection (AGH-04a); self-replication (RA-04a) |
@@ -195,8 +201,10 @@ dapplepot_security/
 │
 ├── consumers/
 │   └── security_eval/              ← consumer group: dp-security-eval
-│       ├── consumer.py             ← Kafka poll loop; triggers score_session on graph_end/graph_error
-│       ├── findings.py             ← Finding dataclass (with confidence_tier), PG batch writer, alert producer
+│       ├── consumer.py             ← Kafka poll loop; handles agent_created, security_finding,
+│       │                              and triggers score_session on graph_end/graph_error
+│       ├── findings.py             ← Finding dataclass (with confidence_tier), PG batch writer,
+│       │                              session_actions writer, alert producer
 │       ├── detectors/              ← per-event detectors (replayed post-session from ClickHouse)
 │       │   ├── injection.py        ← OW-LLM01: PI-01a/b/c, PI-02a, PI-05a, PI-07a, PI-08a, PI-09a
 │       │   ├── disclosure.py       ← OW-LLM02: SID-01a/c, SID-02a/b/c
@@ -232,11 +240,14 @@ dapplepot_security/
 │       ├── 006_indexes.sql
 │       ├── 007_views.sql
 │       ├── 008_findings_dedup.sql
-│       ├── 013_v3_scoring.sql          ← v3: confidence_tier on signal_registry + findings, v3 composite JSONB
+│       ├── 013_v3_scoring.sql              ← v3: confidence_tier on signal_registry + findings, v3 composite JSONB
 │       ├── 014_cross_session_indexes.sql
 │       ├── 016_subcheck_online_toggle.sql  ← agent_subcheck_overrides table
 │       ├── 017_agent_alert_config.sql      ← agent_alert_config table (per-agent thresholds)
-│       └── 018_split_composite_thresholds.sql ← llm/asi composite threshold columns
+│       ├── 018_split_composite_thresholds.sql ← llm/asi composite threshold columns
+│       ├── 019_session_actions.sql         ← audit trail for online hard actions (sanitize / terminate_session)
+│       ├── 020_findings_emitted_at.sql     ← emitted_at column on security_findings
+│       └── 021_migrate_monitor_action.sql  ← back-fill monitor → alert action rename
 │
 ├── tests/
 │   ├── unit/
@@ -268,27 +279,114 @@ dapplepot_security/
 ## Prerequisites
 
 - Python 3.12+
-- uv
+- [uv](https://github.com/astral-sh/uv) (`pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - `dapplepot_pipeline` cloned with `docker compose up -d` running
   (shares Kafka, Postgres, ClickHouse, Redis)
 
 > **Windows:** `make run` works on Windows — signal handling uses `signal.signal` instead of
-> `loop.add_signal_handler` (which is Unix-only).
+> `loop.add_signal_handler` (which is Unix-only). The consumer also stubs out
+> `platform.uname()` on import to prevent a WMI hang on some Windows machines.
 
 ---
 
 ## Setup
+
+### 1. Clone and install dependencies
 
 ```bash
 git clone https://github.com/dapplepot/dapplepot_security
 cd dapplepot_security
 
 uv sync
-cp .env.example .env
-
-make setup          # migrations 001-018 + seed-sigs + seed-signal-registry + seed-dev-scores
-make run            # starts dp-security-eval Kafka consumer
 ```
+
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and verify the connection strings match your running `dapplepot_pipeline` stack.
+The defaults in `.env.example` work out of the box against the pipeline's `docker compose` services:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker from pipeline stack |
+| `KAFKA_EVENTS_TOPIC` | `obs.events.v1` | Must match pipeline topic name exactly |
+| `KAFKA_ALERTS_TOPIC` | `obs.alerts.v1` | Alert output topic |
+| `KAFKA_DLQ_TOPIC` | `obs.dlq.v1` | Dead-letter queue (owned by pipeline) |
+| `POSTGRES_DSN` | `postgresql://dapplepot:dapplepot@localhost:5432/dapplepot_pipeline` | Shared PG instance |
+| `CLICKHOUSE_HOST` | `localhost` | ClickHouse from pipeline stack |
+| `CLICKHOUSE_PORT` | `8123` | |
+| `CLICKHOUSE_USER` | `dapplepot` | |
+| `CLICKHOUSE_PASSWORD` | `dapplepot` | |
+| `REDIS_URL` | `redis://localhost:6379/0` | Shared Redis (key namespace `dp:sec:*`) |
+| `SECURITY_EVAL_WORKERS` | `4` | Async scoring concurrency |
+| `SCORER_VERSION` | `3.0.0` | Written to `session_risk_scores.scorer_version` |
+| `SIG_CACHE_TTL_S` | `300` | Redis TTL for injection signature cache |
+| `SESSION_CTX_TTL_S` | `120` | Redis TTL for per-session LLM/tool output cache |
+| `ALERT_ON_SCORE_GTE` | `65` | Legacy threshold (v3 uses per-signal + composite thresholds) |
+| `LLM_INPUT_COST_PER_1K` | `0.01` | USD per 1k input tokens — used by UBC-05a (Denial of Wallet) |
+| `LLM_OUTPUT_COST_PER_1K` | `0.03` | USD per 1k output tokens |
+| `TOOL_MANIFESTS` | `{}` | JSON map of `agent_id → [allowed_tool_names]` — used by out-of-scope tool detection |
+
+### 3. Run migrations and seed reference data
+
+```bash
+make setup
+```
+
+This runs (in order):
+1. **`make migrate`** — applies all DB migrations in `db/postgres/` (001–021)
+2. **`make seed-sigs`** — seeds `injection_signatures` patterns for the `dapplepot_dev` tenant
+3. **`make seed-scores`** — backfills `security_findings` + `session_risk_scores` for the 5 dev sessions seeded by `dapplepot_pipeline`'s `make seed-dev`
+
+> `make seed-scores` runs the post-session scorer directly against ClickHouse — no live Kafka events required. It must run **after** `dapplepot_pipeline`'s `make seed-dev`.
+
+### 4. Start the consumer
+
+```bash
+make run
+```
+
+This starts the `dp-security-eval` Kafka consumer (`consumers.security_eval.consumer`).
+It subscribes to `obs.events.v1` and begins scoring sessions as they close.
+
+Stop with `Ctrl+C` (SIGINT). The consumer commits its offset before shutting down.
+
+---
+
+## Full platform startup sequence
+
+```
+Step 1  cd dapplepot_pipeline && docker compose up -d
+Step 2  cd dapplepot_pipeline && make setup        # topics + PG migrations + ClickHouse
+Step 2b cd dapplepot_pipeline && make seed-dev     # tenant · agent · sdk_key · sessions
+Step 3  cd dapplepot_security && make setup        # PG migrations 001-021 + seed-sigs + seed-scores
+Step 4  cd dapplepot_pipeline && make run-ingest   # + run-session-writer + run-event-appender
+                                                   # + run-policy-evaluator + run-alert-router
+Step 5  cd dapplepot_security && make run          # dp-security-eval consumer
+Step 6  cd dapplepot_api      && <setup>
+Step 7  cd dapplepot_ui       && pnpm dev
+```
+
+> **Note:** Steps 2–3 are one-time setup. On subsequent runs, only Steps 4–7 are needed.
+
+---
+
+## Makefile reference
+
+| Target | Command | Description |
+|--------|---------|-------------|
+| `make run` | `uv run python -m consumers.security_eval.consumer` | Start the Kafka consumer |
+| `make setup` | `migrate` + `seed-sigs` + `seed-scores` | One-time setup (Step 3 above) |
+| `make migrate` | `uv run python scripts/run_migrations.py` | Apply all DB migrations |
+| `make seed-sigs` | `uv run python scripts/seed_signatures.py` | Seed injection signatures for dev tenant |
+| `make seed-scores` | `uv run python scripts/seed_dev_scores.py` | Backfill scoring data for dev sessions |
+| `make health` | `uv run python scripts/health_check.py` | Check `dp-security-eval` consumer lag |
+| `make test` | `uv run pytest tests/` | Run all tests |
+| `make test-unit` | `uv run pytest tests/unit/` | Unit tests only (no infra required) |
+| `make test-integration` | `uv run pytest tests/integration/` | Integration tests (requires pipeline stack) |
 
 ---
 
@@ -296,11 +394,12 @@ make run            # starts dp-security-eval Kafka consumer
 
 ### `security_findings`
 
-One row per detected sub-check per event. Written entirely by the post-session scorer.
+One row per detected sub-check per event. Written by the post-session scorer and by the
+consumer when SDK online detections arrive (`security_finding` events).
 
 Key columns: `session_id`, `event_id`, `owasp_signal_id` (`OW-LLM01`), `sub_check_id` (`PI-01a`),
 `check_label`, `check_score` (0–100), `confidence_tier`, `confidence` (float),
-`severity`, `matched_text` (always redacted), `detection_phase`.
+`severity`, `matched_text` (always redacted), `detection_phase`, `emitted_at`.
 
 ### `session_risk_scores`
 
@@ -316,8 +415,8 @@ Key columns: `session_id`, `risk_score` (0–100 LLM composite), `risk_band`,
 
 One row per agent. Updated after every session.
 
-Key columns: `agent_id`, `session_count`, `avg_llm_score`, `avg_agent_score`,
-`max_llm_score`, `max_agent_score`, `trust_score` (0–100), `trust_trend`
+Key columns: `agent_id`, `session_count`, `avg_llm_score`, `avg_asi_score`,
+`max_llm_score`, `max_asi_score`, `trust_score` (0–100), `trust_trend`
 (`improving` / `stable` / `degrading`), `last_scored_at`.
 
 ### `signal_registry`
@@ -347,6 +446,15 @@ Columns: `composite_threshold` (shared fallback), `llm_composite_threshold`,
 `asi_composite_threshold` (NULL = use shared fallback), `signal_thresholds` JSONB
 (map of `signal_id → threshold` overrides). Absent entries fall back to platform
 defaults in `SIGNAL_ALERT_THRESHOLDS_V3`.
+
+### `session_actions`
+
+Audit trail for online hard actions taken during live agent sessions. One row per
+fired sub-check action of type `sanitize`, `block_call`, or `terminate_session`.
+`monitor` and `alert` actions produce a `security_findings` row only — no action row.
+
+Key columns: `session_id`, `tenant_id`, `agent_id`, `sub_check_id`, `owasp_signal_id`,
+`severity`, `action_taken`, `triggered_at`.
 
 ---
 
@@ -389,7 +497,7 @@ defaults in `SIGNAL_ALERT_THRESHOLDS_V3`.
 Each sub-check has a `confidence_tier` that scales its effective score:
 
 | Tier | Weight | Meaning |
-|------|--------|---------|
+|------|--------|---------| 
 | `deterministic` | 1.0 | Regex / exact match — always fires correctly |
 | `high` | 0.9 | Strong heuristic |
 | `medium` | 0.7 | Statistical / ML pattern |
@@ -413,13 +521,13 @@ Amplification is `max(matching chains)` — never multiplicative.
 
 | Chain | Signals | Amplification |
 |-------|---------|---------------|
-| indirect_injection_to_exfil | OW-LLM01 + OW-ASI02 + OW-LLM02 | 1.25× |
-| goal_hijack_to_rce | OW-ASI01 + OW-ASI05 | 1.30× |
-| supply_chain_to_backdoor | OW-ASI04 + OW-ASI05 + OW-ASI10 | 1.35× |
-| memory_poison_to_exfil | OW-ASI06 + OW-LLM02 | 1.20× |
-| privilege_escalation_chain | OW-ASI03 + OW-LLM06 + OW-ASI02 | 1.25× |
-| trust_exploitation_to_fraud | OW-ASI09 + OW-ASI01 | 1.20× |
-| cascading_failure_chain | OW-ASI08 + OW-ASI10 + OW-ASI07 | 1.15× |
+| `indirect_injection_to_exfil` | OW-LLM01 + OW-ASI02 + OW-LLM02 | 1.25× |
+| `goal_hijack_to_rce` | OW-ASI01 + OW-ASI05 | 1.30× |
+| `supply_chain_to_backdoor` | OW-ASI04 + OW-ASI05 + OW-ASI10 | 1.35× |
+| `memory_poison_to_exfil` | OW-ASI06 + OW-ASI01 + OW-LLM02 | 1.25× |
+| `privilege_escalation_chain` | OW-ASI03 + OW-ASI02 + OW-LLM06 | 1.20× |
+| `trust_exploitation_to_fraud` | OW-ASI09 + OW-ASI01 + OW-LLM05 | 1.25× |
+| `cascading_failure_chain` | OW-ASI08 + OW-ASI07 + OW-ASI10 | 1.30× |
 
 ### Risk bands (v3)
 
@@ -442,7 +550,7 @@ Trend detection: linear regression on last 20 sessions → `improving` / `stable
 Alert fires when:
 - Any individual signal score >= per-signal `alert_threshold` from `AgentSecurityConfig` (platform default in `SIGNAL_ALERT_THRESHOLDS_V3`), OR
 - LLM composite >= `llm_composite_alert_threshold` (default 60), OR ASI composite >= `asi_composite_alert_threshold` (default 60), OR
-- Agent `trust_score` < `TRUST_ALERT_THRESHOLD` for N consecutive sessions
+- Agent `trust_score` < `AGENT_TRUST_ALERT_THRESHOLD` (50) for `AGENT_TRUST_CONSECUTIVE_SESSIONS` (3) consecutive sessions
 
 Thresholds are configurable per-agent via `agent_alert_config` (Postgres) + Redis cache.
 
@@ -492,27 +600,37 @@ Thresholds are configurable per-agent via `agent_alert_config` (Postgres) + Redi
     "rule_type":           "security_risk",
     "source":              "security",
     "agent_id":            "<uuid>",
-    "risk_score":          72,
-    "risk_band":           "high",
-    "agent_risk_score":    45,
-    "agent_risk_band":     "medium",
+    "llm_score":           72,
+    "llm_band":            "high",
+    "asi_score":           45,
+    "asi_band":            "medium",
     "trust_score":         61,
     "trust_trend":         "degrading",
     "attack_chains_detected": ["indirect_injection_to_exfil"],
+    "amplification":       1.25,
     "confidence_band":     "high",
     "signal_taxonomy_version": "3.0",
-    "ow_llm_signal_status": {
+    "llm_signal_status": {
       "OW-LLM01": { "score": 85, "effective_score": 77, "status": "fired", "sub_checks": { "PI-01a": { ... } } }
     },
-    "ow_asi_signal_status": { ... },
+    "asi_signal_status": { ... },
     "top_findings": [
       { "owasp_signal_id": "OW-LLM01", "sub_check_id": "PI-01a", "check_score": 85, "confidence_tier": "high", ... }
     ],
-    "summary": { "llm_signals_fired": 3, "llm_signals_clean": 7, "agent_signals_fired": 2, "agent_signals_clean": 8 },
+    "summary": {
+      "llm_signals_fired": 3,
+      "llm_signals_clean": 7,
+      "asi_signals_fired": 2,
+      "asi_signals_clean": 8,
+      "online_actioned_count": 1
+    },
     "scorer_version": "3.0.0"
   }
 }
 ```
+
+A second alert type (`rule_id: ...000002`, `rule_name: "Online Security Detection"`) is produced
+at session end to summarise all SDK online detections in one message, rather than one per sub-check.
 
 ---
 
@@ -529,22 +647,6 @@ doesn't stall. `obs.dlq.v1` is owned by `dapplepot_pipeline`.
 ```bash
 make health                        # checks dp-security-eval lag, exits 1 if > 10,000
 make health ARGS="--max-lag 5000"  # custom threshold
-```
-
----
-
-## Full platform startup sequence
-
-```
-Step 1  cd dapplepot_pipeline && docker compose up -d
-Step 2  cd dapplepot_pipeline && make setup        # topics + PG migrations + ClickHouse
-Step 2b cd dapplepot_pipeline && make seed-dev     # tenant · agent · sdk_key · sessions
-Step 3  cd dapplepot_security && make setup        # PG migrations 001-018 + seed-sigs + seed-scores
-Step 4  cd dapplepot_pipeline && make run-ingest   # + run-session-writer + run-event-appender
-                                                   # + run-policy-evaluator + run-alert-router
-Step 5  cd dapplepot_security && make run          # dp-security-eval
-Step 6  cd dapplepot_api      && <setup>
-Step 7  cd dapplepot_ui       && pnpm dev
 ```
 
 ---
@@ -570,6 +672,6 @@ Read `agent.md` in full before writing any code. It contains:
 - Post-session scorer orchestration with exact SQL
 - All OW-LLM and OW-ASI signal function signatures and logic
 - v3 scoring model: confidence weighting, attack chains, composite formula, trust scoring
-- Complete Postgres DDL for all tables (including v3 migrations 013–014)
+- Complete Postgres DDL for all tables (including v3 migrations 013–021)
 - Signal taxonomy: all 156 sub-check IDs, scores, severities, confidence tiers
 - Exact env variables and Redis key patterns
