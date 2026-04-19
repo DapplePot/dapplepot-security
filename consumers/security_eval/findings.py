@@ -1,4 +1,4 @@
-"""Finding dataclass, Postgres batch writer, and alert producer."""
+"""Finding dataclass, Postgres batch writer, and alert delivery."""
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -13,16 +13,6 @@ from core.config import (
     COMPOSITE_ALERT_THRESHOLD_V3,
     CONFIDENCE_WEIGHTS,
 )
-
-_producer = None
-
-
-def _get_producer():
-    global _producer
-    if _producer is None:
-        from core.infra.kafka import make_producer
-        _producer = make_producer()
-    return _producer
 
 
 @dataclass
@@ -170,11 +160,7 @@ _SECURITY_RULE_NAME  = "Security Risk Score"
 _ONLINE_RULE_ID      = "00000000-0000-0000-0000-000000000002"
 _ONLINE_RULE_NAME    = "Online Security Detection"
 
-# Actions that warrant a combined alert from Zone 6 at session end.
-_ALERTABLE_ACTIONS: frozenset[str] = frozenset({"alert", "sanitize", "terminate_session"})
-
 # Actions that require an audit row in session_actions.
-# sanitize is auditable because content was actively modified in-flight.
 _AUDITABLE_ACTIONS: frozenset[str] = frozenset({"sanitize", "block_call", "terminate_session"})
 
 _RISK_BAND_TO_SEVERITY = {
@@ -185,11 +171,7 @@ _RISK_BAND_TO_SEVERITY = {
     "critical": "critical",
 }
 
-_ACTION_TO_SEVERITY = {
-    "alert":             "medium",
-    "sanitize":          "medium",
-    "terminate_session": "critical",
-}
+_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
 
 async def produce_security_alert(score_row: dict, findings: list[Finding], *, trust_triggered: bool = False) -> None:
@@ -223,16 +205,14 @@ async def produce_security_alert(score_row: dict, findings: list[Finding], *, tr
     ]
 
     alert = {
-        "alert_id":      str(uuid.uuid4()),
-        "tenant_id":     score_row["tenant_id"],
-        "session_id":    session_id,
-        "rule_id":       _SECURITY_RULE_ID,
-        "rule_name":     _SECURITY_RULE_NAME,
-        "severity":      severity,
-        "triggered_at":  datetime.now(timezone.utc).isoformat(),
-        "dedup_key":     dedup_key,
-        "channels":      [],
-        "channel_config": {},
+        "alert_id":     str(uuid.uuid4()),
+        "tenant_id":    score_row["tenant_id"],
+        "session_id":   session_id,
+        "rule_id":      _SECURITY_RULE_ID,
+        "rule_name":    _SECURITY_RULE_NAME,
+        "severity":     severity,
+        "triggered_at": datetime.now(timezone.utc).isoformat(),
+        "dedup_key":    dedup_key,
         "payload": {
             "title":   (
                 f"Agent Trust Alert: Score degrading ({int(score_row.get('trust_score', 0))}/100)"
@@ -280,13 +260,8 @@ async def produce_security_alert(score_row: dict, findings: list[Finding], *, tr
             "scorer_version": score_row["scorer_version"],
         },
     }
-    producer = _get_producer()
-    producer.produce(
-        settings.kafka_alerts_topic,
-        key=session_id.encode(),
-        value=json.dumps(alert).encode(),
-    )
-    producer.flush()
+    from server.alert_delivery import deliver_alert
+    await deliver_alert(alert)
 
 
 async def write_session_action(
@@ -331,17 +306,7 @@ async def produce_combined_online_alert(
     if not findings:
         return
 
-    _severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-    _action_rank   = {"terminate_session": 2, "sanitize": 1, "alert": 0}
-
-    # Overall alert severity: highest of finding severity or action severity
-    top_finding_sev = max(findings, key=lambda f: _severity_rank.get(f.severity, 0)).severity
-    top_action      = max(action_map.values(), key=lambda a: _action_rank.get(a, 0)) \
-                      if action_map else "alert"
-    action_sev      = _ACTION_TO_SEVERITY.get(top_action, "medium")
-    severity        = top_finding_sev \
-                      if _severity_rank.get(top_finding_sev, 0) >= _severity_rank.get(action_sev, 0) \
-                      else action_sev
+    severity = max(findings, key=lambda f: _SEVERITY_RANK.get(f.severity, 0)).severity
 
     # Count by action bucket
     action_counts: dict[str, int] = {}
@@ -381,17 +346,14 @@ async def produce_combined_online_alert(
         f"{v} {k}" for k, v in action_counts.items() if v > 0
     )
     alert = {
-        "alert_id":      str(uuid.uuid4()),
-        "tenant_id":     tenant_id,
-        "session_id":    session_id,
-        "rule_id":       _ONLINE_RULE_ID,
-        "rule_name":     _ONLINE_RULE_NAME,
-        "severity":      severity,
-        "triggered_at":  datetime.now(timezone.utc).isoformat(),
-        # One dedup key per session — alert router discards duplicates if scorer retries.
-        "dedup_key":     f"online_summary:{session_id}",
-        "channels":      [],
-        "channel_config": {},
+        "alert_id":     str(uuid.uuid4()),
+        "tenant_id":    tenant_id,
+        "session_id":   session_id,
+        "rule_id":      _ONLINE_RULE_ID,
+        "rule_name":    _ONLINE_RULE_NAME,
+        "severity":     severity,
+        "triggered_at": datetime.now(timezone.utc).isoformat(),
+        "dedup_key":    f"online_summary:{session_id}",
         "payload": {
             "title":           f"Online Detections: {n} check{'s' if n != 1 else ''} fired",
             "message":         f"{checks_text}. Actions: {action_summary}.",
@@ -404,10 +366,5 @@ async def produce_combined_online_alert(
             "signal_taxonomy_version": "3.0",
         },
     }
-    producer = _get_producer()
-    producer.produce(
-        settings.kafka_alerts_topic,
-        key=session_id.encode(),
-        value=json.dumps(alert).encode(),
-    )
-    producer.flush()
+    from server.alert_delivery import deliver_alert
+    await deliver_alert(alert)
