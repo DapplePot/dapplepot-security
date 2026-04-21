@@ -511,11 +511,19 @@ async def score_session(
                 """,
                 session_id,
             )
+            # Deduplicate by sub_check_id for scoring — keep highest check_score per
+            # sub-check so multiple firings of the same check in one session don't
+            # inflate signal scores.  All rows are stored in the DB for UI display.
+            _best: dict[str, Finding] = {}
             for row in rows:
-                sdk_findings.append(Finding(**{k: v for k, v in dict(row).items() if k in _init_fields}))
+                f = Finding(**{k: v for k, v in dict(row).items() if k in _init_fields})
+                existing = _best.get(f.sub_check_id)
+                if existing is None or f.check_score > existing.check_score:
+                    _best[f.sub_check_id] = f
+            sdk_findings = list(_best.values())
             if sdk_findings:
                 logger.info(
-                    '"loaded %d SDK online findings from Postgres session_id=%s"',
+                    '"loaded %d SDK online findings (deduplicated) from Postgres session_id=%s"',
                     len(sdk_findings),
                     session_id,
                 )
@@ -536,10 +544,23 @@ async def score_session(
         except Exception:
             logger.exception('"failed to load session_actions session_id=%s"', session_id)
 
-    # Build the skip set from sub-checks that actually fired online — not from config.
-    # This ensures sub-checks toggled online but lacking an SDK implementation still
-    # run post-session (the SDK produces no finding for them, so they shouldn't be skipped).
-    online_ids: frozenset[str] = frozenset(f.sub_check_id for f in sdk_findings)
+    # Build the skip set:
+    # - Sub-checks configured as online AND with a known SDK implementation are always
+    #   skipped post-session. The SDK handles them in real time and the security_finding
+    #   event may not yet be persisted by the time the scorer runs (race condition between
+    #   the async ingest pipeline and graph_end triggering score_session).
+    # - Sub-checks configured as online but NOT in the SDK's implementation set are NOT
+    #   skipped — no finding will arrive from the SDK for them so post-session must cover them.
+    _SDK_ONLINE_CAPABLE = frozenset({
+        'PI-01a', 'PI-01b', 'PI-01c', 'PI-02a', 'PI-05a', 'PI-08a',
+        'SID-01a', 'SID-01c', 'SID-02a',
+        'EA-01a', 'EA-02b',
+    })
+    config_online = sec_config.online_subcheck_ids() & _SDK_ONLINE_CAPABLE
+    # Also include any sub-checks that actually fired online (already in DB) but
+    # weren't covered by the config set (e.g. findings from older SDK versions).
+    fired_online = frozenset(f.sub_check_id for f in sdk_findings)
+    online_ids: frozenset[str] = config_online | fired_online
 
     # ─── Per-event detectors (replayed post-session) ──────────────────────────
     # Skip sub-checks that the SDK already handled online — avoids double-counting.

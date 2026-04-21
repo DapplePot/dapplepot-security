@@ -233,6 +233,42 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
     if raw_tenant:
         _deep_merge(cfg_dict, json.loads(raw_tenant))
 
+    # Fold in agent-specific subcheck online toggles from Postgres so the cached
+    # config includes the current online detection settings.  Without this,
+    # get_agent_security_config returns the cache on a hit and never sees the
+    # subcheck_overrides — causing the post-session scorer to skip PI-01a etc.
+    try:
+        from core.infra.postgres import get_pool
+        pool = await get_pool()
+        sc_row = await pool.fetchrow(
+            "SELECT overrides FROM agent_subcheck_overrides "
+            "WHERE tenant_id = $1 AND agent_id = $2",
+            tenant_id, agent_id,
+        )
+        if sc_row and sc_row["overrides"]:
+            subcheck_overrides_raw = sc_row["overrides"]
+            if isinstance(subcheck_overrides_raw, str):
+                subcheck_overrides_raw = json.loads(subcheck_overrides_raw)
+            cfg_dict.setdefault("subcheck_overrides", {})
+            cfg_dict["subcheck_overrides"].update(subcheck_overrides_raw)
+
+        alert_row = await pool.fetchrow(
+            "SELECT tool_manifest, max_tool_calls_per_session "
+            "FROM agent_alert_config WHERE tenant_id = $1 AND agent_id = $2",
+            tenant_id, agent_id,
+        )
+        if alert_row:
+            raw_manifest = alert_row["tool_manifest"]
+            if isinstance(raw_manifest, str):
+                raw_manifest = json.loads(raw_manifest)
+            cfg_dict["tool_manifest"] = raw_manifest or []
+            cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
+    except Exception:
+        logger.exception(
+            '"push_agent_defaults failed to load Postgres overrides tenant_id=%s agent_id=%s"',
+            tenant_id, agent_id,
+        )
+
     cfg = AgentSecurityConfig.model_validate(cfg_dict)
     cache_key = _agent_cache_key(tenant_id, agent_id)
     await redis.set(cache_key, cfg.model_dump_json(), ex=CACHE_TTL_S)

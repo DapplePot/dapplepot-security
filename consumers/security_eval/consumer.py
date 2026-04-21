@@ -12,99 +12,108 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-# Maps SDK online signal names → Finding-compatible fields.
-# Keeps the SDK thin (sends just signal + reason) while giving the
-# security service full OWASP context.
+# Maps SDK online sub_check_id → Finding-compatible fields.
+# Only the 11 sub-checks marked onlineCapable: true in signalRegistry.ts are listed.
+# The SDK now sends sub_check_id directly so this map is keyed by sub_check_id.
 _ONLINE_SIGNAL_MAP: dict[str, dict] = {
-    'prompt_injection': {
+    'PI-01a': {
         'owasp_signal_id': 'OW-LLM01',
-        'sub_check_id': 'llm-01-online',
-        'check_label': 'Online prompt injection detection',
+        'sub_check_id': 'PI-01a',
+        'check_label': 'Role-override phrase match',
+        'check_score': 85,
+        'category': 'prompt_injection',
+        'severity': 'high',
+        'confidence_tier': 'high',
+    },
+    'PI-01b': {
+        'owasp_signal_id': 'OW-LLM01',
+        'sub_check_id': 'PI-01b',
+        'check_label': 'Delimiter smuggling',
+        'check_score': 90,
+        'category': 'prompt_injection',
+        'severity': 'critical',
+        'confidence_tier': 'deterministic',
+    },
+    'PI-01c': {
+        'owasp_signal_id': 'OW-LLM01',
+        'sub_check_id': 'PI-01c',
+        'check_label': 'Encoded / obfuscated payload',
         'check_score': 75,
         'category': 'prompt_injection',
         'severity': 'high',
         'confidence_tier': 'high',
     },
-    'insecure_output': {
-        'owasp_signal_id': 'OW-LLM09',
-        'sub_check_id': 'llm-09-online',
-        'check_label': 'Online insecure output detection',
+    'PI-02a': {
+        'owasp_signal_id': 'OW-LLM01',
+        'sub_check_id': 'PI-02a',
+        'check_label': 'Web-fetched content with injection pattern',
         'check_score': 70,
-        'category': 'insecure_output',
+        'category': 'prompt_injection',
         'severity': 'high',
         'confidence_tier': 'high',
     },
-    'pii_input': {
-        'owasp_signal_id': 'OW-LLM02',
-        'sub_check_id': 'llm-02-online-in',
-        'check_label': 'Online PII detected in input',
-        'check_score': 65,
-        'category': 'data_disclosure',
-        'severity': 'medium',
-        'confidence_tier': 'high',
-    },
-    'pii_output': {
-        'owasp_signal_id': 'OW-LLM02',
-        'sub_check_id': 'llm-02-online-out',
-        'check_label': 'Online PII detected in output',
-        'check_score': 65,
-        'category': 'data_disclosure',
-        'severity': 'medium',
-        'confidence_tier': 'high',
-    },
-    'sensitive_data_exfiltration': {
-        'owasp_signal_id': 'OW-LLM02',
-        'sub_check_id': 'llm-02-online-exfil',
-        'check_label': 'Online sensitive data exfiltration',
+    'PI-05a': {
+        'owasp_signal_id': 'OW-LLM01',
+        'sub_check_id': 'PI-05a',
+        'check_label': 'Code injection pattern in prompt',
         'check_score': 80,
-        'category': 'data_disclosure',
+        'category': 'prompt_injection',
         'severity': 'high',
         'confidence_tier': 'high',
     },
-    'tool_misuse': {
-        'owasp_signal_id': 'OW-LLM05',
-        'sub_check_id': 'llm-05-online',
-        'check_label': 'Online dangerous tool argument detected',
-        'check_score': 80,
-        'category': 'tool_misuse',
+    'PI-08a': {
+        'owasp_signal_id': 'OW-LLM01',
+        'sub_check_id': 'PI-08a',
+        'check_label': 'Adversarial suffix (high-entropy tail)',
+        'check_score': 75,
+        'category': 'prompt_injection',
         'severity': 'high',
-        'confidence_tier': 'high',
-    },
-    'resource_exhaustion': {
-        'owasp_signal_id': 'OW-ASI08',
-        'sub_check_id': 'asi-08-online',
-        'check_label': 'Online node call exhaustion',
-        'check_score': 60,
-        'category': 'resource_exhaustion',
-        'severity': 'medium',
         'confidence_tier': 'medium',
     },
-    'privilege_escalation': {
-        'owasp_signal_id': 'OW-ASI05',
-        'sub_check_id': 'asi-05-online-priv',
-        'check_label': 'Online privilege escalation attempt',
-        'check_score': 85,
-        'category': 'privilege_escalation',
+    'SID-01a': {
+        'owasp_signal_id': 'OW-LLM02',
+        'sub_check_id': 'SID-01a',
+        'check_label': 'API key / token pattern in output',
+        'check_score': 95,
+        'category': 'data_disclosure',
         'severity': 'critical',
-        'confidence_tier': 'high',
+        'confidence_tier': 'deterministic',
     },
-    'unsafe_code_execution': {
-        'owasp_signal_id': 'OW-ASI05',
-        'sub_check_id': 'asi-05-online-code',
-        'check_label': 'Online unsafe code execution attempt',
-        'check_score': 85,
-        'category': 'unsafe_code',
+    'SID-01c': {
+        'owasp_signal_id': 'OW-LLM02',
+        'sub_check_id': 'SID-01c',
+        'check_label': 'JWT / session token in agent message',
+        'check_score': 90,
+        'category': 'data_disclosure',
         'severity': 'critical',
-        'confidence_tier': 'high',
+        'confidence_tier': 'deterministic',
     },
-    'supply_chain_tool': {
-        'owasp_signal_id': 'OW-ASI04',
-        'sub_check_id': 'asi-04-online',
-        'check_label': 'Online unauthorized tool usage',
-        'check_score': 70,
-        'category': 'supply_chain',
+    'SID-02a': {
+        'owasp_signal_id': 'OW-LLM02',
+        'sub_check_id': 'SID-02a',
+        'check_label': 'Name + email + phone co-occurrence',
+        'check_score': 75,
+        'category': 'data_disclosure',
         'severity': 'high',
         'confidence_tier': 'high',
+    },
+    'EA-01a': {
+        'owasp_signal_id': 'OW-LLM06',
+        'sub_check_id': 'EA-01a',
+        'check_label': 'Tool not in approved manifest invoked',
+        'check_score': 80,
+        'category': 'excessive_agency',
+        'severity': 'high',
+        'confidence_tier': 'deterministic',
+    },
+    'EA-02b': {
+        'owasp_signal_id': 'OW-LLM06',
+        'sub_check_id': 'EA-02b',
+        'check_label': 'Tool calls exceed configured session limit',
+        'check_score': 75,
+        'category': 'excessive_agency',
+        'severity': 'high',
+        'confidence_tier': 'deterministic',
     },
 }
 
@@ -140,8 +149,8 @@ async def _persist_sdk_finding(
 
         action_taken: str = payload.get('action_taken', 'alert')
 
-        # SDK sends {signal, reason, ...original_payload}; map to Finding fields.
-        signal_name = payload.get('signal') or payload.get('owasp_signal_id', '')
+        # SDK sends {signal: sub_check_id, reason, matched_text, ...}; look up Finding fields.
+        signal_name = payload.get('signal') or payload.get('sub_check_id', '')
         mapping = _ONLINE_SIGNAL_MAP.get(signal_name)
 
         if mapping is None:
@@ -157,14 +166,15 @@ async def _persist_sdk_finding(
             _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
             finding = Finding(**{k: v for k, v in payload.items() if k in _init_fields})
         else:
+            matched = payload.get('matched_text') or payload.get('reason')
             finding = Finding(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 event_id=payload.get('event_id') or str(uuid.uuid4()),
                 event_type=payload.get('dp_event_type', 'security_finding'),
                 detection_phase='online',
-                matched_text=payload.get('reason'),
-                detail=payload.get('reason'),
+                matched_text=matched,
+                detail=matched,
                 **mapping,
             )
 

@@ -60,7 +60,7 @@ async def write_findings(findings: list[Finding]) -> None:
              category, severity, detection_phase, matched_text, detail,
              confidence_tier, confidence, emitted_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-        ON CONFLICT (session_id, sub_check_id) DO UPDATE SET
+        ON CONFLICT (session_id, sub_check_id, event_id) DO UPDATE SET
             check_score     = GREATEST(security_findings.check_score, EXCLUDED.check_score),
             severity        = CASE
                                 WHEN ARRAY_POSITION(ARRAY['critical','high','medium','low'], EXCLUDED.severity)
