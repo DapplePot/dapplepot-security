@@ -12,8 +12,8 @@ FastAPI service that evaluates AI agent sessions for OWASP LLM Top 10 + Agentic 
 ```bash
 uv sync
 cp .env.example .env   # fill in connection strings
-make setup             # run migrations + seed signal registry + signatures
-make run               # uvicorn server.main:app --port 8001
+make setup             # run migrations + seed signal registry + signatures + scores
+make server            # uvicorn server.main:app --port 8001 --reload
 make test-unit         # ~1,000+ assertions, no infra (~2 min)
 ```
 
@@ -32,7 +32,7 @@ make test-unit         # ~1,000+ assertions, no infra (~2 min)
 
 ## HTTP Endpoint
 
-`POST /v1/evaluate` — receives events forwarded from `dapplepot-api`. No Kafka; this is a direct HTTP call.
+`POST /v1/evaluate` — receives events forwarded from `dapplepot-api`. Direct HTTP call (no Kafka).
 
 ### Event Dispatch
 
@@ -43,7 +43,25 @@ make test-unit         # ~1,000+ assertions, no infra (~2 min)
 | `graph_end` | `score_session()` — full post-session scoring pipeline |
 | `graph_error` | `score_session()` — same as graph_end |
 
-All scoring and finding persistence run as `asyncio.create_task` (fire-and-forget from the HTTP handler).
+Online finding persistence tasks are tracked in `_pending_findings` per session. The scorer (`_run_scorer_after_findings`) waits for all in-flight finding-persist tasks to complete before querying the DB, ensuring online findings are visible to the post-session scoring pipeline.
+
+## Online Findings (SDK-initiated)
+
+The SDK sends `security_finding` events with `sub_check_id`, `trigger_event_id`, and `trigger_event_type`. The security service maps these via `_ONLINE_SIGNAL_MAP` (keyed by `sub_check_id`) before persisting. The `trigger_event_id`/`trigger_event_type` are stored so the UI can link findings to the originating event in the trace timeline.
+
+| sub_check_id | OWASP ID | Severity | Confidence |
+|-------------|----------|---------|------------|
+| `PI-01a` | OW-LLM01 | high | high |
+| `PI-01b` | OW-LLM01 | critical | deterministic |
+| `PI-01c` | OW-LLM01 | high | high |
+| `PI-02a` | OW-LLM01 | high | high |
+| `PI-05a` | OW-LLM01 | high | high |
+| `PI-08a` | OW-LLM01 | high | medium |
+| `SID-01a` | OW-LLM02 | critical | deterministic |
+| `SID-01c` | OW-LLM02 | critical | deterministic |
+| `SID-02a` | OW-LLM02 | high | high |
+| `IOH-01a` | OW-LLM05 | critical | deterministic |
+| `EA-01a` | OW-LLM06 | — | — |
 
 ## Scoring Pipeline (`score_session`)
 
@@ -102,49 +120,41 @@ Temporal decay: weight_i = exp(-0.05 × days_ago_i)
 trust_score = int(100 × (1 − α/(α+β)))
 ```
 
-## Online Findings (SDK-initiated)
+## Key Schema Changes (recent)
 
-The SDK sends `security_finding` events with `{signal, reason}`. The security service maps these to full OWASP fields via `_ONLINE_SIGNAL_MAP` in `consumers/security_eval/consumer.py` before persisting:
-
-| SDK signal | OWASP ID | Sub-check |
-|------------|----------|-----------|
-| `prompt_injection` | OW-LLM01 | llm-01-online |
-| `insecure_output` | OW-LLM09 | llm-09-online |
-| `pii_input` | OW-LLM02 | llm-02-online-in |
-| `pii_output` | OW-LLM02 | llm-02-online-out |
-| `sensitive_data_exfiltration` | OW-LLM02 | llm-02-online-exfil |
-| `tool_misuse` | OW-LLM05 | llm-05-online |
-| `resource_exhaustion` | OW-ASI08 | asi-08-online |
-| `privilege_escalation` | OW-ASI05 | asi-05-online-priv |
-| `unsafe_code_execution` | OW-ASI05 | asi-05-online-code |
-| `supply_chain_tool` | OW-ASI04 | asi-04-online |
+- **`agent_alert_config`** — added `tool_manifest JSONB DEFAULT '[]'` (allowed tool names for manifest sub-checks) and `max_tool_calls_per_session INT` (hard cap; NULL = statistical baseline)
+- **`security_findings`** — uniqueness constraint is now `(session_id, sub_check_id, event_id)` — the same sub-check can fire multiple times per session and all firings are stored
+- **`detection_phase`** — now accepts `'cross_session'` in addition to `'online'` and `'post_session'`
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
 | `server/main.py` | FastAPI app, `POST /v1/evaluate` route |
-| `consumers/security_eval/consumer.py` | `_handle_event()` — all dispatch logic, `_ONLINE_SIGNAL_MAP` |
+| `consumers/security_eval/consumer.py` | `_handle_event()` — dispatch logic, `_ONLINE_SIGNAL_MAP` (keyed by sub_check_id) |
 | `consumers/security_eval/findings.py` | `Finding` dataclass + `write_findings()`, `write_session_action()` |
 | `consumers/security_eval/scorer/orchestrator.py` | `score_session()` — main scoring entry point |
 | `consumers/security_eval/scorer/llm_signals.py` | OW-LLM01–10 signal functions (~1,000 LOC) |
 | `consumers/security_eval/scorer/asi_signals.py` | OW-ASI01–10 signal functions (~1,300 LOC) |
 | `consumers/security_eval/scorer/attack_chains.py` | 7 attack chain patterns |
 | `consumers/security_eval/scorer/trust.py` | Bayesian agent trust scoring |
-| `core/security_config.py` | `AgentSecurityConfig`, `push_agent_defaults()`, Redis cache |
-| `db/postgres/` | 22 migration files |
+| `core/security_config.py` | `AgentSecurityConfig`, `SubCheckOverride`, `push_agent_defaults()`, Redis cache |
+| `db/postgres/` | 26 migration files |
 
 ## Make Targets
 
 ```bash
-make run              # uvicorn server.main:app --host 0.0.0.0 --port 8001
-make setup            # migrate + seed signal registry + seed signatures
+make server           # uvicorn server.main:app --host 0.0.0.0 --port 8001 --reload
+make setup            # migrate + seed signal registry + seed signatures + seed scores
 make migrate          # run migrations only
-make seed-registry    # upsert 156 sub-checks with confidence_tier
+make seed-signal-registry  # upsert 156 sub-checks with confidence_tier
+make seed-sigs        # seed injection_signatures for dev tenant
 make test-unit        # no infra required, ~2 min
 make test-integration # needs docker compose up
 make test             # all tests
-make health           # check consumer lag / service health
+make health           # check Postgres + Redis connectivity
+make lint             # ruff check
+make format           # ruff format
 ```
 
 ## Related Repos
