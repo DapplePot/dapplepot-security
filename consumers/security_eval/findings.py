@@ -293,6 +293,7 @@ async def produce_combined_online_alert(
     agent_id: str | None,
     findings: list[Finding],
     action_map: dict[str, str],
+    session_started_at: str | None = None,
 ) -> None:
     """Produce ONE combined alert for all online detections in a session.
 
@@ -316,16 +317,19 @@ async def produce_combined_online_alert(
 
     detections = [
         {
-            "sub_check_id":    f.sub_check_id,
-            "owasp_signal_id": f.owasp_signal_id,
-            "check_label":     f.check_label,
-            "check_score":     f.check_score,
-            "effective_score": round(f.check_score * f.confidence),
-            "confidence_tier": f.confidence_tier,
-            "severity":        f.severity,
-            "category":        f.category,
-            "action_taken":    action_map.get(f.sub_check_id, "alert"),
-            "matched_text":    f.matched_text,
+            "sub_check_id":       f.sub_check_id,
+            "owasp_signal_id":    f.owasp_signal_id,
+            "check_label":        f.check_label,
+            "check_score":        f.check_score,
+            "effective_score":    round(f.check_score * f.confidence),
+            "confidence_tier":    f.confidence_tier,
+            "severity":           f.severity,
+            "category":           f.category,
+            "action_taken":       action_map.get(f.sub_check_id, "alert"),
+            "matched_text":       f.matched_text,
+            "trigger_event_id":   str(f.event_id),
+            "trigger_event_type": f.event_type,
+            "triggered_at":       f.emitted_at,
         }
         for f in findings
     ]
@@ -360,9 +364,10 @@ async def produce_combined_online_alert(
             "rule_type":       "online_security_summary",
             "source":          "security",
             "agent_id":        agent_id,
-            "detection_count": n,
-            "action_counts":   action_counts,
-            "detections":      sorted_detections,
+            "detection_count":    n,
+            "action_counts":      action_counts,
+            "session_started_at": session_started_at,
+            "detections":         sorted_detections,
             "signal_taxonomy_version": "3.0",
         },
     }

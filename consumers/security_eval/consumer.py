@@ -170,8 +170,8 @@ async def _persist_sdk_finding(
             finding = Finding(
                 tenant_id=tenant_id,
                 session_id=session_id,
-                event_id=payload.get('event_id') or str(uuid.uuid4()),
-                event_type=payload.get('dp_event_type', 'security_finding'),
+                event_id=payload.get('trigger_event_id') or str(uuid.uuid4()),
+                event_type=payload.get('trigger_event_type') or payload.get('dp_event_type', 'security_finding'),
                 detection_phase='online',
                 matched_text=matched,
                 detail=matched,
@@ -190,12 +190,25 @@ async def _persist_sdk_finding(
         logger.exception('failed to persist SDK online finding session_id=%s', session_id)
 
 
+# Tracks in-flight _persist_sdk_finding tasks per session so the scorer can
+# wait for all findings to be committed before reading them from the DB.
+_pending_findings: dict[str, set[asyncio.Task]] = {}
+
+
 async def _run_scorer(tenant_id: str, session_id: str, agent_id: str) -> None:
     try:
         from consumers.security_eval.scorer.orchestrator import score_session
         await score_session(tenant_id=tenant_id, session_id=session_id, agent_id=agent_id)
     except Exception:
         logger.exception('score_session failed session_id=%s', session_id)
+
+
+async def _run_scorer_after_findings(tenant_id: str, session_id: str, agent_id: str) -> None:
+    """Wait for all pending finding-persist tasks before scoring."""
+    pending = _pending_findings.pop(session_id, set())
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    await _run_scorer(tenant_id=tenant_id, session_id=session_id, agent_id=agent_id)
 
 
 async def _handle_event(event: dict) -> None:
@@ -216,7 +229,7 @@ async def _handle_event(event: dict) -> None:
         return
 
     if event_type == 'security_finding':
-        asyncio.create_task(
+        task = asyncio.create_task(
             _persist_sdk_finding(
                 session_id=session_id,
                 tenant_id=tenant_id or '',
@@ -225,11 +238,15 @@ async def _handle_event(event: dict) -> None:
                 emitted_at=event.get('emitted_at'),
             )
         )
+        _pending_findings.setdefault(session_id, set()).add(task)
+        task.add_done_callback(
+            lambda t: _pending_findings.get(session_id, set()).discard(t)
+        )
         return
 
     if event_type in ('graph_end', 'graph_error'):
         asyncio.create_task(
-            _run_scorer(
+            _run_scorer_after_findings(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 agent_id=agent_id,

@@ -471,7 +471,7 @@ async def score_session(
     pool = await get_pool()
     session_row = await pool.fetchrow(
         """
-        SELECT initial_input, graph_state, graph_runs, duration_ms
+        SELECT initial_input, graph_state, graph_runs, duration_ms, started_at
         FROM sessions WHERE session_id = $1
         """,
         session_id,
@@ -494,6 +494,7 @@ async def score_session(
     # in config but have no SDK implementation, in which case no finding arrives and
     # the post-session scorer must still handle it.
     sdk_findings: list = []
+    sdk_findings_all: list = []
     if sec_config.online_subcheck_ids():
         try:
             import dataclasses
@@ -511,12 +512,15 @@ async def score_session(
                 """,
                 session_id,
             )
-            # Deduplicate by sub_check_id for scoring — keep highest check_score per
-            # sub-check so multiple firings of the same check in one session don't
-            # inflate signal scores.  All rows are stored in the DB for UI display.
+            # Build two lists:
+            # sdk_findings      — deduplicated by sub_check_id (for scoring only) so
+            #                     multiple firings of the same check don't inflate scores.
+            # sdk_findings_all  — every row, used for the combined online alert so all
+            #                     firings (same sub-check, different events) are reported.
             _best: dict[str, Finding] = {}
             for row in rows:
                 f = Finding(**{k: v for k, v in dict(row).items() if k in _init_fields})
+                sdk_findings_all.append(f)
                 existing = _best.get(f.sub_check_id)
                 if existing is None or f.check_score > existing.check_score:
                     _best[f.sub_check_id] = f
@@ -914,12 +918,18 @@ async def score_session(
     if sdk_findings:
         try:
             from consumers.security_eval.findings import produce_combined_online_alert
+            _started_at = session.get("started_at")
+            session_started_at = (
+                _started_at.isoformat() if hasattr(_started_at, "isoformat") else str(_started_at)
+                if _started_at else None
+            )
             await produce_combined_online_alert(
                 session_id=session_id,
                 tenant_id=tenant_id,
                 agent_id=agent_id,
-                findings=sdk_findings,
+                findings=sdk_findings_all,  # undeduped — show every firing in the alert
                 action_map=online_action_map,
+                session_started_at=session_started_at,
             )
         except Exception:
             logger.exception('"failed to produce combined online alert session_id=%s"', session_id)
