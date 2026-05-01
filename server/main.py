@@ -45,6 +45,36 @@ async def health():
     return {'status': 'ok'}
 
 
+@app.post('/v1/online-check')
+async def online_check(request: Request):
+    """
+    Synchronous online check endpoint — called by the SDK (via API proxy)
+    on every event that has blocking checks enabled.
+    Runs detection logic and returns findings immediately. No DB writes here —
+    the SDK sends a security_finding event through ingest which consumer.py persists.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'invalid JSON'}, status_code=400)
+
+    try:
+        from consumers.security_eval.detectors.online import run_online_checks
+        findings = run_online_checks(
+            event_type=body.get('event_type', ''),
+            payload=body.get('payload', {}),
+            enabled_checks=body.get('enabled_checks', {}),
+            tool_manifest=body.get('tool_manifest', []),
+            max_tool_calls=body.get('max_tool_calls'),
+            tool_call_count=body.get('tool_call_count', 0),
+        )
+    except Exception:
+        logger.exception('online-check failed event_type=%s', body.get('event_type'))
+        return JSONResponse({'error': 'internal error'}, status_code=500)
+
+    return JSONResponse({'findings': findings})
+
+
 @app.post('/v1/evaluate', status_code=202)
 async def evaluate(request: Request):
     """
