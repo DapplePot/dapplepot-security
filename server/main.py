@@ -10,9 +10,11 @@ Start:
 """
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from core.infra.postgres import close_pool, get_pool
@@ -23,6 +25,8 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(name)s %(message)s',
 )
 logger = logging.getLogger(__name__)
+
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
 
 
 @asynccontextmanager
@@ -38,6 +42,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='dapplepot-security', lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=['GET', 'POST'],
+    allow_headers=['Authorization', 'Content-Type'],
+)
 
 
 @app.get('/healthz')
