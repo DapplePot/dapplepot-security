@@ -253,11 +253,32 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             cfg_dict["subcheck_overrides"].update(subcheck_overrides_raw)
 
         alert_row = await pool.fetchrow(
-            "SELECT tool_manifest, max_tool_calls_per_session "
+            "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
+            "       signal_thresholds, tool_manifest, max_tool_calls_per_session "
             "FROM agent_alert_config WHERE tenant_id = $1 AND agent_id = $2",
             tenant_id, agent_id,
         )
         if alert_row:
+            composite = alert_row["composite_threshold"]
+            cfg_dict["composite_alert_threshold"] = composite
+            cfg_dict["llm_composite_alert_threshold"] = (
+                alert_row["llm_composite_threshold"]
+                if alert_row["llm_composite_threshold"] is not None
+                else composite
+            )
+            cfg_dict["asi_composite_alert_threshold"] = (
+                alert_row["asi_composite_threshold"]
+                if alert_row["asi_composite_threshold"] is not None
+                else composite
+            )
+            sig_thresholds = alert_row["signal_thresholds"]
+            if isinstance(sig_thresholds, str):
+                sig_thresholds = json.loads(sig_thresholds)
+            if sig_thresholds:
+                cfg_dict.setdefault("signals", {})
+                for sig_id, threshold in sig_thresholds.items():
+                    cfg_dict["signals"].setdefault(sig_id, {})
+                    cfg_dict["signals"][sig_id]["alert_threshold"] = threshold
             raw_manifest = alert_row["tool_manifest"]
             if isinstance(raw_manifest, str):
                 raw_manifest = json.loads(raw_manifest)

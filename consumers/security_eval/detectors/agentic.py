@@ -62,6 +62,7 @@ _CONTEXT_INJECTION_PATTERNS = [
 _NULL_UUID = "00000000-0000-0000-0000-000000000000"
 
 _SIGNAL_CATEGORY = {
+    "OW-LLM06": "excessive_agency",
     "OW-ASI01": "prompt_injection",
     "OW-ASI02": "excessive_agency",
     "OW-ASI04": "supply_chain",
@@ -166,17 +167,30 @@ def _check_context_injection(content: str) -> str | None:
     return None
 
 
-def detect_agent_threats_on_tool_start(event: dict) -> list["Finding"]:
+def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Finding"]:
     """
     Called for every tool_start event.
-    Checks OW-ASI05 (RCE via tool name / container escape) and
-    OW-ASI02 (tool input misuse / destructive action).
+    Checks OW-LLM06 EA-01a (tool manifest), OW-ASI05 (RCE), OW-ASI02 (tool misuse).
     """
     findings: list["Finding"] = []
     payload = event.get("payload") or {}
     tool_name = event.get("tool_name") or payload.get("tool_name", "")
     tool_input = payload.get("tool_input")
     input_str = json.dumps(tool_input) if not isinstance(tool_input, str) else (tool_input or "")
+
+    # OW-LLM06:EA-01a — tool not in approved manifest
+    if sec_config is not None and sec_config.tool_manifest and tool_name:
+        if tool_name not in sec_config.tool_manifest:
+            findings.append(_make_finding(
+                "OW-LLM06", "EA-01a",
+                check_label="Tool not in approved manifest invoked",
+                check_score=80,
+                event=event,
+                severity="high",
+                matched_text=tool_name,
+                detail=f"'{tool_name}' is not in the configured manifest ({len(sec_config.tool_manifest)} allowed tools)",
+                confidence_tier="deterministic",
+            ))
 
     # OW-ASI05:RCE-01b — code/shell execution tool name
     if tool_name and _check_rce_tool_name(tool_name):
@@ -392,6 +406,42 @@ def detect_agent_threats_on_tool_end(event: dict) -> list["Finding"]:
                 ))
 
     return findings
+
+
+def detect_ea_tool_call_limit(
+    events: list[dict],
+    sec_config,
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """
+    OW-LLM06:EA-02b — total tool calls in session exceeds max_tool_calls_per_session.
+    Session-level check; runs once after all events are replayed.
+    """
+    if sec_config is None or sec_config.max_tool_calls_per_session is None:
+        return []
+
+    limit = sec_config.max_tool_calls_per_session
+    tool_start_events = [ev for ev in events if ev.get("event_type") == "tool_start"]
+    count = len(tool_start_events)
+
+    if count <= limit:
+        return []
+
+    excess = count - limit
+    check_score = min(65 + excess * 2, 85)
+    trigger_event = tool_start_events[limit] if limit < len(tool_start_events) else tool_start_events[-1]
+
+    return [_make_finding(
+        "OW-LLM06", "EA-02b",
+        check_label="Tool calls exceed configured session limit",
+        check_score=check_score,
+        event=trigger_event,
+        severity="high",
+        matched_text=f"call #{limit + 1} of {count} (limit: {limit})",
+        detail=f"Session made {count} tool calls, exceeding the configured limit of {limit} by {excess}",
+        confidence_tier="deterministic",
+    )]
 
 
 def detect_agent_threats_on_llm_start(event: dict) -> list["Finding"]:

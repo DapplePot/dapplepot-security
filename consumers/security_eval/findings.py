@@ -157,6 +157,8 @@ async def write_agent_risk_score(
 
 _SECURITY_RULE_ID    = "00000000-0000-0000-0000-000000000001"
 _SECURITY_RULE_NAME  = "Security Risk Score"
+_TRUST_RULE_ID       = "00000000-0000-0000-0000-000000000002"
+_TRUST_RULE_NAME     = "Agent Trust Degradation"
 _ONLINE_RULE_ID      = "00000000-0000-0000-0000-000000000002"
 _ONLINE_RULE_NAME    = "Online Security Detection"
 
@@ -174,20 +176,50 @@ _RISK_BAND_TO_SEVERITY = {
 _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
 
-async def produce_security_alert(score_row: dict, findings: list[Finding], *, trust_triggered: bool = False) -> None:
-    """Produce an alert to obs.alerts.v1 conforming to AlertMessage schema."""
+def _trust_status_label(score: float) -> str:
+    if score >= 75: return "Trusted"
+    if score >= 50: return "Caution"
+    return "At risk"
+
+
+async def produce_security_alert(
+    score_row: dict,
+    findings: list[Finding],
+    trigger_context: dict | None = None,
+) -> None:
+    """Produce a security risk alert (composite / signal threshold crossed)."""
     llm_band   = score_row.get("llm_band", "medium")
     severity   = _RISK_BAND_TO_SEVERITY.get(llm_band, "medium")
     session_id = score_row["session_id"]
 
-    llm_status   = score_row.get("llm_signal_status", {})
-    asi_status   = score_row.get("asi_signal_status", {})
-    llm_fired    = sum(1 for v in llm_status.values() if v.get("status") == "fired")
-    llm_clean    = sum(1 for v in llm_status.values() if v.get("status") == "clean")
-    asi_fired    = sum(1 for v in asi_status.values() if v.get("status") == "fired")
-    asi_clean    = sum(1 for v in asi_status.values() if v.get("status") == "clean")
+    llm_status = score_row.get("llm_signal_status", {})
+    asi_status = score_row.get("asi_signal_status", {})
+    llm_fired  = sum(1 for v in llm_status.values() if v.get("status") == "fired")
+    llm_clean  = sum(1 for v in llm_status.values() if v.get("status") == "clean")
+    asi_fired  = sum(1 for v in asi_status.values() if v.get("status") == "fired")
+    asi_clean  = sum(1 for v in asi_status.values() if v.get("status") == "clean")
 
-    dedup_key = score_row.get("dedup_key", f"security:{session_id}")
+    trust_score = score_row.get("trust_score")
+
+    ctx = trigger_context or {}
+    if ctx.get("composite_llm_breached"):
+        trigger_note = (
+            f"LLM composite {ctx['llm_score']}/100 exceeded threshold {ctx['llm_threshold']}"
+        )
+    elif ctx.get("composite_asi_breached"):
+        trigger_note = (
+            f"ASI composite {ctx['asi_score']}/100 exceeded threshold {ctx['asi_threshold']}"
+        )
+    elif ctx.get("threshold_signals"):
+        top = ctx["threshold_signals"][0]
+        count = len(ctx["threshold_signals"])
+        extra = f" (+{count - 1} more)" if count > 1 else ""
+        trigger_note = (
+            f"Signal '{top['sig_id']}' score {top['effective_score']} "
+            f"exceeded threshold {top['threshold']}{extra}"
+        )
+    else:
+        trigger_note = f"LLM: {llm_fired} signals fired · ASI: {asi_fired} signals fired"
 
     top_findings = [
         {
@@ -212,51 +244,68 @@ async def produce_security_alert(score_row: dict, findings: list[Finding], *, tr
         "rule_name":    _SECURITY_RULE_NAME,
         "severity":     severity,
         "triggered_at": datetime.now(timezone.utc).isoformat(),
-        "dedup_key":    dedup_key,
+        "dedup_key":    score_row.get("dedup_key", f"security:{session_id}"),
         "payload": {
-            "title":   (
-                f"Agent Trust Alert: Score degrading ({int(score_row.get('trust_score', 0))}/100)"
-                if trust_triggered else
-                f"Security Risk: {llm_band.capitalize()} ({score_row['llm_score']}/100)"
-            ),
-            "message": (
-                f"Agent trust score has been consistently below threshold across recent sessions · "
-                f"Trust trend: {score_row.get('trust_trend', 'degrading')}"
-                if trust_triggered else
-                f"LLM: {llm_fired} signals fired · ASI: {asi_fired} signals fired"
-            ),
-            "rule_type":  "trust_degradation" if trust_triggered else "security_risk",
-            "source":     "security",
-            "agent_id":   score_row.get("agent_id"),
-            # Composite scores
-            "llm_score":  score_row["llm_score"],
-            "llm_band":   llm_band,
-            "asi_score":  score_row.get("asi_score", 0),
-            "asi_band":   score_row.get("asi_band", "clean"),
-            # Signal status maps (OW-canonical)
-            "llm_signal_status": llm_status,
-            "asi_signal_status": asi_status,
-            # v3: attack chains, amplification, confidence, trust
+            "title":     f"Security Risk: {llm_band.capitalize()} ({score_row['llm_score']}/100)",
+            "message":   trigger_note,
+            "rule_type": "security_risk",
+            "source":    "security",
+            "agent_id":  score_row.get("agent_id"),
+            "llm_score": score_row["llm_score"],
+            "llm_band":  llm_band,
+            "asi_score": score_row.get("asi_score", 0),
+            "asi_band":  score_row.get("asi_band", "clean"),
+            "llm_signal_status":      llm_status,
+            "asi_signal_status":      asi_status,
             "attack_chains_detected": score_row.get("attack_chains_detected", []),
             "amplification":          score_row.get("amplification", 1.0),
             "confidence_band":        score_row.get("confidence_band", "high"),
-            "trust_score":            score_row.get("trust_score"),
+            "trust_score":            trust_score,
             "trust_trend":            score_row.get("trust_trend"),
-            # Top findings
-            "top_findings": top_findings,
+            "top_findings":           top_findings,
             "summary": {
-                "llm_signals_fired":    llm_fired,
-                "llm_signals_clean":    llm_clean,
-                "asi_signals_fired":    asi_fired,
-                "asi_signals_clean":    asi_clean,
-                # How many of these findings were already actioned online
-                # (sanitize / terminate_session raised in real time).
-                # Consumers can use this to de-duplicate notifications.
-                "online_actioned_count": sum(
-                    1 for f in findings if f.detection_phase == "online"
-                ),
+                "llm_signals_fired":     llm_fired,
+                "llm_signals_clean":     llm_clean,
+                "asi_signals_fired":     asi_fired,
+                "asi_signals_clean":     asi_clean,
+                "online_actioned_count": sum(1 for f in findings if f.detection_phase == "online"),
             },
+            "trigger_context":          ctx,
             "signal_taxonomy_version": "3.0",
+            "scorer_version":          score_row["scorer_version"],
+        },
+    }
+    from server.alert_delivery import deliver_alert
+    await deliver_alert(alert)
+
+
+async def produce_trust_alert(score_row: dict) -> None:
+    """Produce a standalone trust-degradation alert, separate from security risk alerts."""
+    session_id  = score_row["session_id"]
+    agent_id    = score_row.get("agent_id") or session_id
+    trust_score = float(score_row.get("trust_score") or 0)
+    trust_trend = score_row.get("trust_trend", "stable")
+
+    day       = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    dedup_key = f"trust:{agent_id}:{day}"
+
+    alert = {
+        "alert_id":     str(uuid.uuid4()),
+        "tenant_id":    score_row["tenant_id"],
+        "session_id":   session_id,
+        "rule_id":      _TRUST_RULE_ID,
+        "rule_name":    _TRUST_RULE_NAME,
+        "severity":     "warning",
+        "triggered_at": datetime.now(timezone.utc).isoformat(),
+        "dedup_key":    dedup_key,
+        "payload": {
+            "title":       f"Agent Trust Degrading: {round(trust_score)}/100 ({_trust_status_label(trust_score)})",
+            "message":     "Trust score has been below 50 for 3+ consecutive sessions",
+            "rule_type":   "trust_degradation",
+            "source":      "security",
+            "agent_id":    score_row.get("agent_id"),
+            "trust_score": trust_score,
+            "trust_trend": trust_trend,
             "scorer_version": score_row["scorer_version"],
         },
     }

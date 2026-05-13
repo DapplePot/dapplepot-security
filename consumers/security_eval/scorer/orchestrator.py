@@ -315,6 +315,7 @@ async def _run_per_event_detectors(
     tenant_id: str,
     session_id: str,
     skip_sub_checks: frozenset[str] | None = None,
+    sec_config=None,
 ) -> list:
     """
     Replay the session event sequence and run all per-event detectors with
@@ -371,7 +372,7 @@ async def _run_per_event_detectors(
                 ev_findings += await detect_passthrough(
                     ev, last_llm_output=last_llm_output.get(nid, "")
                 )
-                ev_findings += detect_agent_threats_on_tool_start(ev)
+                ev_findings += detect_agent_threats_on_tool_start(ev, sec_config=sec_config)
 
             elif etype == "tool_end":
                 tool_output = payload.get("tool_output", "") if isinstance(payload, dict) else ""
@@ -558,6 +559,7 @@ async def score_session(
     _SDK_ONLINE_CAPABLE = frozenset({
         'PI-01a', 'PI-01b', 'PI-01c', 'PI-02a', 'PI-05a', 'PI-08a',
         'SID-01a', 'SID-01c', 'SID-02a',
+        'IOH-01a',
         'EA-01a', 'EA-02b',
     })
     config_online = sec_config.online_subcheck_ids() & _SDK_ONLINE_CAPABLE
@@ -569,7 +571,7 @@ async def score_session(
     # ─── Per-event detectors (replayed post-session) ──────────────────────────
     # Skip sub-checks that the SDK already handled online — avoids double-counting.
     all_findings = await _run_per_event_detectors(
-        events, tenant_id, session_id, skip_sub_checks=online_ids
+        events, tenant_id, session_id, skip_sub_checks=online_ids, sec_config=sec_config
     )
     # Merge SDK online findings in
     all_findings.extend(sdk_findings)
@@ -606,6 +608,8 @@ async def score_session(
             if sig_cfg is None or sig_cfg.enabled:
                 all_findings.append(f)
 
+    from consumers.security_eval.detectors.agentic import detect_ea_tool_call_limit
+    _extend_if_enabled(detect_ea_tool_call_limit(events, sec_config, session_id, tenant_id))
     _extend_if_enabled(check_multi_turn_jailbreak(events, session_id, tenant_id))
     _extend_if_enabled(check_payload_splitting(events, session_id, tenant_id))
     _extend_if_enabled(check_rag_integrity(events, session_id, tenant_id, baseline={}))
@@ -772,12 +776,14 @@ async def score_session(
              llm_signal_status, asi_signal_status,
              v3_llm_composite, v3_asi_composite,
              attack_chains_detected,
+             trust_score,
              scorer_version, scored_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7,
                 $8::jsonb, $9::jsonb,
                 $10::jsonb, $11::jsonb,
                 $12,
-                $13, now())
+                $13,
+                $14, now())
         ON CONFLICT (session_id) DO UPDATE SET
             llm_score              = EXCLUDED.llm_score,
             llm_band               = EXCLUDED.llm_band,
@@ -788,6 +794,7 @@ async def score_session(
             v3_llm_composite       = EXCLUDED.v3_llm_composite,
             v3_asi_composite       = EXCLUDED.v3_asi_composite,
             attack_chains_detected = EXCLUDED.attack_chains_detected,
+            trust_score            = EXCLUDED.trust_score,
             scorer_version         = EXCLUDED.scorer_version,
             scored_at              = now()
         """,
@@ -803,6 +810,7 @@ async def score_session(
         json.dumps(v3_llm_composite),
         json.dumps(v3_asi_composite),
         all_chains,
+        trust_result["trust_score"],
         SCORER_VERSION,
     )
 
@@ -875,42 +883,85 @@ async def score_session(
                     should_alert = True
                     break
 
-    # Sustained trust degradation alert
-    if not should_alert and agent_id:
-        if trust_result["trust_score"] < AGENT_TRUST_ALERT_THRESHOLD:
-            try:
-                recent_trust_rows = await pool.fetch(
-                    """
-                    SELECT trust_score
-                    FROM agent_risk_scores
-                    WHERE agent_id = $1
-                    LIMIT 1
-                    """,
-                    agent_id,
-                )
-                if recent_trust_rows:
-                    # Simple check: if current trust is below threshold, check consecutive
-                    # sessions by looking at recent session risk scores
-                    low_trust_sessions = await pool.fetch(
+    # Collect every fired signal that individually crossed its alert threshold.
+    # Built regardless of what triggered should_alert so the alert payload is complete.
+    _threshold_signals: list[dict] = []
+    for _sig_id, _sig_data in {**llm_signal_map, **asi_signal_map}.items():
+        if _sig_data["status"] == "fired":
+            _sig_cfg   = sec_config.signals.get(_sig_id)
+            _sig_thr   = (
+                _sig_cfg.alert_threshold if _sig_cfg is not None
+                else SIGNAL_ALERT_THRESHOLDS_V3.get(_sig_id, 80)
+            )
+            if _sig_data["effective_score"] >= _sig_thr:
+                _threshold_signals.append({
+                    "sig_id":          _sig_id,
+                    "effective_score": _sig_data["effective_score"],
+                    "threshold":       _sig_thr,
+                })
+
+    _trigger_context = {
+        "composite_llm_breached": llm_score >= _llm_threshold,
+        "composite_asi_breached": asi_score >= _asi_threshold,
+        "llm_score":              llm_score,
+        "llm_threshold":          _llm_threshold,
+        "asi_score":              asi_score,
+        "asi_threshold":          _asi_threshold,
+        "threshold_signals":      _threshold_signals,
+    }
+
+    # ─── Sustained trust degradation alert (evaluated independently) ─────────
+    # Runs regardless of whether composite/signal alerts fired — trust degradation
+    # is a separate signal and must not be silenced by the all_online suppression
+    # that applies to per-session composite alerts.
+    # Deduped per-agent per-day: fires at most once per 24 h window so a
+    # persistently degraded agent does not spam one alert per session.
+    if agent_id and trust_result["trust_score"] < AGENT_TRUST_ALERT_THRESHOLD:
+        try:
+            # Primary gate: agent has enough session history.
+            # Uses agent_risk_scores.session_count — always available, no
+            # dependency on migration 015.
+            session_count_row = await pool.fetchrow(
+                "SELECT session_count FROM agent_risk_scores WHERE agent_id = $1",
+                agent_id,
+            )
+            has_enough_history = (
+                session_count_row is not None
+                and int(session_count_row["session_count"]) >= AGENT_TRUST_CONSECUTIVE_SESSIONS
+            )
+
+            if has_enough_history:
+                # Secondary check: count how many recent sessions actually recorded
+                # trust below the threshold. Using point-in-time snapshot scores
+                # and checking all(< threshold) was too strict — Bayesian trust
+                # converges gradually from its prior (~80) so early sessions for
+                # a risky agent often have scores above threshold even when the
+                # agent has been consistently bad. Filtering the query to only
+                # sessions already below threshold and counting them correctly
+                # captures "N sessions with confirmed low trust."
+                # Exception path: column not yet migrated → trust the Bayesian score.
+                try:
+                    low_trust_rows = await pool.fetch(
                         """
-                        SELECT COUNT(*) AS cnt
-                        FROM (
-                            SELECT scored_at
-                            FROM session_risk_scores
-                            WHERE agent_id = $1 AND tenant_id = $2
-                            ORDER BY scored_at DESC
-                            LIMIT %s
-                        ) sub
-                        """ % AGENT_TRUST_CONSECUTIVE_SESSIONS,
+                        SELECT trust_score
+                        FROM session_risk_scores
+                        WHERE agent_id = $1 AND tenant_id = $2
+                          AND trust_score IS NOT NULL
+                          AND trust_score < $4
+                        ORDER BY scored_at DESC
+                        LIMIT $3
+                        """,
                         agent_id,
                         tenant_id,
+                        AGENT_TRUST_CONSECUTIVE_SESSIONS,
+                        float(AGENT_TRUST_ALERT_THRESHOLD),
                     )
-                    # If we have enough sessions and trust is below threshold, alert
-                    if low_trust_sessions and int(low_trust_sessions[0]["cnt"]) >= AGENT_TRUST_CONSECUTIVE_SESSIONS:
-                        should_alert = True
-                        trust_alert_triggered = True
-            except Exception:
-                pass
+                    trust_alert_triggered = len(low_trust_rows) >= AGENT_TRUST_CONSECUTIVE_SESSIONS
+                except Exception:
+                    # Column not yet migrated — fall through to primary gate result.
+                    trust_alert_triggered = True
+        except Exception:
+            logger.exception("failed to evaluate trust degradation alert agent_id=%s", agent_id)
 
     # ─── Combined online alert (one per session) ─────────────────────────────
     # Produced here — at session end — so all online findings are known and can
@@ -937,14 +988,15 @@ async def score_session(
     if should_alert:
         # Suppress the post-session risk-score alert when every finding was already
         # caught by the SDK online — the combined online alert above covers it.
-        # Any session with at least one post-session finding still fires the risk
-        # alert since the scorer saw something the SDK didn't catch in real time.
         all_online = bool(all_session_findings) and all(
             f.detection_phase == "online" for f in all_session_findings
         )
         if not all_online:
             from consumers.security_eval.findings import produce_security_alert
-            await produce_security_alert(score_row, all_session_findings,
-                                         trust_triggered=trust_alert_triggered)
+            await produce_security_alert(score_row, all_session_findings, _trigger_context)
+
+    if trust_alert_triggered:
+        from consumers.security_eval.findings import produce_trust_alert
+        await produce_trust_alert(score_row)
 
     return score_row
