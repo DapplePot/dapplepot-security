@@ -245,7 +245,10 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
             ))
 
     # OW-ASI02:TME-03b — production target from tool (simple URL heuristic)
-    if url and any(re.search(p, url) for p in _PROD_URL_PATTERNS):
+    # Suppressed when sec_config declares this is a production agent
+    # (a production agent hitting production URLs is expected behaviour)
+    _agent_env = getattr(sec_config, "environment", None) if sec_config else None
+    if url and _agent_env != "production" and any(re.search(p, url) for p in _PROD_URL_PATTERNS):
         findings.append(_make_finding(
             "OW-ASI02", "TME-03b",
             check_label="Production target from non-prod agent",

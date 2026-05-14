@@ -81,6 +81,13 @@ from consumers.security_eval.scorer.llm_signals import (
     check_hallucinated_packages,
     check_ungrounded_high_stakes,
     check_input_size_anomaly,
+    check_irreversible_without_gate,
+    check_reads_outside_working_dir,
+    check_network_not_in_allowlist,
+    check_operating_hours,
+    check_package_not_in_sbom,
+    check_mcp_endpoint_anomaly,
+    check_system_prompt_modification,
 )
 from consumers.security_eval.scorer.asi_signals import (
     AGENT_SIGNAL_ID_FUNCTIONS,
@@ -613,12 +620,19 @@ async def score_session(
     _extend_if_enabled(check_multi_turn_jailbreak(events, session_id, tenant_id))
     _extend_if_enabled(check_payload_splitting(events, session_id, tenant_id))
     _extend_if_enabled(check_rag_integrity(events, session_id, tenant_id, baseline={}))
-    _extend_if_enabled(check_system_prompt_leakage(events, session_id, tenant_id))
+    _extend_if_enabled(check_system_prompt_leakage(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_vector_integrity(events, session_id, tenant_id))
     _extend_if_enabled(check_insecure_code_output(events, session_id, tenant_id))
     _extend_if_enabled(check_hallucinated_packages(events, session_id, tenant_id))
     _extend_if_enabled(check_ungrounded_high_stakes(events, session_id, tenant_id))
     _extend_if_enabled(await check_input_size_anomaly(events, session_id, tenant_id, agent_id))
+    _extend_if_enabled(check_irreversible_without_gate(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_reads_outside_working_dir(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_network_not_in_allowlist(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_operating_hours(events, session, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_package_not_in_sbom(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_mcp_endpoint_anomaly(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_system_prompt_modification(events, session_id, tenant_id, sec_config=sec_config))
 
     # ─── Session-level OW-ASI signals ────────────────────────────────────────
     from consumers.security_eval.scorer.asi_signals import signal_a01

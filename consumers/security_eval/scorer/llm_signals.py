@@ -190,21 +190,59 @@ async def signal_ow_llm06_write_on_read(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """EA-01c — data written outside designated namespace (write on read-intent session)."""
+    """EA-01c — data written outside designated namespace.
+
+    Manual mode (sec_config.write_namespace set):
+        Fire when any write tool call has a 'path' or 'key' or 'namespace' arg
+        that does not start with the declared write_namespace prefix.
+
+    Auto mode (write_namespace is None):
+        Fire when session starts with read-intent AND write-named tools are called.
+    """
+    tool_events = [e for e in events if e["event_type"] == "tool_start" and e.get("tool_name")]
+
+    write_namespace = getattr(sec_config, "write_namespace", None) if sec_config else None
+
+    if write_namespace:
+        # Manual mode: check tool path arguments
+        for e in tool_events:
+            tool_name = e.get("tool_name", "")
+            if not any(re.search(p, tool_name) for p in WRITE_TOOL_PATTERNS):
+                continue
+            payload = e.get("payload") or {}
+            tool_input = payload.get("tool_input") or {}
+            if isinstance(tool_input, str):
+                try:
+                    import json as _j
+                    tool_input = _j.loads(tool_input)
+                except Exception:
+                    tool_input = {}
+            if not isinstance(tool_input, dict):
+                continue
+            # Check any path-like parameter
+            for key in ("path", "file_path", "destination", "key", "namespace", "bucket", "prefix"):
+                val = str(tool_input.get(key, ""))
+                if val and not val.startswith(write_namespace):
+                    return _make_finding(
+                        "OW-LLM06", "EA-01c",
+                        "Data written outside designated namespace",
+                        75, session_id, tenant_id,
+                        detail=f"Tool '{tool_name}' wrote to '{val}' — outside declared namespace '{write_namespace}'",
+                        severity="high",
+                    )
+        return None
+
+    # Auto mode: read-intent session + write tools
     initial_input = session.get("initial_input", "") or ""
     is_read_intent = any(re.search(p, initial_input) for p in READ_INTENT_PATTERNS)
     if not is_read_intent:
         return None
-
-    tool_names = [
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
-    ]
+    tool_names = [e["tool_name"] for e in tool_events]
     write_tools = [t for t in tool_names if any(re.search(p, t) for p in WRITE_TOOL_PATTERNS)]
     if not write_tools:
         return None
-
     return _make_finding(
         "OW-LLM06", "EA-01c",
         "Data written outside designated namespace",
@@ -222,13 +260,21 @@ async def signal_ow_llm09(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """MIS-03a — high-stakes action without interrupt (HITL gap)."""
+    """MIS-03a — high-stakes action without interrupt gate."""
     tool_names = [
         e["tool_name"] for e in events
         if e["event_type"] == "tool_start" and e.get("tool_name")
     ]
-    high_stakes = [t for t in tool_names if any(re.search(p, t) for p in HIGH_STAKES_TOOL_PATTERNS)]
+
+    # Use declared irreversible tools if set, else name-pattern heuristic
+    declared = getattr(sec_config, "irreversible_tools", None) if sec_config else None
+    if declared is not None:
+        high_stakes = [t for t in tool_names if t in declared]
+    else:
+        high_stakes = [t for t in tool_names if any(re.search(p, t) for p in HIGH_STAKES_TOOL_PATTERNS)]
+
     if not high_stakes:
         return None
 
@@ -426,9 +472,32 @@ def check_system_prompt_leakage(
     events: list[dict],
     session_id: str,
     tenant_id: str,
+    sec_config=None,
 ) -> list["Finding"]:
-    """SPL-02a (reveals persona/role name) and SPL-03b (system prompt in inter-agent msg)."""
+    """SPL-01a (verbatim segment match), SPL-02a (reveals persona/role name)
+    and SPL-03b (system prompt in inter-agent msg)."""
     findings: list["Finding"] = []
+    declared_prompt: str | None = getattr(sec_config, "system_prompt", None) if sec_config else None
+
+    # SPL-01a: Verbatim segment match — only possible with declared prompt
+    if declared_prompt and len(declared_prompt) > 20:
+        from difflib import SequenceMatcher as _SM
+        for ev in (e for e in events if e["event_type"] == "llm_end"):
+            payload = ev.get("payload") or {}
+            completion = payload.get("completion", "")
+            if not isinstance(completion, str):
+                completion = json.dumps(completion)
+            sm = _SM(None, declared_prompt.lower(), completion.lower())
+            lcs = max((b.size for b in sm.get_matching_blocks()), default=0)
+            if lcs >= 80:
+                findings.append(_make_finding(
+                    "OW-LLM07", "SPL-01a",
+                    "Verbatim system prompt segment in output",
+                    85, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Verbatim segment of {lcs} chars from declared system prompt in completion",
+                ))
+                break
 
     llm_ends = [e for e in events if e["event_type"] == "llm_end"]
     for e in llm_ends:
@@ -819,6 +888,390 @@ async def check_input_size_anomaly(
             severity="medium",
             detail=f"Input tokens {session_input_tokens} exceeds 4σ above baseline {mean:.0f}",
         )]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent profile-aware checkers (called directly from orchestrator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_irreversible_without_gate(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """EA-02a — irreversible tool called without intervening user confirmation.
+
+    Fires when two consecutive tool_start events occur with an irreversible
+    tool in the second position and no llm_start (user turn) in between.
+
+    Manual mode: sec_config.irreversible_tools names the irreversible tools.
+    Auto mode:   HIGH_STAKES_TOOL_PATTERNS applied to tool name.
+    """
+    declared = getattr(sec_config, "irreversible_tools", None) if sec_config else None
+
+    def is_irreversible(tool_name: str) -> bool:
+        if declared is not None:
+            return tool_name in declared
+        return any(re.search(p, tool_name) for p in HIGH_STAKES_TOOL_PATTERNS)
+
+    relevant = [
+        ev for ev in events
+        if ev["event_type"] in ("tool_start", "llm_start")
+    ]
+
+    last_was_tool = False
+    for ev in relevant:
+        if ev["event_type"] == "llm_start":
+            last_was_tool = False
+        elif ev["event_type"] == "tool_start":
+            tool_name = ev.get("tool_name") or ""
+            if is_irreversible(tool_name) and last_was_tool:
+                return [_make_finding(
+                    "OW-LLM06", "EA-02a",
+                    "Irreversible action without confirm gate",
+                    85, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Tool '{tool_name}' called without a user confirmation turn between tool calls",
+                )]
+            last_was_tool = True
+
+    return []
+
+
+def check_reads_outside_working_dir(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """EA-03a — reads outside declared working directory.
+
+    Only runs when sec_config.working_directory is set (no heuristic fallback).
+    Scans tool_start events for file-read tool names with a 'path' argument
+    that does not start with the declared working_directory prefix.
+    """
+    working_dir = getattr(sec_config, "working_directory", None) if sec_config else None
+    if not working_dir:
+        return []
+
+    _READ_TOOL_RE = re.compile(
+        r"(?i)\b(read|open|load|get|fetch|parse|cat|head|tail)[\w_]*(file|doc|content|text|data)?\b"
+    )
+    findings: list["Finding"] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not _READ_TOOL_RE.search(tool_name):
+            continue
+        payload = ev.get("payload") or {}
+        tool_input = payload.get("tool_input") or {}
+        if isinstance(tool_input, str):
+            try:
+                tool_input = json.loads(tool_input)
+            except Exception:
+                tool_input = {}
+        if not isinstance(tool_input, dict):
+            continue
+        for key in ("path", "file_path", "filename", "filepath", "source"):
+            val = str(tool_input.get(key, ""))
+            if val and not val.startswith(working_dir):
+                findings.append(_make_finding(
+                    "OW-LLM06", "EA-03a",
+                    "Reads outside working directory",
+                    65, session_id, tenant_id,
+                    severity="medium",
+                    detail=f"Tool '{tool_name}' read path '{val}' — outside declared working directory '{working_dir}'",
+                ))
+                break
+
+    return findings
+
+
+def check_network_not_in_allowlist(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """EA-03b — outbound call to host not in declared network allowlist.
+
+    Only runs when sec_config.network_allowlist is set and non-empty.
+    Scans tool_start events for URL parameters and checks the hostname
+    against the allowlist. Wildcards like '*.internal.com' are supported.
+    """
+    from urllib.parse import urlparse
+    allowlist: list | None = getattr(sec_config, "network_allowlist", None) if sec_config else None
+    if not allowlist:
+        return []
+
+    def host_allowed(host: str) -> bool:
+        for entry in allowlist:
+            if entry.startswith("*."):
+                if host.endswith(entry[1:]) or host == entry[2:]:
+                    return True
+            elif entry == host or entry == "*":
+                return True
+        return False
+
+    findings: list["Finding"] = []
+    seen_hosts: set[str] = set()
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        tool_input = payload.get("tool_input") or {}
+        if isinstance(tool_input, str):
+            try:
+                tool_input = json.loads(tool_input)
+            except Exception:
+                tool_input = {}
+        if not isinstance(tool_input, dict):
+            continue
+        for key in ("url", "endpoint", "host", "base_url", "target"):
+            raw_url = str(tool_input.get(key, ""))
+            if not raw_url:
+                continue
+            try:
+                parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+                host = parsed.hostname or raw_url
+            except Exception:
+                host = raw_url
+            if host and host not in seen_hosts and not host_allowed(host):
+                seen_hosts.add(host)
+                findings.append(_make_finding(
+                    "OW-LLM06", "EA-03b",
+                    "Network call to host not in allowlist",
+                    75, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Tool '{ev.get('tool_name', '')}' contacted host '{host}' — not in declared network allowlist",
+                ))
+
+    return findings
+
+
+def check_operating_hours(
+    events: list[dict],
+    session: dict,
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """RA-01b — agent active outside declared operating hours.
+
+    Only runs when sec_config.operating_hours is set.
+    Format: {"days": ["Mon","Tue",...], "from": "09:00", "to": "18:00"}
+    Times are UTC.
+    """
+    import datetime
+    operating_hours: dict | None = getattr(sec_config, "operating_hours", None) if sec_config else None
+    if not operating_hours:
+        return []
+
+    started_at = session.get("started_at")
+    if not started_at:
+        return []
+
+    if not isinstance(started_at, datetime.datetime):
+        try:
+            started_at = datetime.datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        except Exception:
+            return []
+
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    session_day = day_names[started_at.weekday()]
+    declared_days: list = operating_hours.get("days", day_names)
+    time_from_str: str = operating_hours.get("from", "00:00")
+    time_to_str: str   = operating_hours.get("to", "23:59")
+
+    try:
+        t_from = datetime.time.fromisoformat(time_from_str)
+        t_to   = datetime.time.fromisoformat(time_to_str)
+    except Exception:
+        return []
+
+    session_time = started_at.replace(tzinfo=datetime.timezone.utc).time()
+
+    outside_days = session_day not in declared_days
+    if t_from <= t_to:
+        outside_hours = not (t_from <= session_time <= t_to)
+    else:  # wraps midnight
+        outside_hours = not (session_time >= t_from or session_time <= t_to)
+
+    if outside_days or outside_hours:
+        reason = []
+        if outside_days:
+            reason.append(f"day={session_day} not in {declared_days}")
+        if outside_hours:
+            reason.append(f"time={session_time.strftime('%H:%M')} UTC outside {time_from_str}–{time_to_str}")
+        return [_make_finding(
+            "OW-ASI10", "RA-01b",
+            "Agent active outside declared operating hours",
+            60, session_id, tenant_id,
+            severity="medium",
+            detail=f"Session started outside schedule: {'; '.join(reason)}",
+        )]
+
+    return []
+
+
+def check_package_not_in_sbom(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """ASCV-02b — package installed that is not in the declared SBOM allowlist.
+
+    Only runs when sec_config.sbom_allowlist is set.
+    """
+    sbom: list | None = getattr(sec_config, "sbom_allowlist", None) if sec_config else None
+    if sbom is None:
+        return []
+
+    _PKG_RE = re.compile(
+        r"(?i)(pip\s+install|npm\s+install|yarn\s+add|gem\s+install|cargo\s+install)\s+([\w\-@/]+)",
+    )
+
+    findings: list["Finding"] = []
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        tool_input = payload.get("tool_input") or {}
+        if isinstance(tool_input, str):
+            input_str = tool_input
+        else:
+            input_str = json.dumps(tool_input)
+        for m in _PKG_RE.finditer(input_str):
+            pkg = m.group(2).strip().split("@")[0].split("[")[0]  # strip version/extras
+            if pkg not in sbom:
+                findings.append(_make_finding(
+                    "OW-ASI04", "ASCV-02b",
+                    "Package not in approved SBOM",
+                    88, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Package '{pkg}' is not in the declared SBOM allowlist",
+                ))
+    return findings
+
+
+def check_mcp_endpoint_anomaly(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """ASCV-01a — tool call targeting an undeclared MCP server endpoint.
+
+    Only runs when sec_config.mcp_endpoints is set and non-empty.
+    Checks tool_start events for URL parameters that don't match any
+    declared endpoint prefix.
+    """
+    declared: list | None = getattr(sec_config, "mcp_endpoints", None) if sec_config else None
+    if not declared:
+        return []
+
+    def endpoint_allowed(url: str) -> bool:
+        for ep in declared:
+            if url.startswith(ep) or ep.startswith(url):
+                return True
+        return False
+
+    findings: list["Finding"] = []
+    seen: set[str] = set()
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        tool_input = payload.get("tool_input") or {}
+        if isinstance(tool_input, str):
+            try:
+                tool_input = json.loads(tool_input)
+            except Exception:
+                tool_input = {}
+        if not isinstance(tool_input, dict):
+            continue
+        tool_name = ev.get("tool_name") or ""
+        if not re.search(r"(?i)(mcp|tool|call|invoke|request)", tool_name):
+            continue
+        for key in ("url", "endpoint", "server", "base_url"):
+            raw = str(tool_input.get(key, ""))
+            if raw and raw not in seen and not endpoint_allowed(raw):
+                seen.add(raw)
+                findings.append(_make_finding(
+                    "OW-ASI04", "ASCV-01a",
+                    "MCP server endpoint URL changed",
+                    85, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Tool '{tool_name}' contacted undeclared MCP endpoint '{raw}'",
+                ))
+    return findings
+
+
+def check_system_prompt_modification(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """EA-02c — agent self-modifies its system prompt mid-session.
+
+    Manual mode (system_prompt set): detects when an llm_start event
+    contains a system message that differs significantly from the declared prompt.
+
+    Auto mode: looks for completion text that explicitly claims to update
+    system instructions (weak heuristic).
+    """
+    from difflib import SequenceMatcher
+    declared_prompt: str | None = getattr(sec_config, "system_prompt", None) if sec_config else None
+
+    if declared_prompt:
+        # Manual: compare system messages in llm_start events against declared prompt
+        for ev in events:
+            if ev["event_type"] != "llm_start":
+                continue
+            payload = ev.get("payload") or {}
+            for msg in payload.get("messages", []):
+                if not isinstance(msg, dict) or msg.get("role") != "system":
+                    continue
+                content = str(msg.get("content", ""))
+                ratio = SequenceMatcher(None, declared_prompt, content).ratio()
+                if ratio < 0.75 and len(content) > 20:
+                    return [_make_finding(
+                        "OW-LLM06", "EA-02c",
+                        "Agent self-modifies system prompt",
+                        98, session_id, tenant_id,
+                        severity="critical",
+                        detail=f"System message similarity to declared prompt: {ratio:.0%} — possible self-modification",
+                    )]
+    else:
+        # Auto: look for output claiming to change instructions
+        _SELF_MOD_PATTERNS = [
+            r"(?i)(i('ve| have) (updated|changed|modified) my (system prompt|instructions|guidelines))",
+            r"(?i)(my (new|updated) (system prompt|instructions) (is|are|now))",
+            r"(?i)(disregarding (my|the) (original|previous) (system prompt|instructions))",
+        ]
+        for ev in events:
+            if ev["event_type"] != "llm_end":
+                continue
+            payload = ev.get("payload") or {}
+            completion = str(payload.get("completion", ""))
+            for pat in _SELF_MOD_PATTERNS:
+                if re.search(pat, completion):
+                    return [_make_finding(
+                        "OW-LLM06", "EA-02c",
+                        "Agent self-modifies system prompt",
+                        98, session_id, tenant_id,
+                        severity="critical",
+                        detail="Agent output claims to have updated or changed its own system instructions",
+                    )]
+
     return []
 
 
