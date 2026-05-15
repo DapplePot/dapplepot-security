@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     alert_on_score_gte: int = 65
 
     tool_manifests: str = "{}"
+    internal_api_secret: str = ""
 
     # v3 cost config for UBC-05a (Denial of Wallet)
     llm_input_cost_per_1k: float = 0.01    # USD per 1k input tokens (default GPT-4 proxy)

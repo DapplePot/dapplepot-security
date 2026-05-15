@@ -347,11 +347,13 @@ async def signal_a10(
         SELECT session_id, countDistinct(tool_name) AS distinct_tools
         FROM obs_events
         WHERE agent_id   = %(agent_id)s
+          AND tenant_id  = %(tenant_id)s
           AND event_type = 'tool_start'
           AND emitted_at >= now() - INTERVAL 30 DAY
         GROUP BY session_id
         """,
         agent_id=str(agent_id),
+        tenant_id=str(tenant_id),
     )
     if len(baseline_rows) < 5:
         return None

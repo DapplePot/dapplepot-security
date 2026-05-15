@@ -73,6 +73,7 @@ ORDER BY composite_risk_score DESC;
 CREATE OR REPLACE VIEW v_agent_signal_breakdown AS
 SELECT
     s.agent_id,
+    s.tenant_id,
     sf.owasp_signal_id,
     sf.framework,
     sf.category,
@@ -85,6 +86,7 @@ JOIN session_risk_scores s ON s.session_id = sf.session_id
 WHERE s.agent_id IS NOT NULL
 GROUP BY
     s.agent_id,
+    s.tenant_id,
     sf.owasp_signal_id,
     sf.framework,
     sf.category;

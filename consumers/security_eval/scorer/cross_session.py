@@ -216,6 +216,28 @@ async def check_request_rate_spike(
 # UBC-05a — Cost spike / Denial of Wallet (OW-LLM10)
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _get_model_cost_rates(tenant_id: str, model_names: list[str], fallback_input: float, fallback_output: float) -> dict[str, tuple[float, float]]:
+    """Returns {model_name: (input_cost_per_token, output_cost_per_token)} from llm_models table."""
+    if not model_names:
+        return {}
+    try:
+        from core.infra.postgres import get_pool
+        pool = await get_pool()
+        rows = await pool.fetch(
+            "SELECT name, input_cost_per_1k, output_cost_per_1k FROM llm_models WHERE tenant_id = $1 AND name = ANY($2)",
+            tenant_id, model_names,
+        )
+        return {
+            r["name"]: (
+                float(r["input_cost_per_1k"] or fallback_input * 1000) / 1000,
+                float(r["output_cost_per_1k"] or fallback_output * 1000) / 1000,
+            )
+            for r in rows
+        }
+    except Exception:
+        return {}
+
+
 async def check_cost_spike(
     events: list[dict],
     session: dict,
@@ -223,54 +245,88 @@ async def check_cost_spike(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """UBC-05a — today's cumulative cost > 3× 7-day daily average for this agent."""
+    """UBC-05a — today's cumulative cost > 3× 7-day daily average for this agent.
+    Uses per-model cost rates from llm_models table; falls back to global config rates."""
     from core.config import settings
-
-    input_cost = settings.llm_input_cost_per_1k / 1000
-    output_cost = settings.llm_output_cost_per_1k / 1000
-
-    # Compute today's session cost
-    session_input = sum(e.get("llm_input_tokens") or 0 for e in events if e["event_type"] == "llm_end")
-    session_output = sum(e.get("llm_output_tokens") or 0 for e in events if e["event_type"] == "llm_end")
-    session_cost = session_input * input_cost + session_output * output_cost
-
     from core.infra import clickhouse as ch
+
+    fallback_in  = settings.llm_input_cost_per_1k  / 1000
+    fallback_out = settings.llm_output_cost_per_1k / 1000
+
+    llm_events = [e for e in events if e["event_type"] == "llm_end"]
+    model_names = list({e.get("llm_model") or "" for e in llm_events if e.get("llm_model")})
+
+    rates = await _get_model_cost_rates(tenant_id, model_names, fallback_in, fallback_out)
+
+    def token_cost(model: str, inp: int, out: int) -> float:
+        in_rate, out_rate = rates.get(model, (fallback_in, fallback_out))
+        return inp * in_rate + out * out_rate
+
+    session_cost = sum(
+        token_cost(
+            e.get("llm_model") or "",
+            e.get("llm_input_tokens") or 0,
+            e.get("llm_output_tokens") or 0,
+        )
+        for e in llm_events
+    )
+
     try:
+        # Baseline: per-model daily cost over last 7 days, summed across models
         baseline_rows = await ch.fetch(
             """
-            SELECT avg(daily_cost) AS avg_daily_cost
-            FROM (
-                SELECT toDate(emitted_at) AS day,
-                       sum(llm_input_tokens) * %(input_cost)s + sum(llm_output_tokens) * %(output_cost)s AS daily_cost
-                FROM obs_events
-                WHERE agent_id   = %(agent_id)s
-                  AND event_type = 'llm_end'
-                  AND emitted_at BETWEEN now() - INTERVAL 7 DAY AND now() - INTERVAL 1 DAY
-                GROUP BY day
-            )
+            SELECT toDate(emitted_at) AS day,
+                   llm_model,
+                   sum(llm_input_tokens)  AS inp,
+                   sum(llm_output_tokens) AS out
+            FROM obs_events
+            WHERE agent_id   = %(agent_id)s
+              AND tenant_id  = %(tenant_id)s
+              AND event_type = 'llm_end'
+              AND emitted_at BETWEEN now() - INTERVAL 7 DAY AND now() - INTERVAL 1 DAY
+            GROUP BY day, llm_model
             """,
             agent_id=str(agent_id),
-            input_cost=input_cost,
-            output_cost=output_cost,
+            tenant_id=str(tenant_id),
         )
+
+        baseline_models = list({r["llm_model"] for r in baseline_rows if r.get("llm_model")})
+        baseline_rates  = await _get_model_cost_rates(tenant_id, baseline_models, fallback_in, fallback_out)
+
+        daily_costs: dict[str, float] = {}
+        for r in baseline_rows:
+            day = str(r["day"])
+            in_r, out_r = baseline_rates.get(r["llm_model"] or "", (fallback_in, fallback_out))
+            daily_costs[day] = daily_costs.get(day, 0.0) + float(r["inp"]) * in_r + float(r["out"]) * out_r
+
+        avg_daily = sum(daily_costs.values()) / len(daily_costs) if daily_costs else 0.0
 
         today_rows = await ch.fetch(
             """
-            SELECT sum(llm_input_tokens) * %(input_cost)s + sum(llm_output_tokens) * %(output_cost)s AS today_cost
+            SELECT llm_model,
+                   sum(llm_input_tokens)  AS inp,
+                   sum(llm_output_tokens) AS out
             FROM obs_events
             WHERE agent_id   = %(agent_id)s
+              AND tenant_id  = %(tenant_id)s
               AND event_type = 'llm_end'
               AND toDate(emitted_at) = today()
+            GROUP BY llm_model
             """,
             agent_id=str(agent_id),
-            input_cost=input_cost,
-            output_cost=output_cost,
+            tenant_id=str(tenant_id),
         )
+
+        today_models = list({r["llm_model"] for r in today_rows if r.get("llm_model")})
+        today_rates  = await _get_model_cost_rates(tenant_id, today_models, fallback_in, fallback_out)
+        today_cost   = sum(
+            float(r["inp"]) * today_rates.get(r["llm_model"] or "", (fallback_in, fallback_out))[0]
+            + float(r["out"]) * today_rates.get(r["llm_model"] or "", (fallback_in, fallback_out))[1]
+            for r in today_rows
+        ) if today_rows else session_cost
+
     except Exception:
         return None
-
-    avg_daily = float(baseline_rows[0]["avg_daily_cost"]) if baseline_rows else 0.0
-    today_cost = float(today_rows[0]["today_cost"]) if today_rows else session_cost
 
     if avg_daily > 0 and today_cost > avg_daily * 3:
         return _make_finding(
@@ -320,10 +376,12 @@ async def check_identity_sharing(
             SELECT countDistinct(user_context_id) AS distinct_users
             FROM obs_events
             WHERE agent_id   = %(agent_id)s
+              AND tenant_id  = %(tenant_id)s
               AND event_type = 'tool_start'
               AND emitted_at >= now() - INTERVAL 1 DAY
             """,
             agent_id=str(agent_id),
+            tenant_id=str(tenant_id),
         )
         distinct_users = int(rows[0]["distinct_users"]) if rows else 0
     except Exception:

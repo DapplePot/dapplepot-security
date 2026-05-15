@@ -13,10 +13,11 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from core.config import settings
 from core.infra.postgres import close_pool, get_pool
 from core.infra.redis import close_redis, get_redis
 
@@ -27,6 +28,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
+_INTERNAL_SECRET = settings.internal_api_secret
+
+
+def _require_internal_secret(request: Request) -> None:
+    if not _INTERNAL_SECRET or request.headers.get('X-Internal-Secret') != _INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail='forbidden')
 
 
 @asynccontextmanager
@@ -58,7 +65,7 @@ async def health():
 
 
 @app.post('/v1/evaluate', status_code=202)
-async def evaluate(request: Request):
+async def evaluate(request: Request, _: None = Depends(_require_internal_secret)):
     """
     Receive a single event forwarded from dapplepot-api.
     Dispatches the same logic as the former Kafka consumer's _handle_event().
@@ -82,7 +89,7 @@ async def evaluate(request: Request):
 
 
 @app.post('/v1/online-check')
-async def online_check(request: Request):
+async def online_check(request: Request, _: None = Depends(_require_internal_secret)):
     """
     Real-time threat detection endpoint called by SDK via backend proxy.
     Fetches config, runs detection, adds actions, returns findings.

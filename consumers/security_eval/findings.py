@@ -300,7 +300,7 @@ async def produce_trust_alert(score_row: dict) -> None:
         "dedup_key":    dedup_key,
         "payload": {
             "title":       f"Agent Trust Degrading: {round(trust_score)}/100 ({_trust_status_label(trust_score)})",
-            "message":     "Trust score has been below 50 for 3+ consecutive sessions",
+            "message":     "Trust score below 50 for the last 3 consecutive sessions",
             "rule_type":   "trust_degradation",
             "source":      "security",
             "agent_id":    score_row.get("agent_id"),

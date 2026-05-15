@@ -88,6 +88,8 @@ from consumers.security_eval.scorer.llm_signals import (
     check_package_not_in_sbom,
     check_mcp_endpoint_anomaly,
     check_system_prompt_modification,
+    check_undeclared_llm_used,
+    check_context_window_stuffing,
 )
 from consumers.security_eval.scorer.asi_signals import (
     AGENT_SIGNAL_ID_FUNCTIONS,
@@ -633,6 +635,8 @@ async def score_session(
     _extend_if_enabled(check_package_not_in_sbom(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_mcp_endpoint_anomaly(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_system_prompt_modification(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_undeclared_llm_used(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_context_window_stuffing(events, session_id, tenant_id, sec_config=sec_config))
 
     # ─── Session-level OW-ASI signals ────────────────────────────────────────
     from consumers.security_eval.scorer.asi_signals import signal_a01
@@ -955,22 +959,26 @@ async def score_session(
                 # captures "N sessions with confirmed low trust."
                 # Exception path: column not yet migrated → trust the Bayesian score.
                 try:
-                    low_trust_rows = await pool.fetch(
+                    last_rows = await pool.fetch(
                         """
                         SELECT trust_score
                         FROM session_risk_scores
                         WHERE agent_id = $1 AND tenant_id = $2
                           AND trust_score IS NOT NULL
-                          AND trust_score < $4
                         ORDER BY scored_at DESC
                         LIMIT $3
                         """,
                         agent_id,
                         tenant_id,
                         AGENT_TRUST_CONSECUTIVE_SESSIONS,
-                        float(AGENT_TRUST_ALERT_THRESHOLD),
                     )
-                    trust_alert_triggered = len(low_trust_rows) >= AGENT_TRUST_CONSECUTIVE_SESSIONS
+                    trust_alert_triggered = (
+                        len(last_rows) >= AGENT_TRUST_CONSECUTIVE_SESSIONS
+                        and all(
+                            float(r["trust_score"]) < AGENT_TRUST_ALERT_THRESHOLD
+                            for r in last_rows
+                        )
+                    )
                 except Exception:
                     # Column not yet migrated — fall through to primary gate result.
                     trust_alert_triggered = True

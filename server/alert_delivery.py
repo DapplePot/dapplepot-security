@@ -32,7 +32,7 @@ async def deliver_alert(alert: dict[str, Any]) -> None:
                 (alert_id, tenant_id, session_id, rule_id, rule_name,
                  severity, triggered_at, dedup_key, payload)
             VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9::jsonb)
-            ON CONFLICT (alert_id) DO NOTHING
+            ON CONFLICT DO NOTHING
             """,
             alert.get('alert_id'),
             alert.get('tenant_id'),

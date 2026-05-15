@@ -81,6 +81,7 @@ REGISTRY: list[tuple] = [
     ("OW-LLM06","EA-02c","Agent self-modifies system prompt",             "LLM",6,"post_session",   98,"critical", "high",          False,None),
     ("OW-LLM06","EA-03a","Reads outside working directory",               "LLM",6,"post_session",   65,"medium",   "high",          False,None),
     ("OW-LLM06","EA-03b","Network call to host not in allowlist",         "LLM",6,"post_session",   75,"high",     "high",          False,None),
+    ("OW-LLM06","EA-04a","Undeclared LLM model used",                    "LLM",6,"post_session",   70,"medium",   "high",          False,None),
 
     # ── OW-LLM07 System Prompt Leakage ──────────────────────────────────────
     ("OW-LLM07","SPL-01a","Verbatim system prompt segment in output",     "LLM",7,"online",         85,"high",     "medium",        False,None),

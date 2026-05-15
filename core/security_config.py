@@ -45,6 +45,28 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+# ─── cfg_dict sanitizer ──────────────────────────────────────────────────────
+# Stale Redis cache entries may have list fields serialized as JSON strings
+# (e.g. tool_manifest = '"[]"' instead of '[]').  Sanitize before model_validate
+# so Pydantic never sees a str where it expects list.
+
+_LIST_FIELDS = (
+    "tool_manifest", "network_allowlist", "irreversible_tools",
+    "sbom_allowlist", "mcp_endpoints", "connected_llms",
+)
+
+def _sanitize_cfg_dict(cfg: dict) -> dict:
+    for field in _LIST_FIELDS:
+        val = cfg.get(field)
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                cfg[field] = parsed if isinstance(parsed, list) else None
+            except Exception:
+                cfg[field] = None
+    return cfg
+
+
 # ─── JSONB helpers (used when loading agent profile fields from Postgres) ─────
 
 def _load_jsonb_list(raw) -> list | None:
@@ -145,6 +167,10 @@ class AgentSecurityConfig(BaseModel):
     operating_hours:    dict | None       = None  # {days: [...], from: "09:00", to: "18:00"}
     sbom_allowlist:     list[str] | None  = None
     mcp_endpoints:      list[str] | None  = None
+    # Connected LLM models — loaded from agent_llm_models table.
+    # None = auto (no declaration); list = manual (EA-04a + UBC-01b become active).
+    connected_llms:        list[str] | None  = None   # model names
+    connected_llm_details: list[dict] | None = None   # [{name, context_window_tokens, input_cost_per_1k, output_cost_per_1k}]
 
     def is_online(self, sub_check_id: str) -> bool:
         """Return True if this sub-check should be handled by the SDK (not post-session)."""
@@ -335,13 +361,44 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             cfg_dict["operating_hours"]    = _load_jsonb_dict(alert_row["operating_hours"])
             cfg_dict["sbom_allowlist"]     = _load_jsonb_list(alert_row["sbom_allowlist"])
             cfg_dict["mcp_endpoints"]      = _load_jsonb_list(alert_row["mcp_endpoints"])
+
     except Exception:
         logger.exception(
             '"push_agent_defaults failed to load Postgres overrides tenant_id=%s agent_id=%s"',
             tenant_id, agent_id,
         )
 
-    cfg = AgentSecurityConfig.model_validate(cfg_dict)
+    # Load connected LLM models — separate try so a missing migration doesn't
+    # affect the existing config fields above.
+    try:
+        from core.infra.postgres import get_pool as _get_pool
+        _pool = await _get_pool()
+        llm_rows = await _pool.fetch(
+            """SELECT m.name, m.context_window_tokens,
+                      m.input_cost_per_1k, m.output_cost_per_1k
+               FROM agent_llm_models alm
+               JOIN llm_models m ON m.model_id = alm.model_id
+               WHERE alm.tenant_id = $1::uuid AND alm.agent_id = $2::uuid""",
+            tenant_id, agent_id,
+        )
+        if llm_rows:
+            cfg_dict["connected_llms"] = [r["name"] for r in llm_rows]
+            cfg_dict["connected_llm_details"] = [
+                {
+                    "name":                  r["name"],
+                    "context_window_tokens": r["context_window_tokens"],
+                    "input_cost_per_1k":     float(r["input_cost_per_1k"])  if r["input_cost_per_1k"]  is not None else None,
+                    "output_cost_per_1k":    float(r["output_cost_per_1k"]) if r["output_cost_per_1k"] is not None else None,
+                }
+                for r in llm_rows
+            ]
+    except Exception:
+        logger.debug(
+            '"push_agent_defaults: skipping connected_llms (table may not exist yet) tenant_id=%s"',
+            tenant_id,
+        )
+
+    cfg = AgentSecurityConfig.model_validate(_sanitize_cfg_dict(cfg_dict))
     cache_key = _agent_cache_key(tenant_id, agent_id)
     await redis.set(cache_key, cfg.model_dump_json(), ex=CACHE_TTL_S)
     logger.info(
@@ -470,7 +527,37 @@ async def get_agent_security_config(
                 agent_id,
             )
 
-    cfg = AgentSecurityConfig.model_validate(cfg_dict)
+        # Load connected LLM models — isolated so a missing migration doesn't
+        # break the existing config fields.
+        try:
+            from core.infra.postgres import get_pool as _get_pool
+            _pool = await _get_pool()
+            llm_rows = await _pool.fetch(
+                """SELECT m.name, m.context_window_tokens,
+                          m.input_cost_per_1k, m.output_cost_per_1k
+                   FROM agent_llm_models alm
+                   JOIN llm_models m ON m.model_id = alm.model_id
+                   WHERE alm.tenant_id = $1::uuid AND alm.agent_id = $2::uuid""",
+                tenant_id, agent_id,
+            )
+            if llm_rows:
+                cfg_dict["connected_llms"] = [r["name"] for r in llm_rows]
+                cfg_dict["connected_llm_details"] = [
+                    {
+                        "name":                  r["name"],
+                        "context_window_tokens": r["context_window_tokens"],
+                        "input_cost_per_1k":     float(r["input_cost_per_1k"])  if r["input_cost_per_1k"]  is not None else None,
+                        "output_cost_per_1k":    float(r["output_cost_per_1k"]) if r["output_cost_per_1k"] is not None else None,
+                    }
+                    for r in llm_rows
+                ]
+        except Exception:
+            logger.debug(
+                '"get_agent_security_config: skipping connected_llms (table may not exist yet) tenant_id=%s"',
+                tenant_id,
+            )
+
+    cfg = AgentSecurityConfig.model_validate(_sanitize_cfg_dict(cfg_dict))
 
     if agent_id:
         await redis.set(cache_key, cfg.model_dump_json(), ex=CACHE_TTL_S)

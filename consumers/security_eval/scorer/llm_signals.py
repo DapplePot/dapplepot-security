@@ -110,11 +110,13 @@ async def signal_ow_llm06_tool_count(
         SELECT session_id, count() AS tool_call_count
         FROM obs_events
         WHERE agent_id   = %(agent_id)s
+          AND tenant_id  = %(tenant_id)s
           AND event_type = 'tool_start'
           AND emitted_at >= now() - INTERVAL 7 DAY
         GROUP BY session_id
         """,
         agent_id=str(agent_id),
+        tenant_id=str(tenant_id),
     )
     if len(baseline_rows) < 2:
         return None
@@ -317,6 +319,15 @@ async def signal_ow_llm10_probe(
     )
 
 
+def _z_score(value: float, population: list[float]) -> float | None:
+    if len(population) < 2:
+        return None
+    mean = sum(population) / len(population)
+    variance = sum((x - mean) ** 2 for x in population) / len(population)
+    stddev = variance ** 0.5
+    return (value - mean) / stddev if stddev > 0 else None
+
+
 async def signal_ow_llm10_token_spike(
     events: list[dict],
     session: dict,
@@ -324,45 +335,61 @@ async def signal_ow_llm10_token_spike(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """UBC-01a — single turn / session token count > 4σ baseline."""
+    """UBC-01a — session token count > 4σ above per-model 7-day baseline.
+    Baseline is grouped by (agent_id, llm_model) to avoid mixing token distributions
+    across models with different typical usage scales."""
     llm_events = [e for e in events if e["event_type"] == "llm_end"]
-    total_tokens = sum(
-        (e.get("llm_input_tokens") or 0) + (e.get("llm_output_tokens") or 0)
-        for e in llm_events
-    )
+    if not llm_events:
+        return None
+
+    # Group session tokens by model
+    from collections import defaultdict
+    session_by_model: dict[str, int] = defaultdict(int)
+    for e in llm_events:
+        model = e.get("llm_model") or "__unknown__"
+        session_by_model[model] += (e.get("llm_input_tokens") or 0) + (e.get("llm_output_tokens") or 0)
 
     from core.infra import clickhouse as ch
     baseline_rows = await ch.fetch(
         """
         SELECT session_id,
+               llm_model,
                SUM(llm_input_tokens + llm_output_tokens) AS total_tokens
         FROM obs_events
         WHERE agent_id   = %(agent_id)s
           AND event_type = 'llm_end'
           AND emitted_at >= now() - INTERVAL 7 DAY
-        GROUP BY session_id
+        GROUP BY session_id, llm_model
         """,
         agent_id=str(agent_id),
     )
-    if len(baseline_rows) < 2:
+
+    # Build per-model baseline distributions
+    baseline_by_model: dict[str, list[float]] = defaultdict(list)
+    for r in baseline_rows:
+        baseline_by_model[r["llm_model"] or "__unknown__"].append(float(r["total_tokens"]))
+
+    worst_sigmas = 0.0
+    worst_model  = ""
+    worst_tokens = 0
+
+    for model, tokens in session_by_model.items():
+        z = _z_score(float(tokens), baseline_by_model.get(model, []))
+        if z is not None and z > worst_sigmas:
+            worst_sigmas = z
+            worst_model  = model
+            worst_tokens = tokens
+
+    if worst_sigmas < 4.0:
         return None
 
-    token_counts = [float(r["total_tokens"]) for r in baseline_rows]
-    mean     = sum(token_counts) / len(token_counts)
-    variance = sum((t - mean) ** 2 for t in token_counts) / len(token_counts)
-    stddev   = variance ** 0.5
-    if stddev == 0:
-        return None
-    sigmas = (total_tokens - mean) / stddev
-    if sigmas < 4.0:
-        return None
-
+    model_label = f" ({worst_model})" if worst_model and worst_model != "__unknown__" else ""
     return _make_finding(
         "OW-LLM10", "UBC-01a",
         "Single session token count > 4σ baseline",
         55, session_id, tenant_id,
         severity="medium",
-        detail=f"Token count ({total_tokens}) is {sigmas:.1f}σ above 7-day agent baseline",
+        detail=f"Token count {worst_tokens}{model_label} is {worst_sigmas:.1f}σ above 7-day per-model baseline",
     )
 
 
@@ -851,44 +878,52 @@ async def check_input_size_anomaly(
     tenant_id: str,
     agent_id: str,
 ) -> list["Finding"]:
-    """UBC-02a — session input tokens > 4σ above 7-day baseline for this agent."""
-    session_input_tokens = sum(
-        e.get("llm_input_tokens") or 0
-        for e in events
-        if e["event_type"] == "llm_end"
-    )
+    """UBC-02a — session input tokens > 4σ above per-model 7-day baseline.
+    Baseline grouped by (agent_id, llm_model) to avoid mixing input scales across models."""
+    llm_events = [e for e in events if e["event_type"] == "llm_end"]
+    if not llm_events:
+        return []
+
+    from collections import defaultdict
+    session_by_model: dict[str, int] = defaultdict(int)
+    for e in llm_events:
+        model = e.get("llm_model") or "__unknown__"
+        session_by_model[model] += e.get("llm_input_tokens") or 0
 
     from core.infra import clickhouse as ch
     baseline_rows = await ch.fetch(
         """
-        SELECT session_id, SUM(llm_input_tokens) AS input_tokens
+        SELECT session_id, llm_model, SUM(llm_input_tokens) AS input_tokens
         FROM obs_events
         WHERE agent_id   = %(agent_id)s
           AND event_type = 'llm_end'
           AND emitted_at >= now() - INTERVAL 7 DAY
-        GROUP BY session_id
+        GROUP BY session_id, llm_model
         """,
         agent_id=str(agent_id),
     )
-    if len(baseline_rows) < 5:
-        return []
 
-    counts = [float(r["input_tokens"]) for r in baseline_rows]
-    mean = sum(counts) / len(counts)
-    variance = sum((c - mean) ** 2 for c in counts) / len(counts)
-    stddev = variance ** 0.5
-    if stddev == 0:
-        return []
+    baseline_by_model: dict[str, list[float]] = defaultdict(list)
+    for r in baseline_rows:
+        baseline_by_model[r["llm_model"] or "__unknown__"].append(float(r["input_tokens"]))
 
-    if session_input_tokens > mean + 4 * stddev:
-        return [_make_finding(
-            "OW-LLM10", "UBC-02a",
-            "Input size anomaly",
-            50, session_id, tenant_id,
-            severity="medium",
-            detail=f"Input tokens {session_input_tokens} exceeds 4σ above baseline {mean:.0f}",
-        )]
-    return []
+    findings = []
+    for model, inp in session_by_model.items():
+        population = baseline_by_model.get(model, [])
+        if len(population) < 5:
+            continue
+        z = _z_score(float(inp), population)
+        if z is not None and z >= 4.0:
+            mean = sum(population) / len(population)
+            model_label = f" ({model})" if model != "__unknown__" else ""
+            findings.append(_make_finding(
+                "OW-LLM10", "UBC-02a",
+                "Input size anomaly",
+                50, session_id, tenant_id,
+                severity="medium",
+                detail=f"Input tokens {inp}{model_label} is {z:.1f}σ above per-model baseline {mean:.0f}",
+            ))
+    return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1273,6 +1308,94 @@ def check_system_prompt_modification(
                     )]
 
     return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EA-04a — Undeclared LLM model used (OW-LLM06)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_undeclared_llm_used(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """EA-04a — session used an LLM model not in the agent's declared inventory.
+
+    Blind when connected_llms is None (auto mode).
+    Active when connected_llms is set (manual mode) — same pattern as EA-01a
+    (tool not in manifest) applied to LLM models.
+    """
+    declared: list[str] | None = getattr(sec_config, "connected_llms", None) if sec_config else None
+    if not declared:
+        return []
+
+    used_models = {
+        e.get("llm_model") for e in events
+        if e.get("event_type") == "llm_start" and e.get("llm_model")
+    }
+    undeclared = used_models - set(declared)
+    if not undeclared:
+        return []
+
+    return [_make_finding(
+        "OW-LLM06", "EA-04a",
+        "Undeclared LLM model used",
+        70, session_id, tenant_id,
+        severity="medium",
+        detail=f"Model(s) not in declared inventory: {', '.join(sorted(undeclared))}",
+    )]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UBC-01b — Context window stuffing attack (OW-LLM10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_context_window_stuffing(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """UBC-01b — session input tokens exceed 85% of declared context window.
+
+    Blind when connected_llm_details is None (auto mode) or when none of the
+    declared models have context_window_tokens set.
+    Active when a declared model has a context_window_tokens value.
+    """
+    details: list[dict] | None = getattr(sec_config, "connected_llm_details", None) if sec_config else None
+    if not details:
+        return []
+
+    ctx_map = {
+        d["name"]: d["context_window_tokens"]
+        for d in details
+        if d.get("context_window_tokens")
+    }
+    if not ctx_map:
+        return []
+
+    from collections import defaultdict
+    input_by_model: dict[str, int] = defaultdict(int)
+    for e in events:
+        if e.get("event_type") == "llm_end" and e.get("llm_model"):
+            input_by_model[e["llm_model"]] += e.get("llm_input_tokens") or 0
+
+    findings = []
+    for model, ctx_tokens in ctx_map.items():
+        session_input = input_by_model.get(model, 0)
+        if session_input == 0:
+            continue
+        ratio = session_input / ctx_tokens
+        if ratio >= 0.85:
+            findings.append(_make_finding(
+                "OW-LLM10", "UBC-01b",
+                "Context window stuffing attack",
+                70, session_id, tenant_id,
+                severity="high",
+                detail=f"{model}: {session_input:,} input tokens is {ratio:.0%} of {ctx_tokens:,} context window",
+            ))
+    return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────

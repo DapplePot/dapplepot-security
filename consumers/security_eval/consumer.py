@@ -205,7 +205,7 @@ async def _run_scorer(tenant_id: str, session_id: str, agent_id: str) -> None:
 
 async def _run_scorer_after_findings(tenant_id: str, session_id: str, agent_id: str) -> None:
     """Wait for all pending finding-persist tasks before scoring."""
-    pending = _pending_findings.pop(session_id, set())
+    pending = _pending_findings.pop(f"{tenant_id}:{session_id}", set())
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     await _run_scorer(tenant_id=tenant_id, session_id=session_id, agent_id=agent_id)
@@ -238,9 +238,10 @@ async def _handle_event(event: dict) -> None:
                 emitted_at=event.get('emitted_at'),
             )
         )
-        _pending_findings.setdefault(session_id, set()).add(task)
+        _key = f"{tenant_id or ''}:{session_id}"
+        _pending_findings.setdefault(_key, set()).add(task)
         task.add_done_callback(
-            lambda t: _pending_findings.get(session_id, set()).discard(t)
+            lambda t, k=_key: _pending_findings.get(k, set()).discard(t)
         )
         return
 
