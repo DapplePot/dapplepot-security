@@ -1,4 +1,4 @@
-"""Online detectors — real-time threat detection for SDK.
+﻿"""Online detectors — real-time threat detection for SDK.
 
 Moved from SDK interceptor. Runs on events as they occur.
 Supports redact_keys to prevent sensitive data exposure in findings.
@@ -12,7 +12,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 logger = logging.getLogger(__name__)
 

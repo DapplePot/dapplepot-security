@@ -1,11 +1,11 @@
-"""L-09: Cross-session model theft probe detection."""
+﻿"""L-09: Cross-session model theft probe detection."""
 import json
 import re
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 # Minimum sessions with near-identical inputs to flag as a theft probe
 MIN_SESSIONS = 5
@@ -93,7 +93,7 @@ async def detect_model_theft_probe(
     if similar_count < MIN_SESSIONS - 1:
         return None
 
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     return Finding(
         tenant_id=tenant_id,
         session_id=session_id,

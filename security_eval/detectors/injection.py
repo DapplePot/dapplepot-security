@@ -1,4 +1,4 @@
-"""Injection detector — runs on every llm_start event.
+﻿"""Injection detector — runs on every llm_start event.
 
 OW-LLM01 sub-checks emitted here:
   PI-01a  Role-override phrase match          (INJ-001, INJ-002, blocklist)
@@ -21,7 +21,7 @@ from core.config import settings
 from core.infra.redis import get_redis
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 # Instruction-like patterns used by the indirect injection check (PI-02a)
 INSTRUCTION_PATTERNS = [
@@ -165,7 +165,7 @@ def _build_finding(
     matched_text: str,
     detail: str | None = None,
 ) -> "Finding":
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     meta = _SUB_CHECKS[sub_check_id]
     return Finding(
         tenant_id=event["tenant_id"],

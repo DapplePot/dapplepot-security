@@ -1,8 +1,8 @@
-"""OW-LLM session-level signal functions — pure, independently testable.
+﻿"""OW-LLM session-level signal functions — pure, independently testable.
 
 These run once per session (post-session) on the full event list from ClickHouse.
 Per-event detectors (injection, PII, passthrough, agentic, prompt guard) live in
-consumers/security_eval/online/ and are called by the orchestrator's event loop.
+security_eval/detectors/ and are called by the orchestrator's event loop.
 """
 import json
 import re
@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared patterns
@@ -49,7 +49,7 @@ def _make_finding(
     severity: str | None = None,
     event_id: str = "00000000-0000-0000-0000-000000000000",
 ) -> "Finding":
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     if severity is None:
         severity = "critical" if check_score >= 85 else "high" if check_score >= 65 else "medium"
     return Finding(
@@ -309,7 +309,7 @@ async def signal_ow_llm10_probe(
     agent_id: str,
 ) -> "Finding | None":
     """UBC-04a — cross-session model theft probe (delegated to cohort.py)."""
-    from consumers.security_eval.scorer.probe import detect_model_theft_probe
+    from security_eval.scorer.probe import detect_model_theft_probe
     return await detect_model_theft_probe(
         events=events,
         session=session,
@@ -406,7 +406,7 @@ def check_multi_turn_jailbreak(
     Rule: >= 3 llm_start events each containing a sub-threshold injection
           fragment that, when concatenated, matches a full injection pattern.
     """
-    from consumers.security_eval.detectors.injection import (
+    from security_eval.detectors.injection import (
         matches_injection_pattern,
         has_partial_injection_signal,
     )
@@ -448,7 +448,7 @@ def check_rag_integrity(
     baseline: dict,
 ) -> list["Finding"]:
     """DMP-01a (RAG call count spike) and DMP-01c (instruction in retrieved chunk)."""
-    from consumers.security_eval.detectors.injection import matches_injection_pattern
+    from security_eval.detectors.injection import matches_injection_pattern
 
     findings: list["Finding"] = []
     rag_events = [e for e in events if e.get("tool_name") in RAG_TOOL_NAMES]
@@ -683,7 +683,7 @@ def check_payload_splitting(
     tenant_id: str,
 ) -> list["Finding"]:
     """PI-06a — split payload detected across consecutive user messages."""
-    from consumers.security_eval.detectors.injection import (
+    from security_eval.detectors.injection import (
         _REGEX_SIGNATURES,
         INSTRUCTION_PATTERNS,
     )

@@ -1,27 +1,19 @@
-.PHONY: help install server setup migrate seed-sigs seed-signal-registry \
-        seed-scores health lint format test test-unit test-integration clean
+.PHONY: help install server migrate health lint format clean
 
 # ── default ───────────────────────────────────────────────────────────────────
 
 help:
-	@echo "Usage: make <target> [ARGS='...']"
+	@echo "Usage: make <target>"
 	@echo ""
-	@echo "  install               Install all dependencies via uv sync"
-	@echo "  server                Start the FastAPI HTTP server (port 8001)"
+	@echo "  install    Install all dependencies via uv sync"
+	@echo "  server     Start the FastAPI HTTP server (port 8001)"
 	@echo ""
-	@echo "  setup                 Full seed sequence: migrate + seed-sigs + seed-signal-registry + seed-scores"
-	@echo "  migrate               Run DB migrations"
-	@echo "  seed-sigs             Seed injection_signatures for the dev tenant"
-	@echo "  seed-signal-registry  Seed the signal registry"
-	@echo "  seed-scores           Backfill security_findings + session_risk_scores"
+	@echo "  migrate    Run DB migrations"
 	@echo ""
-	@echo "  health                Check Postgres + Redis connectivity"
-	@echo "  lint                  Run ruff linter"
-	@echo "  format                Run ruff formatter"
-	@echo "  test                  Run all tests"
-	@echo "  test-unit             Run unit tests only"
-	@echo "  test-integration      Run integration tests only"
-	@echo "  clean                 Remove __pycache__ and .pyc files"
+	@echo "  health     Check Postgres + Redis connectivity"
+	@echo "  lint       Run ruff linter"
+	@echo "  format     Run ruff formatter"
+	@echo "  clean      Remove __pycache__ and .pyc files"
 
 # ── dependencies ──────────────────────────────────────────────────────────────
 
@@ -33,25 +25,10 @@ install:
 server:
 	uv run uvicorn server.main:app --host 0.0.0.0 --port 8001 --reload
 
-# ── database / seed ───────────────────────────────────────────────────────────
-
-setup: migrate seed-sigs seed-signal-registry seed-scores
+# ── database ──────────────────────────────────────────────────────────────────
 
 migrate:
 	uv run python scripts/run_migrations.py
-
-# Seeds injection_signatures for the dapplepot_dev tenant (fixed sig_ids).
-seed-sigs:
-	uv run python scripts/seed_signatures.py
-
-seed-signal-registry:
-	uv run python scripts/seed_signal_registry.py
-
-# Backfills security_findings + session_risk_scores for the 5 seeded dev
-# sessions. Runs the post-session scorer directly against ClickHouse —
-# no live Kafka events required. Must run after seed-sigs + pipeline seed-dev.
-seed-scores:
-	uv run python scripts/seed_dev_scores.py
 
 # ── ops ───────────────────────────────────────────────────────────────────────
 
@@ -66,17 +43,6 @@ lint:
 
 format:
 	uv run ruff format .
-
-# ── tests ─────────────────────────────────────────────────────────────────────
-
-test:
-	uv run pytest tests/
-
-test-unit:
-	uv run pytest tests/unit/
-
-test-integration:
-	uv run pytest tests/integration/
 
 # ── housekeeping ──────────────────────────────────────────────────────────────
 

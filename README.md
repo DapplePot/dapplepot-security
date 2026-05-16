@@ -12,9 +12,8 @@ FastAPI service that evaluates AI agent sessions for OWASP LLM Top 10 + Agentic 
 ```bash
 uv sync
 cp .env.example .env   # fill in connection strings
-make setup             # run migrations + seed signal registry + signatures + scores
+make migrate           # run DB migrations
 make server            # uvicorn server.main:app --port 8001 --reload
-make test-unit         # ~1,000+ assertions, no infra (~2 min)
 ```
 
 ## Environment Variables
@@ -61,7 +60,8 @@ The SDK sends `security_finding` events with `sub_check_id`, `trigger_event_id`,
 | `SID-01c` | OW-LLM02 | critical | deterministic |
 | `SID-02a` | OW-LLM02 | high | high |
 | `IOH-01a` | OW-LLM05 | critical | deterministic |
-| `EA-01a` | OW-LLM06 | — | — |
+| `EA-01a` | OW-LLM06 | high | deterministic |
+| `EA-02b` | OW-LLM06 | high | deterministic |
 
 ## Scoring Pipeline (`score_session`)
 
@@ -131,36 +131,23 @@ trust_score = int(100 × (1 − α/(α+β)))
 | File | Description |
 |------|-------------|
 | `server/main.py` | FastAPI app, `POST /v1/evaluate` route |
-| `consumers/security_eval/consumer.py` | `_handle_event()` — dispatch logic, `_ONLINE_SIGNAL_MAP` (keyed by sub_check_id) |
-| `consumers/security_eval/findings.py` | `Finding` dataclass + `write_findings()`, `write_session_action()` |
-| `consumers/security_eval/scorer/orchestrator.py` | `score_session()` — main scoring entry point |
-| `consumers/security_eval/scorer/llm_signals.py` | OW-LLM01–10 signal functions (~1,000 LOC) |
-| `consumers/security_eval/scorer/asi_signals.py` | OW-ASI01–10 signal functions (~1,300 LOC) |
-| `consumers/security_eval/scorer/attack_chains.py` | 7 attack chain patterns |
-| `consumers/security_eval/scorer/trust.py` | Bayesian agent trust scoring |
+| `security_eval/consumer.py` | `_handle_event()` — dispatch logic, `_ONLINE_SIGNAL_MAP` (keyed by sub_check_id) |
+| `security_eval/findings.py` | `Finding` dataclass + `write_findings()`, `write_session_action()` |
+| `security_eval/scorer/orchestrator.py` | `score_session()` — main scoring entry point |
+| `security_eval/scorer/llm_signals.py` | OW-LLM01–10 signal functions (~1,000 LOC) |
+| `security_eval/scorer/asi_signals.py` | OW-ASI01–10 signal functions (~1,300 LOC) |
+| `security_eval/scorer/attack_chains.py` | 7 attack chain patterns |
+| `security_eval/scorer/trust.py` | Bayesian agent trust scoring |
 | `core/security_config.py` | `AgentSecurityConfig`, `SubCheckOverride`, `push_agent_defaults()`, Redis cache |
-| `db/postgres/` | 26 migration files |
+| `db/postgres/` | 23 migration files |
 
 ## Make Targets
 
 ```bash
-make server           # uvicorn server.main:app --host 0.0.0.0 --port 8001 --reload
-make setup            # migrate + seed signal registry + seed signatures + seed scores
-make migrate          # run migrations only
-make seed-signal-registry  # upsert 156 sub-checks with confidence_tier
-make seed-sigs        # seed injection_signatures for dev tenant
-make test-unit        # no infra required, ~2 min
-make test-integration # needs docker compose up
-make test             # all tests
-make health           # check Postgres + Redis connectivity
-make lint             # ruff check
-make format           # ruff format
+make server    # uvicorn server.main:app --host 0.0.0.0 --port 8001 --reload
+make migrate   # run DB migrations
+make health    # check Postgres + Redis connectivity
+make lint      # ruff check
+make format    # ruff format
+make clean     # remove __pycache__ and .pyc files
 ```
-
-## Related Repos
-
-| Repo | Role |
-|------|------|
-| [dapplepot-sdk](../dapplepot-sdk) | Python SDK — sends `security_finding` events |
-| [dapplepot-api](../dapplepot-api) | Forwards events via `POST /v1/evaluate` |
-| [dapplepot-ui](../dapplepot-ui) | Displays findings, risk scores, agent profiles |

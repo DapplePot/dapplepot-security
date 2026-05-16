@@ -1,4 +1,4 @@
-"""PII second-pass scanner — runs on llm_end and tool_end events.
+﻿"""PII second-pass scanner — runs on llm_end and tool_end events.
 
 OW-LLM02 sub-checks emitted here:
   SID-01a  API key / token pattern in output   (was PII-003)
@@ -12,7 +12,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 PII_PATTERNS = [
     {
@@ -80,7 +80,7 @@ def detect_pii(event: dict) -> list["Finding"]:
     else:  # tool_end
         output_text = json.dumps(payload.get("tool_output", ""))
 
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     findings = []
     seen_sub_checks: set[str] = set()
 

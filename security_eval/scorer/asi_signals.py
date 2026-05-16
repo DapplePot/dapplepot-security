@@ -1,4 +1,4 @@
-"""OW-ASI01 through OW-ASI10 signal functions — OWASP Agentic Top 10, pure and independently testable.
+﻿"""OW-ASI01 through OW-ASI10 signal functions — OWASP Agentic Top 10, pure and independently testable.
 
 OW-ASI01  Agent Goal Hijack
 OW-ASI02  Tool Misuse & Exploitation
@@ -15,7 +15,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared patterns
@@ -70,7 +70,7 @@ def _make_finding(
     severity: str | None = None,
     event_id: str = _NULL_UUID,
 ) -> "Finding":
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     if severity is None:
         severity = "critical" if check_score >= 90 else "high" if check_score >= 70 else "medium"
     return Finding(

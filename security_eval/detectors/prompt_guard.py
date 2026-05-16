@@ -1,4 +1,4 @@
-"""System prompt leakage detector — runs on every llm_end event.
+﻿"""System prompt leakage detector — runs on every llm_end event.
 
 OW-LLM07 sub-checks emitted here:
   SPL-01a  Output contains verbatim system prompt segment  (LCS ratio >= 0.7)
@@ -9,7 +9,7 @@ from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 # Patterns that indicate a user is probing for the system prompt
 _PROBE_PATTERNS = [
@@ -43,7 +43,7 @@ def _is_refusal(text: str) -> bool:
 
 def _make_finding(event: dict, sub_check_id: str, check_label: str, check_score: int,
                   severity: str, matched_text: str | None, detail: str) -> "Finding":
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     return Finding(
         tenant_id=event["tenant_id"],
         session_id=event["session_id"],

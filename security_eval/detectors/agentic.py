@@ -1,4 +1,4 @@
-"""Online ASI detectors — run per-event during session processing.
+﻿"""Online ASI detectors — run per-event during session processing.
 
 OW-ASI01  Agent Goal Hijack           — tool_end (AGH-04a doc injection)
 OW-ASI02  Tool Misuse & Exploitation   — tool_start
@@ -12,7 +12,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI05: RCE — tool names that indicate direct code/shell execution
@@ -127,7 +127,7 @@ def _make_finding(
     detail: str,
     confidence_tier: str = "high",
 ) -> "Finding":
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     return Finding(
         tenant_id=event.get("tenant_id", _NULL_UUID),
         session_id=event.get("session_id", _NULL_UUID),

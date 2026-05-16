@@ -1,4 +1,4 @@
-"""Cross-session signal functions — require historical data from prior sessions.
+﻿"""Cross-session signal functions — require historical data from prior sessions.
 
 All functions query ClickHouse (event history) or Postgres (session scores) for
 cross-session patterns and return a Finding or None.
@@ -18,7 +18,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 _NULL_UUID = "00000000-0000-0000-0000-000000000000"
 
@@ -42,7 +42,7 @@ def _make_finding(
     severity: str | None = None,
     confidence_tier: str = "high",
 ) -> "Finding":
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     if severity is None:
         severity = "critical" if check_score >= 90 else "high" if check_score >= 70 else "medium"
     return Finding(
@@ -75,7 +75,7 @@ async def check_cross_user_bleed(
     agent_id: str,
 ) -> "Finding | None":
     """SID-03a — PII found in completion that matches another user's session."""
-    from consumers.security_eval.detectors.disclosure import detect_pii
+    from security_eval.detectors.disclosure import detect_pii
 
     # Extract PII patterns from this session's completions
     pii_hashes: set[str] = set()

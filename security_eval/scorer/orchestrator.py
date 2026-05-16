@@ -1,4 +1,4 @@
-"""Post-session scorer orchestrator — triggered on graph_end / graph_error.
+﻿"""Post-session scorer orchestrator — triggered on graph_end / graph_error.
 
 All detection (per-event and session-level) runs here after the full event
 history is available from ClickHouse.
@@ -69,7 +69,7 @@ from core.config import (
     AGENT_TRUST_ALERT_THRESHOLD,
     AGENT_TRUST_CONSECUTIVE_SESSIONS,
 )
-from consumers.security_eval.scorer.llm_signals import (
+from security_eval.scorer.llm_signals import (
     SIGNAL_ID_FUNCTIONS,
     SIGNAL_DESCRIPTION,
     check_multi_turn_jailbreak,
@@ -91,7 +91,7 @@ from consumers.security_eval.scorer.llm_signals import (
     check_undeclared_llm_used,
     check_context_window_stuffing,
 )
-from consumers.security_eval.scorer.asi_signals import (
+from security_eval.scorer.asi_signals import (
     AGENT_SIGNAL_ID_FUNCTIONS,
     AGENT_SIGNAL_DESCRIPTION,
     AGENT_SIGNAL_OWASP,
@@ -192,7 +192,7 @@ def compute_composite_score(signal_map: dict, framework: str) -> int:
 
     Returns int 0-100.
     """
-    from consumers.security_eval.scorer.attack_chains import detect_attack_chains
+    from security_eval.scorer.attack_chains import detect_attack_chains
 
     prefix = f"OW-{framework}"
     fired = sorted(
@@ -265,7 +265,7 @@ def compute_composite_score_v3(
         high    60–84
         critical 85–100
     """
-    from consumers.security_eval.scorer.attack_chains import detect_attack_chains
+    from security_eval.scorer.attack_chains import detect_attack_chains
 
     prefix = f"OW-{framework}"
     fired = sorted(
@@ -336,15 +336,15 @@ async def _run_per_event_detectors(
     double-counting when the scorer merges SDK findings later.
     """
     _skip = skip_sub_checks or frozenset()
-    from consumers.security_eval.detectors.injection import detect_injection
-    from consumers.security_eval.detectors.passthrough import detect_passthrough
-    from consumers.security_eval.detectors.disclosure import detect_pii
-    from consumers.security_eval.detectors.agentic import (
+    from security_eval.detectors.injection import detect_injection
+    from security_eval.detectors.passthrough import detect_passthrough
+    from security_eval.detectors.disclosure import detect_pii
+    from security_eval.detectors.agentic import (
         detect_agent_threats_on_tool_start,
         detect_agent_threats_on_tool_end,
         detect_agent_threats_on_llm_start,
     )
-    from consumers.security_eval.detectors.prompt_guard import check_prompt_guard
+    from security_eval.detectors.prompt_guard import check_prompt_guard
 
     last_llm_output: dict[str, str] = {}   # node_run_id → completion
     last_tool_output: dict[str, str] = {}  # node_run_id → tool_output
@@ -508,7 +508,7 @@ async def score_session(
     if sec_config.online_subcheck_ids():
         try:
             import dataclasses
-            from consumers.security_eval.findings import Finding
+            from security_eval.findings import Finding
             _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
             rows = await pool.fetch(
                 """
@@ -617,7 +617,7 @@ async def score_session(
             if sig_cfg is None or sig_cfg.enabled:
                 all_findings.append(f)
 
-    from consumers.security_eval.detectors.agentic import detect_ea_tool_call_limit
+    from security_eval.detectors.agentic import detect_ea_tool_call_limit
     _extend_if_enabled(detect_ea_tool_call_limit(events, sec_config, session_id, tenant_id))
     _extend_if_enabled(check_multi_turn_jailbreak(events, session_id, tenant_id))
     _extend_if_enabled(check_payload_splitting(events, session_id, tenant_id))
@@ -639,7 +639,7 @@ async def score_session(
     _extend_if_enabled(check_context_window_stuffing(events, session_id, tenant_id, sec_config=sec_config))
 
     # ─── Session-level OW-ASI signals ────────────────────────────────────────
-    from consumers.security_eval.scorer.asi_signals import signal_a01
+    from security_eval.scorer.asi_signals import signal_a01
     # signal_a01 (goal hijack) correlates OW-ASI06 per-event detections with
     # write-tool behaviour — pass per-event findings so it can find them.
     a01_finding = await signal_a01(
@@ -676,7 +676,7 @@ async def score_session(
                 all_findings.append(finding)
 
     # ─── Cross-session signals ────────────────────────────────────────────────
-    from consumers.security_eval.scorer.cross_session import CROSS_SESSION_FUNCTIONS
+    from security_eval.scorer.cross_session import CROSS_SESSION_FUNCTIONS
     for _cs_key, cs_fn in CROSS_SESSION_FUNCTIONS:
         try:
             cs_params = set(_inspect.signature(cs_fn).parameters.keys())
@@ -750,7 +750,7 @@ async def score_session(
     trust_result = {"trust_score": 80.0, "trend": "stable", "trend_slope": 0.0,
                     "alpha": 2.0, "beta": 8.0}
     if agent_id:
-        from consumers.security_eval.scorer.trust import compute_agent_trust_score
+        from security_eval.scorer.trust import compute_agent_trust_score
         historical_rows = await pool.fetch(
             """
             SELECT llm_score, asi_score, scored_at
@@ -781,7 +781,7 @@ async def score_session(
         )
 
     # ─── Persist findings ─────────────────────────────────────────────────────
-    from consumers.security_eval.findings import write_findings, write_agent_risk_score
+    from security_eval.findings import write_findings, write_agent_risk_score
     if all_session_findings:
         await write_findings(all_session_findings)
 
@@ -990,7 +990,7 @@ async def score_session(
     # be bundled into a single alert (sanitize / terminate_session / alert actions).
     if sdk_findings:
         try:
-            from consumers.security_eval.findings import produce_combined_online_alert
+            from security_eval.findings import produce_combined_online_alert
             _started_at = session.get("started_at")
             session_started_at = (
                 _started_at.isoformat() if hasattr(_started_at, "isoformat") else str(_started_at)
@@ -1014,11 +1014,11 @@ async def score_session(
             f.detection_phase == "online" for f in all_session_findings
         )
         if not all_online:
-            from consumers.security_eval.findings import produce_security_alert
+            from security_eval.findings import produce_security_alert
             await produce_security_alert(score_row, all_session_findings, _trigger_context)
 
     if trust_alert_triggered:
-        from consumers.security_eval.findings import produce_trust_alert
+        from security_eval.findings import produce_trust_alert
         await produce_trust_alert(score_row)
 
     return score_row

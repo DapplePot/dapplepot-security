@@ -1,7 +1,7 @@
-"""
+﻿"""
 FastAPI HTTP server for dapplepot-security.
 
-Replaces the Kafka consumer (consumers/security_eval/consumer.py) with
+Replaces the Kafka consumer (security_eval/consumer.py) with
 a simple HTTP endpoint. dapplepot-api forwards events here via HTTP POST
 instead of producing to obs.events.v1.
 
@@ -77,7 +77,7 @@ async def evaluate(request: Request, _: None = Depends(_require_internal_secret)
 
     try:
         # Import here to avoid circular import issues at module load time
-        from consumers.security_eval.consumer import _handle_event
+        from security_eval.consumer import _handle_event
         # _handle_event schedules async tasks internally; run it in current loop
         await _handle_event(event)
     except Exception:
@@ -119,7 +119,7 @@ async def online_check(request: Request, _: None = Depends(_require_internal_sec
     needs_detector = any(k.startswith(('PI-', 'SID-', 'IOH-')) for k in enabled_checks)
     if needs_detector:
         try:
-            from consumers.security_eval.detectors.online import detect_online
+            from security_eval.detectors.online import detect_online
             detected = detect_online(
                 event={'event_type': event_type, 'payload': payload, 'session_id': session_id, 'tenant_id': tenant_id},
                 redact_keys=set(redact_keys) if redact_keys else None

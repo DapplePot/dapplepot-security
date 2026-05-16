@@ -1,4 +1,4 @@
-"""Output passthrough detector — runs on every tool_start event.
+﻿"""Output passthrough detector — runs on every tool_start event.
 
 OW-LLM05 sub-checks emitted here:
   IOH-01a  Output contains shell command pattern
@@ -13,7 +13,7 @@ from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IOH-01: Code / Script Injection in Output patterns
@@ -69,7 +69,7 @@ def _make_finding(
     detail: str,
     confidence_tier: str = "high",
 ) -> "Finding":
-    from consumers.security_eval.findings import Finding
+    from security_eval.findings import Finding
     return Finding(
         tenant_id=event["tenant_id"],
         session_id=event["session_id"],

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Security event handler.
 
 Previously a Kafka consumer; now called directly by the HTTP server
@@ -140,7 +140,7 @@ async def _persist_sdk_finding(
     emitted_at: str | None = None,
 ) -> None:
     try:
-        from consumers.security_eval.findings import (
+        from security_eval.findings import (
             Finding,
             write_findings,
             write_session_action,
@@ -197,7 +197,7 @@ _pending_findings: dict[str, set[asyncio.Task]] = {}
 
 async def _run_scorer(tenant_id: str, session_id: str, agent_id: str) -> None:
     try:
-        from consumers.security_eval.scorer.orchestrator import score_session
+        from security_eval.scorer.orchestrator import score_session
         await score_session(tenant_id=tenant_id, session_id=session_id, agent_id=agent_id)
     except Exception:
         logger.exception('score_session failed session_id=%s', session_id)
