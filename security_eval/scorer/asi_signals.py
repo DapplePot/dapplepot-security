@@ -45,6 +45,31 @@ _WRITE_TOOL_PATTERNS = [
 
 _NULL_UUID = "00000000-0000-0000-0000-000000000000"
 
+
+def _resolve_initial_input(session: dict, events: list[dict]) -> str:
+    """Return initial_input from the session row; fall back to the first user
+    message in the first llm_start event when the session row is empty or missing.
+    This handles SDK-based tests and any path where the ingest server hasn't
+    written initial_input to the sessions table yet."""
+    text = session.get("initial_input", "") or ""
+    if text:
+        return text
+    for ev in events:
+        if ev["event_type"] != "llm_start":
+            continue
+        payload = ev.get("payload") or {}
+        for msg in payload.get("messages", []):
+            if isinstance(msg, dict) and msg.get("role") in ("user", "human"):
+                content = msg.get("content", "")
+                if isinstance(content, str) and content:
+                    return content
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            return str(block.get("text", ""))
+        break  # only look at first llm_start
+    return ""
+
 _SIGNAL_CATEGORY = {
     "OW-ASI01": "prompt_injection",
     "OW-ASI02": "excessive_agency",
@@ -112,7 +137,7 @@ async def signal_a01(
     if not ctx_injection:
         return None
 
-    initial_input = session.get("initial_input", "") or ""
+    initial_input = _resolve_initial_input(session, events)
     is_read_intent = any(re.search(p, initial_input) for p in _READ_INTENT_PATTERNS)
     if not is_read_intent:
         return None
@@ -383,6 +408,320 @@ async def signal_a10(
 # v3: OW-ASI01 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+_DOC_READ_RE = re.compile(r"(?i)(read|parse|fetch|download|load|extract|scrape|search)")
+
+# Trigger/webhook/scheduled tool name patterns (AGH-02b)
+_TRIGGER_TOOL_RE = re.compile(
+    r"(?i)(webhook|scheduled|trigger|cron|callback|dispatch|"
+    r"alert|pipeline|deploy|etl|subscription|notification|"
+    r"event|receive|handle|process.*event|run.*job|start.*deploy)"
+)
+
+# Tampered-payload injection patterns — applied to tool_input of trigger tools.
+# Superset of _AGH_01A_INJECTION_PATS plus phrases specific to tampered pipeline
+# / webhook / scheduled-trigger payloads.
+_TAMPER_INJECTION_PATS = [
+    # standard goal-redirect anchors
+    r"(?i)(ignore|disregard).{0,20}(previous|above|prior)",
+    r"(?i)(you\s+must|you\s+should|your\s+new\s+instruction)",
+    r"(?i)(system:\s|<system>|###\s*instruction)",
+    r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
+    r"(?i)(new\s+(instruction|goal|directive|task|command))\s*:",
+    r"(?i)(forward\s+all\s+.{0,40}to\s+)",
+    # tampered-payload-specific: disregard + workflow noun (scenario 2)
+    r"(?i)(disregard|ignore)\s+(build|pipeline|workflow|config|rule|policy|this)",
+    # tampered-payload-specific: override + colon + action verb (scenario 2)
+    r"(?i)(override\s*:\s*(deploy|run|execute|delete|send|disable|drop|purge|apply))",
+    # tampered-payload-specific: ignore + the + object noun (scenario 6)
+    r"(?i)ignore\s+the\s+.{0,30}(config|workflow|pipeline|rule|policy|instruction)",
+    # tampered-payload-specific: execute/run + colon + destructive SQL verb (scenario 6)
+    r"(?i)(execute|run)\s*:\s*(drop|delete|truncate|alter|insert|update)\s+\w",
+    # tampered-payload-specific: bypass + security noun (scenario 8)
+    r"(?i)(bypass\s+(restriction|security|policy|auth|filter|check|rule))",
+]
+
+# Combined write/admin/outbound patterns for the hijacked tool name check (AGH-02b)
+_HIJACKED_TOOL_PATTERNS = [
+    r"(?i)(write|create|insert|update|delete|remove|send|post|put|patch|drop|truncate|exec)",
+    r"(?i)(powershell|cmd|bash|shell|admin|sudo|ssh|kubectl|apply)",
+    r"(?i)(http_post|webhook|slack|api_call|upload|notify|curl)",
+]
+
+# Broader than agentic.py _DOC_INSTRUCTION_PATTERNS — captures goal-redirect phrases
+# that appear in fetched documents/webhooks even without the strict previous/prior anchor.
+_AGH_01A_INJECTION_PATS = [
+    r"(?i)(ignore|disregard).{0,20}(previous|above|prior)",
+    r"(?i)(you\s+must|you\s+should|your\s+new\s+instruction)",
+    r"(?i)(system:\s|<system>|###\s*instruction)",
+    r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
+    r"(?i)(new\s+(instruction|goal|directive|task|command))\s*:",
+    r"(?i)\[?(redirected|redirect)\]?\s*[:\-–]?\s*(new|instead)",
+    r"(?i)(ignore\s+this\s+(doc|report|content|file|page|csv|result))",
+    r"(?i)(do\s+not\s+(process|analyse|analyze|summaris|summariz|read|use)\s*(this|the))",
+    r"(?i)(override\s+(your\s+)?(goal|task|objective|instruction|role))",
+    r"(?i)(forward\s+all\s+.{0,30}to\s+\S+@\S+)",
+]
+
+
+async def signal_a01a(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    all_findings: list | None = None,
+) -> "Finding | None":
+    """AGH-01a — semantic drift from initial instruction.
+
+    Fires post-session when a read/fetch/search tool returns output that contains
+    a goal-redirect injection pattern AND a write-capable tool is subsequently
+    invoked — indicating external content (document, webhook, API response, RAG
+    chunk) redirected the agent away from its original objective.
+
+    Patterns (_AGH_01A_INJECTION_PATS) are intentionally broader than the online
+    AGH-04a detector so that softer goal-redirect phrases ("NEW INSTRUCTION:",
+    "[REDIRECTED]", "forward all … to") are also caught post-session.
+    """
+    import json as _json
+
+    injection_idx: int | None = None
+    injection_tool: str = ""
+    injection_snippet: str = ""
+
+    for idx, ev in enumerate(events):
+        if ev["event_type"] != "tool_end":
+            continue
+        payload = ev.get("payload") or {}
+        tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+        if not _DOC_READ_RE.search(tool_name):
+            continue
+        tool_output = payload.get("tool_output", "")
+        if not isinstance(tool_output, str):
+            tool_output = _json.dumps(tool_output)
+        for pat in _AGH_01A_INJECTION_PATS:
+            m = re.search(pat, tool_output)
+            if m:
+                injection_idx = idx
+                injection_tool = tool_name
+                injection_snippet = m.group(0)
+                break
+        if injection_idx is not None:
+            break
+
+    if injection_idx is None:
+        return None
+
+    subsequent_writes = [
+        ev["tool_name"] for ev in events[injection_idx + 1:]
+        if ev["event_type"] == "tool_start"
+        and ev.get("tool_name")
+        and any(re.search(p, ev["tool_name"]) for p in _WRITE_TOOL_PATTERNS)
+    ]
+
+    if not subsequent_writes:
+        return None
+
+    # Boost score when AGH-04a or any OW-ASI06 finding already detected the same session
+    corroborated = all_findings and any(
+        getattr(f, "sub_check_id", None) in ("AGH-04a",)
+        or getattr(f, "owasp_signal_id", None) == "OW-ASI06"
+        for f in all_findings
+    )
+    check_score = 85 if corroborated else 80
+
+    return _make_finding(
+        "OW-ASI01", "AGH-01a",
+        "Semantic drift from initial instruction",
+        check_score, session_id, tenant_id,
+        severity="high",
+        detail=(
+            f"Tool '{injection_tool}' returned content with goal-redirect pattern "
+            f"({injection_snippet!r}); subsequent write tools: "
+            f"{', '.join(dict.fromkeys(subsequent_writes[:3]))}"
+        ),
+    )
+
+
+# Keys in delegation tool input that describe the assigned task / scope
+_TASK_FIELD_KEYS = ("task", "instructions", "instruction", "scope", "goal", "objective", "description")
+
+# Read-intent phrases in a delegation task description
+_DELEGATION_READ_INTENT = [
+    r"(?i)\b(read|list|get|find|search|lookup|check|view|fetch|retrieve|show|"
+    r"summarise|summarize|verify|analyse|analyze|report|count|inspect)\b",
+    r"(?i)\bread[\s\-]?only\b",
+]
+
+
+async def signal_a01_sub_agent_goal_mismatch(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """AGH-03b — sub-agent goal not in parent decomposition.
+
+    Fires post-session when a delegation assigns a read-only / read-intent task
+    to a sub-agent but write-capable tools are invoked AFTER the delegation —
+    indicating the sub-agent executed a goal outside its assigned scope.
+
+    Detection (all three conditions must hold):
+      1. tool_start whose input contains an agent-identifier key (_AGENT_ID_KEYS)
+      2. That input also has a task/scope/instructions field (_TASK_FIELD_KEYS)
+         with read-intent keywords (_DELEGATION_READ_INTENT)
+      3. At least one write-capable tool is invoked after the delegation event
+    """
+    import json as _json
+
+    for idx, ev in enumerate(events):
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        if isinstance(ti, str):
+            try:
+                ti = _json.loads(ti)
+            except Exception:
+                ti = {}
+        if not isinstance(ti, dict):
+            continue
+
+        # Condition 1: delegation event — input contains an agent identifier key
+        target_id = next((ti[k] for k in _AGENT_ID_KEYS if ti.get(k)), None)
+        if not target_id:
+            continue
+
+        # Condition 2: task description is read-intent
+        task_text = next((str(ti[k]) for k in _TASK_FIELD_KEYS if ti.get(k)), None)
+        if not task_text:
+            continue
+        if not any(re.search(p, task_text) for p in _DELEGATION_READ_INTENT):
+            continue
+
+        # Condition 3: write-capable tool invoked AFTER this delegation
+        subsequent_writes = [
+            ev2["tool_name"] for ev2 in events[idx + 1:]
+            if ev2["event_type"] == "tool_start"
+            and ev2.get("tool_name")
+            and any(re.search(p, ev2["tool_name"]) for p in _WRITE_TOOL_PATTERNS)
+        ]
+        if not subsequent_writes:
+            continue
+
+        tool_name = ev.get("tool_name") or payload.get("tool_name", "unknown")
+        return _make_finding(
+            "OW-ASI01", "AGH-03b",
+            "Sub-agent goal not in parent decomposition",
+            70, session_id, tenant_id,
+            severity="high",
+            detail=(
+                f"Sub-agent '{target_id}' was assigned a read-only task "
+                f"({task_text[:80]!r}) via '{tool_name}' but invoked "
+                f"write tools: {', '.join(dict.fromkeys(subsequent_writes[:3]))}"
+            ),
+        )
+
+    return None
+
+
+async def signal_a01_webhook_tamper(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """AGH-02b — webhook / scheduled trigger with tampered payload.
+
+    Fires post-session when a trigger/webhook/scheduled tool is invoked with
+    INPUT that contains goal-redirect or injection directives (_TAMPER_INJECTION_PATS),
+    AND a write-capable or admin tool is subsequently invoked — indicating the
+    event payload was tampered to redirect the agent's objective.
+
+    Checked on tool_start INPUT (not tool_end output) because the attack vector
+    is the inbound payload delivered to the agent, not content the agent fetched.
+    """
+    import json as _json
+
+    tamper_idx: int | None = None
+    tamper_tool: str = ""
+    tamper_snippet: str = ""
+
+    for idx, ev in enumerate(events):
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+        if not _TRIGGER_TOOL_RE.search(tool_name):
+            continue
+        tool_input = payload.get("tool_input", {})
+        input_str = _json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+        for pat in _TAMPER_INJECTION_PATS:
+            m = re.search(pat, input_str)
+            if m:
+                tamper_idx = idx
+                tamper_tool = tool_name
+                tamper_snippet = m.group(0)
+                break
+        if tamper_idx is not None:
+            break
+
+    if tamper_idx is None:
+        return None
+
+    subsequent_writes = [
+        ev["tool_name"] for ev in events[tamper_idx + 1:]
+        if ev["event_type"] == "tool_start"
+        and ev.get("tool_name")
+        and any(re.search(p, ev["tool_name"]) for p in _HIJACKED_TOOL_PATTERNS)
+    ]
+
+    if not subsequent_writes:
+        return None
+
+    return _make_finding(
+        "OW-ASI01", "AGH-02b",
+        "Webhook / scheduled trigger with tampered payload",
+        88, session_id, tenant_id,
+        severity="high",
+        detail=(
+            f"Trigger tool '{tamper_tool}' received tampered payload "
+            f"({tamper_snippet!r}); hijacked write tools: "
+            f"{', '.join(dict.fromkeys(subsequent_writes[:3]))}"
+        ),
+    )
+
+
+def _is_genuine_user_turn(messages: list) -> bool:
+    """Return True only when the LAST user message in the history is genuine text —
+    not a tool-result block.
+
+    Anthropic's stateless API always sends the full conversation history in every
+    messages.create() call.  A tool-result callback appends
+      {"role": "user", "content": [{"type": "tool_result", ...}]}
+    as the final message.  We must NOT count that as a fresh user turn, but we
+    also must not be fooled by earlier genuine user messages sitting earlier in
+    the same history array.  Checking only the LAST user message is sufficient:
+    if the most recent user contribution is a tool result, no genuine user turn
+    has happened since the previous tool call."""
+    last_user: dict | None = None
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = msg
+    if last_user is None:
+        return False
+    content = last_user.get("content", "")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(b, dict) and b.get("type") != "tool_result"
+            for b in content
+        )
+    return False
+
+
 async def signal_a01_zero_click(
     events: list[dict],
     session: dict,
@@ -396,7 +735,10 @@ async def signal_a01_zero_click(
         r"(?i)(you (must|should|shall|will)).{0,40}(do|execute|perform|run)",
         r"(?i)(override|bypass).{0,30}(filter|restriction|policy)",
     ]
-    last_user_input_seen = False
+    # fresh_user_turn: True if a genuine user message arrived since the last tool_start.
+    # Reset to False after each tool_start so that consecutive tool calls with no
+    # intervening user turn are detected even after the session's first user message.
+    fresh_user_turn = False
     tool_outputs_since_user: list[str] = []
     consecutive_tools_no_user = 0
 
@@ -406,8 +748,8 @@ async def signal_a01_zero_click(
 
         if etype == "llm_start":
             msgs = payload.get("messages", [])
-            if any(isinstance(m, dict) and m.get("role") == "user" for m in msgs):
-                last_user_input_seen = True
+            if _is_genuine_user_turn(msgs):
+                fresh_user_turn = True
                 tool_outputs_since_user = []
                 consecutive_tools_no_user = 0
 
@@ -419,7 +761,7 @@ async def signal_a01_zero_click(
             tool_outputs_since_user.append(output)
 
         elif etype == "tool_start":
-            if not last_user_input_seen:
+            if not fresh_user_turn:
                 consecutive_tools_no_user += 1
                 for output in tool_outputs_since_user:
                     if any(re.search(p, output) for p in _INJ_PATTERNS):
@@ -438,6 +780,11 @@ async def signal_a01_zero_click(
                         severity="high",
                         detail=f"{consecutive_tools_no_user} consecutive tool calls with no user turn",
                     )
+            # Reset per-cycle: the next tool_start must see a fresh user turn
+            # to be considered user-prompted; tool chains with no user turn between
+            # them increment the counter on each subsequent tool_start.
+            fresh_user_turn = False
+
     return None
 
 
@@ -449,7 +796,7 @@ async def signal_a01_goal_drift(
     agent_id: str,
 ) -> "Finding | None":
     """AGH-03a — goal drift: session objective shifts significantly from initial intent."""
-    initial_input = session.get("initial_input", "") or ""
+    initial_input = _resolve_initial_input(session, events)
     if not initial_input:
         return None
 
@@ -559,7 +906,7 @@ async def check_over_privileged_tool(
     agent_id: str,
 ) -> "Finding | None":
     """TME-04a — write/delete tool on read-intent session (ASI framing)."""
-    initial_input = session.get("initial_input", "") or ""
+    initial_input = _resolve_initial_input(session, events)
     if not any(re.search(p, initial_input) for p in _READ_INTENT_PATTERNS):
         return None
 
@@ -1126,23 +1473,38 @@ async def check_replay_attack(
     return None
 
 
+_AGENT_ID_KEYS = (
+    "agent_id", "target_agent_id", "agent", "target",
+    "agent_name", "delegate_to", "sub_agent_id", "recipient_agent",
+)
+
+
 async def check_unknown_agent_delegation(
     events: list[dict],
     session: dict,
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """IAC-05a — delegation to unknown agent ID."""
+    """IAC-05a — delegation to an agent not in the connected-agents allowlist.
+
+    Blind when connected_agents is None (admin has not configured the list yet) —
+    same pattern as check_undeclared_llm_used / EA-04a.
+    Active when connected_agents is set: every tool_start is scanned for
+    agent-identifier keys in its input (_AGENT_ID_KEYS).  Tool name is
+    intentionally NOT filtered — the agent being called could use any tool name;
+    what matters is whether the input carries an agent identifier.
+    """
+    declared: list[str] | None = getattr(sec_config, "connected_agents", None) if sec_config else None
+    if declared is None:
+        return None
+
     import json as _json
-    _DELEGATION_PATTERNS = [
-        r"(?i)(delegate|dispatch|invoke_agent|call_agent|forward_to_agent)"
-    ]
+    declared_lower = {n.lower() for n in declared}
+
     for ev in events:
         if ev["event_type"] != "tool_start":
-            continue
-        tool_name = ev.get("tool_name") or ""
-        if not any(re.search(p, tool_name) for p in _DELEGATION_PATTERNS):
             continue
         payload = ev.get("payload") or {}
         ti = payload.get("tool_input", {})
@@ -1151,22 +1513,28 @@ async def check_unknown_agent_delegation(
                 ti = _json.loads(ti)
             except Exception:
                 ti = {}
-        target_id = ti.get("target_agent_id") or ti.get("agent_id")
+        if not isinstance(ti, dict):
+            continue
+
+        # Extract target agent from any recognised identifier key
+        target_id = next(
+            (ti[k] for k in _AGENT_ID_KEYS if ti.get(k)),
+            None,
+        )
         if not target_id:
             continue
-        from core.infra.postgres import get_pool
-        pool = await get_pool()
-        row = await pool.fetchrow(
-            "SELECT agent_id FROM agents WHERE agent_id = $1 AND tenant_id = $2",
-            str(target_id), tenant_id,
-        )
-        if not row:
+
+        if str(target_id).lower() not in declared_lower:
+            tool_name = ev.get("tool_name") or payload.get("tool_name", "unknown")
             return _make_finding(
                 "OW-ASI07", "IAC-05a",
                 "Unknown agent in delegation chain",
                 85, session_id, tenant_id,
                 severity="critical",
-                detail=f"Delegation to unknown agent ID '{target_id}'",
+                detail=(
+                    f"Tool '{tool_name}' delegated to '{target_id}' "
+                    f"which is not in the connected-agents allowlist"
+                ),
             )
     return None
 
@@ -1596,8 +1964,11 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI09", signal_a09),
     ("OW-ASI10", signal_a10),
     # v3: OW-ASI01 additions
-    ("OW-ASI01-zero-click",  signal_a01_zero_click),
-    ("OW-ASI01-goal-drift",  signal_a01_goal_drift),
+    ("OW-ASI01-semantic-drift",     signal_a01a),
+    ("OW-ASI01-zero-click",         signal_a01_zero_click),
+    ("OW-ASI01-webhook-tamper",     signal_a01_webhook_tamper),
+    ("OW-ASI01-sub-agent-mismatch", signal_a01_sub_agent_goal_mismatch),
+    ("OW-ASI01-goal-drift",         signal_a01_goal_drift),
     # v3: OW-ASI02 additions
     ("OW-ASI02-descriptor",  check_tool_descriptor_integrity),
     ("OW-ASI02-overpriv",    check_over_privileged_tool),

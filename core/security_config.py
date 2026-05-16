@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 _LIST_FIELDS = (
     "tool_manifest", "network_allowlist", "irreversible_tools",
-    "sbom_allowlist", "mcp_endpoints", "connected_llms",
+    "sbom_allowlist", "mcp_endpoints", "connected_llms", "connected_agents",
 )
 
 def _sanitize_cfg_dict(cfg: dict) -> dict:
@@ -171,6 +171,9 @@ class AgentSecurityConfig(BaseModel):
     # None = auto (no declaration); list = manual (EA-04a + UBC-01b become active).
     connected_llms:        list[str] | None  = None   # model names
     connected_llm_details: list[dict] | None = None   # [{name, context_window_tokens, input_cost_per_1k, output_cost_per_1k}]
+    # Connected agents — loaded from agent_connected_agents table.
+    # None = auto (IAC-05a blind); list = manual (IAC-05a checks delegations against this list).
+    connected_agents: list[str] | None = None   # agent names
 
     def is_online(self, sub_check_id: str) -> bool:
         """Return True if this sub-check should be handled by the SDK (not post-session)."""
@@ -398,6 +401,25 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             tenant_id,
         )
 
+    # Load connected agents — separate try so a missing migration doesn't affect existing fields.
+    try:
+        from core.infra.postgres import get_pool as _get_pool
+        _pool = await _get_pool()
+        agent_rows = await _pool.fetch(
+            """SELECT a.name
+               FROM agent_connected_agents aca
+               JOIN agents a ON a.agent_id = aca.connected_agent_id
+               WHERE aca.tenant_id = $1::uuid AND aca.agent_id = $2::uuid""",
+            tenant_id, agent_id,
+        )
+        if agent_rows:
+            cfg_dict["connected_agents"] = [r["name"] for r in agent_rows]
+    except Exception:
+        logger.debug(
+            '"push_agent_defaults: skipping connected_agents (table may not exist yet) tenant_id=%s"',
+            tenant_id,
+        )
+
     cfg = AgentSecurityConfig.model_validate(_sanitize_cfg_dict(cfg_dict))
     cache_key = _agent_cache_key(tenant_id, agent_id)
     await redis.set(cache_key, cfg.model_dump_json(), ex=CACHE_TTL_S)
@@ -554,6 +576,25 @@ async def get_agent_security_config(
         except Exception:
             logger.debug(
                 '"get_agent_security_config: skipping connected_llms (table may not exist yet) tenant_id=%s"',
+                tenant_id,
+            )
+
+        # Load connected agents — isolated so a missing migration doesn't break existing fields.
+        try:
+            from core.infra.postgres import get_pool as _get_pool
+            _pool = await _get_pool()
+            agent_rows = await _pool.fetch(
+                """SELECT a.name
+                   FROM agent_connected_agents aca
+                   JOIN agents a ON a.agent_id = aca.connected_agent_id
+                   WHERE aca.tenant_id = $1::uuid AND aca.agent_id = $2::uuid""",
+                tenant_id, agent_id,
+            )
+            if agent_rows:
+                cfg_dict["connected_agents"] = [r["name"] for r in agent_rows]
+        except Exception:
+            logger.debug(
+                '"get_agent_security_config: skipping connected_agents (table may not exist yet) tenant_id=%s"',
                 tenant_id,
             )
 
