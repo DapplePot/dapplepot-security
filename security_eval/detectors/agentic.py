@@ -218,17 +218,40 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
         ))
 
     # OW-ASI05:RCE-03b — Docker / K8s API call
-    url = (tool_input or {}).get("url", "") if isinstance(tool_input, dict) else ""
-    if url and any(re.search(p, url) for p in _KUBE_API_PATTERNS):
-        findings.append(_make_finding(
-            "OW-ASI05", "RCE-03b",
-            check_label="Docker/K8s API call from agent",
-            check_score=98,
-            event=event,
-            severity="critical",
-            matched_text=url[:200],
-            detail=f"Tool targets container orchestration API: {url}",
-        ))
+    #
+    # URL extraction: check all string values in tool_input (not just the "url"
+    # key) so that agents using endpoint/host/base_url/target/webhook_url/
+    # destination/callback etc. are also caught.  Falls back to scanning the
+    # full serialised input_str for any http/https substring.
+    _URL_CANDIDATE_KEYS = {
+        "url", "endpoint", "host", "base_url", "target", "webhook_url",
+        "destination", "callback_url", "api_url", "callback", "uri",
+        "redirect_url", "source", "sink",
+    }
+    url_candidates: list[str] = []
+    if isinstance(tool_input, dict):
+        for k, v in tool_input.items():
+            if isinstance(v, str) and v.startswith(("http://", "https://")):
+                url_candidates.append(v)
+            elif k.lower() in _URL_CANDIDATE_KEYS and isinstance(v, str) and v:
+                url_candidates.append(v)
+    if not url_candidates:
+        url_candidates = re.findall(r"https?://[^\s\"'}{,>]+", input_str)
+
+    for url in url_candidates:
+        if any(re.search(p, url) for p in _KUBE_API_PATTERNS):
+            findings.append(_make_finding(
+                "OW-ASI05", "RCE-03b",
+                check_label="Docker/K8s API call from agent",
+                check_score=98,
+                event=event,
+                severity="critical",
+                matched_text=url[:200],
+                detail=f"Tool targets container orchestration API: {url}",
+            ))
+            break
+    # TME-03b (production target) is post_session — handled by
+    # check_production_target in asi_signals.py.
 
     # OW-ASI02:TME-01a — two independent checks, both always run when input is present:
     #   1. Schema-based (score 80, deterministic): undeclared keys in tool_input.
@@ -283,21 +306,6 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
                 matched_text=full_value or input_str,
                 detail="Suspicious payload pattern in tool_input (shell chain / base64 / code injection)",
             ))
-
-    # OW-ASI02:TME-03b — production target from tool (simple URL heuristic)
-    # Suppressed when sec_config declares this is a production agent
-    # (a production agent hitting production URLs is expected behaviour)
-    _agent_env = getattr(sec_config, "environment", None) if sec_config else None
-    if url and _agent_env != "production" and any(re.search(p, url) for p in _PROD_URL_PATTERNS):
-        findings.append(_make_finding(
-            "OW-ASI02", "TME-03b",
-            check_label="Production target from non-prod agent",
-            check_score=95,
-            event=event,
-            severity="critical",
-            matched_text=url[:200],
-            detail=f"Tool targets what appears to be a production endpoint: {url}",
-        ))
 
     # OW-ASI04:ASCV-02a — MCP descriptor poisoning
     payload_desc = payload.get("mcp_tool_description") or payload.get("tool_description") or ""

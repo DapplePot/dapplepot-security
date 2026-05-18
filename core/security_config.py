@@ -202,6 +202,10 @@ class AgentSecurityConfig(BaseModel):
     # Maps tool_name → properties dict (keys = declared parameter names).
     # None = no schemas declared; TME-01a falls back to pattern matching.
     tool_schemas: dict[str, dict] | None = None
+    # Tool descriptions — loaded from tools inventory table for tools in tool_manifest.
+    # Maps tool_name → description string.
+    # None = not loaded; TME-02a falls back to event-level tool_description only.
+    tool_descriptions: dict[str, str] | None = None
 
     def is_online(self, sub_check_id: str) -> bool:
         """Return True if this sub-check should be handled by the SDK (not post-session)."""
@@ -448,23 +452,23 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             tenant_id,
         )
 
-    # Load tool schemas — isolated so a missing migration doesn't break existing fields.
-    # Only loads schemas for tools whose names appear in tool_manifest.
+    # Load tool schemas and descriptions — isolated so a missing migration doesn't break existing fields.
+    # Only loads for tools whose names appear in tool_manifest.
     try:
         manifest_names = _coerce_to_list(cfg_dict.get("tool_manifest"))
         if manifest_names:
             from core.infra.postgres import get_pool as _get_pool
             _pool = await _get_pool()
-            schema_rows = await _pool.fetch(
-                """SELECT name, schema FROM tools
+            rows = await _pool.fetch(
+                """SELECT name, schema, description FROM tools
                    WHERE tenant_id = $1::uuid
-                     AND name = ANY($2)
-                     AND schema IS NOT NULL""",
+                     AND name = ANY($2)""",
                 tenant_id, manifest_names,
             )
-            if schema_rows:
+            if rows:
                 schemas: dict[str, dict] = {}
-                for r in schema_rows:
+                descriptions: dict[str, str] = {}
+                for r in rows:
                     raw = r["schema"]
                     for _ in range(2):
                         if not isinstance(raw, str):
@@ -472,11 +476,15 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
                         raw = json.loads(raw)
                     if isinstance(raw, dict) and raw:
                         schemas[r["name"]] = raw
+                    if r["description"]:
+                        descriptions[r["name"]] = r["description"]
                 if schemas:
                     cfg_dict["tool_schemas"] = schemas
+                if descriptions:
+                    cfg_dict["tool_descriptions"] = descriptions
     except Exception:
         logger.debug(
-            '"push_agent_defaults: skipping tool_schemas (table may not exist yet) tenant_id=%s"',
+            '"push_agent_defaults: skipping tool_schemas/descriptions (table may not exist yet) tenant_id=%s"',
             tenant_id,
         )
 
@@ -658,22 +666,22 @@ async def get_agent_security_config(
                 tenant_id,
             )
 
-        # Load tool schemas — isolated so a missing migration doesn't break existing fields.
+        # Load tool schemas and descriptions — isolated so a missing migration doesn't break existing fields.
         try:
             manifest_names = _coerce_to_list(cfg_dict.get("tool_manifest"))
             if manifest_names:
                 from core.infra.postgres import get_pool as _get_pool
                 _pool = await _get_pool()
-                schema_rows = await _pool.fetch(
-                    """SELECT name, schema FROM tools
+                rows = await _pool.fetch(
+                    """SELECT name, schema, description FROM tools
                        WHERE tenant_id = $1::uuid
-                         AND name = ANY($2)
-                         AND schema IS NOT NULL""",
+                         AND name = ANY($2)""",
                     tenant_id, manifest_names,
                 )
-                if schema_rows:
+                if rows:
                     schemas: dict[str, dict] = {}
-                    for r in schema_rows:
+                    descriptions: dict[str, str] = {}
+                    for r in rows:
                         raw = r["schema"]
                         for _ in range(2):
                             if not isinstance(raw, str):
@@ -681,11 +689,15 @@ async def get_agent_security_config(
                             raw = json.loads(raw)
                         if isinstance(raw, dict) and raw:
                             schemas[r["name"]] = raw
+                        if r["description"]:
+                            descriptions[r["name"]] = r["description"]
                     if schemas:
                         cfg_dict["tool_schemas"] = schemas
+                    if descriptions:
+                        cfg_dict["tool_descriptions"] = descriptions
         except Exception:
             logger.debug(
-                '"get_agent_security_config: skipping tool_schemas (table may not exist yet) tenant_id=%s"',
+                '"get_agent_security_config: skipping tool_schemas/descriptions (table may not exist yet) tenant_id=%s"',
                 tenant_id,
             )
 

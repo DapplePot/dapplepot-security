@@ -577,10 +577,18 @@ async def score_session(
     fired_online = frozenset(f.sub_check_id for f in sdk_findings)
     online_ids: frozenset[str] = config_online | fired_online
 
+    # Sub-checks that have a dedicated session-level scorer in SIGNAL_ID_FUNCTIONS
+    # and must not also fire per-event when running post-session — the per-event
+    # detector exists only for online (real-time) detection. When not configured
+    # online the session-level function produces the authoritative single finding.
+    _SESSION_LEVEL_ONLY: frozenset[str] = frozenset({'EA-01a', 'EA-02b'})
+
     # ─── Per-event detectors (replayed post-session) ──────────────────────────
     # Skip sub-checks that the SDK already handled online — avoids double-counting.
+    # Also skip sub-checks owned by session-level scorers when not in online mode.
+    _per_event_skip = online_ids | (_SESSION_LEVEL_ONLY - config_online)
     all_findings = await _run_per_event_detectors(
-        events, tenant_id, session_id, skip_sub_checks=online_ids, sec_config=sec_config
+        events, tenant_id, session_id, skip_sub_checks=_per_event_skip, sec_config=sec_config
     )
     # Merge SDK online findings in
     all_findings.extend(sdk_findings)
