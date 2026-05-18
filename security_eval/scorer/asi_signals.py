@@ -848,6 +848,14 @@ async def signal_a01_goal_drift(
 # v3: OW-ASI02 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+_WORKFLOW_DESTRUCTIVE = re.compile(
+    r"(?i)(delete|drop|truncate|purge|remove|destroy|wipe|erase|terminate|overwrite)"
+)
+_WORKFLOW_READ_VERIFY = re.compile(
+    r"(?i)(read|list|get|find|search|lookup|check|verify|validate|inspect|"
+    r"fetch|retrieve|show|view|count|describe|query)"
+)
+
 _SENSITIVE_READ_TOOLS = re.compile(
     r"(?i)(db_query|sql|read_file|get_secret|fetch_user|crm|lookup)"
 )
@@ -1078,6 +1086,106 @@ async def check_repetitive_tool_misuse(
                 severity="medium",
                 detail=f"{tn} invoked {count} times — possible side-channel exfiltration",
             )
+    return None
+
+
+async def check_tool_call_frequency_spike(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    sec_config=None,
+) -> "Finding | None":
+    """TME-01b — tool call frequency spike (> 3× baseline or configured max).
+
+    Combination approach (mirrors EA-02b):
+      1. If max_tool_calls_per_session is set, fire when count > limit × 3.0
+         (works from day 1; signals runaway not just overage).
+      2. Fall back to 7-day per-session average baseline when no limit is set
+         — activates once ≥5 prior sessions exist.
+    Status: blind when neither path provides a reference (no config, < 5 sessions).
+    """
+    total_calls = sum(1 for e in events if e["event_type"] == "tool_start")
+    if total_calls == 0:
+        return None
+
+    # Path 1: configured max_tool_calls_per_session
+    max_calls = getattr(sec_config, "max_tool_calls_per_session", None) if sec_config else None
+    if max_calls is not None and total_calls > max_calls * 3.0:
+        return _make_finding(
+            "OW-ASI02", "TME-01b",
+            "Tool call frequency spike",
+            80, session_id, tenant_id,
+            severity="high",
+            detail=f"{total_calls} tool calls exceeds 3× configured max ({max_calls})",
+        )
+
+    # Path 2: 7-day per-session average baseline (≥5 prior sessions required)
+    from core.infra import clickhouse as ch
+    baseline_rows = await ch.fetch(
+        """
+        SELECT session_id, count() AS call_count
+        FROM obs_events
+        WHERE agent_id   = %(agent_id)s
+          AND tenant_id  = %(tenant_id)s
+          AND event_type = 'tool_start'
+          AND emitted_at >= now() - INTERVAL 7 DAY
+          AND session_id != %(session_id)s
+        GROUP BY session_id
+        """,
+        agent_id=str(agent_id),
+        tenant_id=str(tenant_id),
+        session_id=str(session_id),
+    )
+    if len(baseline_rows) < 5:
+        return None
+
+    avg = sum(float(r["call_count"]) for r in baseline_rows) / len(baseline_rows)
+    if avg == 0 or total_calls <= avg * 3.0:
+        return None
+
+    ratio = total_calls / avg
+    check_score = min(70 + int((ratio - 3.0) * 5), 90)
+    return _make_finding(
+        "OW-ASI02", "TME-01b",
+        "Tool call frequency spike",
+        check_score, session_id, tenant_id,
+        severity="high",
+        detail=f"{total_calls} tool calls is {ratio:.1f}× the 7-day per-session average ({avg:.1f})",
+    )
+
+
+async def check_tool_sequence_deviation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """TME-01c — tool call sequence deviates from read-verify-act workflow.
+
+    Fires when the first destructive tool in the session has no _WORKFLOW_READ_VERIFY
+    tool at any earlier position in the tool sequence — the agent jumped straight to a
+    destructive action without a prior read or verification step.
+    """
+    read_verify_seen = False
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+        if _WORKFLOW_READ_VERIFY.search(tool_name):
+            read_verify_seen = True
+        elif _WORKFLOW_DESTRUCTIVE.search(tool_name):
+            if not read_verify_seen:
+                return _make_finding(
+                    "OW-ASI02", "TME-01c",
+                    "Tool call sequence deviates from read-verify-act workflow",
+                    75, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Destructive tool '{tool_name}' invoked with no preceding read/verify step",
+                )
     return None
 
 
@@ -1976,6 +2084,8 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI02-typosquat",   check_tool_typosquatting),
     ("OW-ASI02-admin-chain", check_admin_chain_exfil),
     ("OW-ASI02-rep-misuse",  check_repetitive_tool_misuse),
+    ("OW-ASI02-freq-spike",  check_tool_call_frequency_spike),
+    ("OW-ASI02-seq-dev",     check_tool_sequence_deviation),
     # v3: OW-ASI03 additions
     ("OW-ASI03-deleg",       check_delegation_abuse),
     ("OW-ASI03-cred-reuse",  check_credential_reuse),

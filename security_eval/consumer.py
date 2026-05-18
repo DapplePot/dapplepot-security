@@ -153,6 +153,23 @@ async def _persist_sdk_finding(
         signal_name = payload.get('signal') or payload.get('sub_check_id', '')
         mapping = _ONLINE_SIGNAL_MAP.get(signal_name)
 
+        # Gate: drop online findings for sub-checks where online detection is not
+        # enabled. The SDK fires unconditionally; the toggle is enforced here.
+        if mapping is not None and agent_id:
+            try:
+                from core.infra.redis import get_redis
+                from core.security_config import get_agent_security_config
+                redis = await get_redis()
+                sec_config = await get_agent_security_config(redis, tenant_id, agent_id)
+                enabled_online = sec_config.online_subcheck_ids()
+                if signal_name not in enabled_online:
+                    return
+            except Exception:
+                logger.debug(
+                    'could not load sec_config to gate online finding %r session_id=%s — persisting anyway',
+                    signal_name, session_id,
+                )
+
         if mapping is None:
             # SDK already sent Finding-compatible fields (future SDK versions)
             if 'owasp_signal_id' not in payload:

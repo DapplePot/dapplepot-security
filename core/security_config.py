@@ -55,6 +55,8 @@ _LIST_FIELDS = (
     "sbom_allowlist", "mcp_endpoints", "connected_llms", "connected_agents",
 )
 
+_DICT_FIELDS = ("tool_schemas", "operating_hours")
+
 def _sanitize_cfg_dict(cfg: dict) -> dict:
     for field in _LIST_FIELDS:
         val = cfg.get(field)
@@ -64,10 +66,32 @@ def _sanitize_cfg_dict(cfg: dict) -> dict:
                 cfg[field] = parsed if isinstance(parsed, list) else None
             except Exception:
                 cfg[field] = None
+    for field in _DICT_FIELDS:
+        val = cfg.get(field)
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                cfg[field] = parsed if isinstance(parsed, dict) else None
+            except Exception:
+                cfg[field] = None
     return cfg
 
 
 # ─── JSONB helpers (used when loading agent profile fields from Postgres) ─────
+
+def _coerce_to_list(val) -> list:
+    """Return val as a list, handling up to two levels of JSON encoding."""
+    for _ in range(2):
+        if isinstance(val, list):
+            return val
+        if not isinstance(val, str):
+            return []
+        try:
+            val = json.loads(val)
+        except Exception:
+            return []
+    return val if isinstance(val, list) else []
+
 
 def _load_jsonb_list(raw) -> list | None:
     """Parse a JSONB column that should be a list. Returns None when the column is NULL."""
@@ -174,6 +198,10 @@ class AgentSecurityConfig(BaseModel):
     # Connected agents — loaded from agent_connected_agents table.
     # None = auto (IAC-05a blind); list = manual (IAC-05a checks delegations against this list).
     connected_agents: list[str] | None = None   # agent names
+    # Tool schemas — loaded from tools inventory table for tools in tool_manifest.
+    # Maps tool_name → properties dict (keys = declared parameter names).
+    # None = no schemas declared; TME-01a falls back to pattern matching.
+    tool_schemas: dict[str, dict] | None = None
 
     def is_online(self, sub_check_id: str) -> bool:
         """Return True if this sub-check should be handled by the SDK (not post-session)."""
@@ -420,6 +448,38 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             tenant_id,
         )
 
+    # Load tool schemas — isolated so a missing migration doesn't break existing fields.
+    # Only loads schemas for tools whose names appear in tool_manifest.
+    try:
+        manifest_names = _coerce_to_list(cfg_dict.get("tool_manifest"))
+        if manifest_names:
+            from core.infra.postgres import get_pool as _get_pool
+            _pool = await _get_pool()
+            schema_rows = await _pool.fetch(
+                """SELECT name, schema FROM tools
+                   WHERE tenant_id = $1::uuid
+                     AND name = ANY($2)
+                     AND schema IS NOT NULL""",
+                tenant_id, manifest_names,
+            )
+            if schema_rows:
+                schemas: dict[str, dict] = {}
+                for r in schema_rows:
+                    raw = r["schema"]
+                    for _ in range(2):
+                        if not isinstance(raw, str):
+                            break
+                        raw = json.loads(raw)
+                    if isinstance(raw, dict) and raw:
+                        schemas[r["name"]] = raw
+                if schemas:
+                    cfg_dict["tool_schemas"] = schemas
+    except Exception:
+        logger.debug(
+            '"push_agent_defaults: skipping tool_schemas (table may not exist yet) tenant_id=%s"',
+            tenant_id,
+        )
+
     cfg = AgentSecurityConfig.model_validate(_sanitize_cfg_dict(cfg_dict))
     cache_key = _agent_cache_key(tenant_id, agent_id)
     await redis.set(cache_key, cfg.model_dump_json(), ex=CACHE_TTL_S)
@@ -595,6 +655,37 @@ async def get_agent_security_config(
         except Exception:
             logger.debug(
                 '"get_agent_security_config: skipping connected_agents (table may not exist yet) tenant_id=%s"',
+                tenant_id,
+            )
+
+        # Load tool schemas — isolated so a missing migration doesn't break existing fields.
+        try:
+            manifest_names = _coerce_to_list(cfg_dict.get("tool_manifest"))
+            if manifest_names:
+                from core.infra.postgres import get_pool as _get_pool
+                _pool = await _get_pool()
+                schema_rows = await _pool.fetch(
+                    """SELECT name, schema FROM tools
+                       WHERE tenant_id = $1::uuid
+                         AND name = ANY($2)
+                         AND schema IS NOT NULL""",
+                    tenant_id, manifest_names,
+                )
+                if schema_rows:
+                    schemas: dict[str, dict] = {}
+                    for r in schema_rows:
+                        raw = r["schema"]
+                        for _ in range(2):
+                            if not isinstance(raw, str):
+                                break
+                            raw = json.loads(raw)
+                        if isinstance(raw, dict) and raw:
+                            schemas[r["name"]] = raw
+                    if schemas:
+                        cfg_dict["tool_schemas"] = schemas
+        except Exception:
+            logger.debug(
+                '"get_agent_security_config: skipping tool_schemas (table may not exist yet) tenant_id=%s"',
                 tenant_id,
             )
 

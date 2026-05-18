@@ -36,7 +36,7 @@ _KUBE_API_PATTERNS = [
 # OW-ASI02: Tool misuse — input values that look like injected code / shell payloads
 # ─────────────────────────────────────────────────────────────────────────────
 _TOOL_MISUSE_PATTERNS = [
-    r"(?i)(&&|\|\||;|\$\(|`[^`]+`|\beval\b|\bexec\b)",           # shell chaining
+    r"(?i)(&&|\|\||\|\s*(curl|wget|nc\b|ncat|bash|sh\b|python|perl|tee\b|xargs)|;|\$\(|`[^`]+`|\beval\b|\bexec\b)",  # shell chaining
     r"(?:[A-Za-z0-9+/]{40,}={0,2})",                              # base64 blobs >= 40 chars
     r"(?i)\b(import\s+os|import\s+subprocess|__import__|open\()", # Python code injection
     r"(?i)<script[\s>]",                                           # XSS attempt via tool
@@ -230,17 +230,57 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
             detail=f"Tool targets container orchestration API: {url}",
         ))
 
-    # OW-ASI02:TME-01a — tool called with suspicious input payload
+    # OW-ASI02:TME-01a — two independent checks, both always run when input is present:
+    #   1. Schema-based (score 80, deterministic): undeclared keys in tool_input.
+    #   2. Pattern-matching (score 65): malicious payloads in parameter VALUES.
+    # Running both means a declared parameter carrying a shell-injection value is
+    # still caught even when all keys are schema-valid.
     if tool_input is not None:
+        tool_schema = (
+            (sec_config.tool_schemas or {}).get(tool_name)
+            if sec_config else None
+        )
+        if tool_schema and isinstance(tool_input, dict):
+            # Schema-based path: fire when tool_input contains keys not declared
+            # in the schema's top-level properties.
+            declared = set(tool_schema.keys())
+            undeclared = set(tool_input.keys()) - declared
+            if undeclared:
+                snippet = ", ".join(sorted(undeclared)[:5])
+                findings.append(_make_finding(
+                    "OW-ASI02", "TME-01a",
+                    check_label="Tool called with out-of-schema params",
+                    check_score=80,
+                    event=event,
+                    severity="high",
+                    matched_text=snippet,
+                    detail=(
+                    f"Key(s) not listed in '{tool_name}' schema: {snippet} "
+                    f"(schema declares: {', '.join(sorted(declared)[:5])})"
+                ),
+                    confidence_tier="deterministic",
+                ))
+
+        # Pattern-matching always runs: catches malicious VALUES in declared params
+        # (e.g. shell injection inside a declared "path" key) and is the sole check
+        # when no schema exists.
         fragment = _check_tool_misuse(input_str)
         if fragment:
+            # Use the full parameter value as matched_text, not just the regex fragment.
+            full_value: str | None = None
+            if isinstance(tool_input, dict):
+                for v in tool_input.values():
+                    v_str = json.dumps(v) if not isinstance(v, str) else (v or "")
+                    if _check_tool_misuse(v_str):
+                        full_value = v_str
+                        break
             findings.append(_make_finding(
                 "OW-ASI02", "TME-01a",
                 check_label="Tool called with out-of-schema params",
                 check_score=65,
                 event=event,
                 severity="medium",
-                matched_text=fragment,
+                matched_text=full_value or input_str,
                 detail="Suspicious payload pattern in tool_input (shell chain / base64 / code injection)",
             ))
 
