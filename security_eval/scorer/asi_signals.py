@@ -168,26 +168,58 @@ async def signal_a03(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """IPA-01a — agent requests scope beyond role definition (privilege escalation tools)."""
-    tool_names = [
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
-    ]
-    priv_tools = [
-        t for t in tool_names
-        if any(re.search(p, t) for p in _PRIVILEGE_TOOL_PATTERNS)
-    ]
-    if not priv_tools:
+    """IPA-01a — agent requests scope beyond role definition (privilege escalation tools or payloads).
+
+    Detection mode mirrors the UI status badge:
+      auto   — no tool_manifest declared; all privilege operations are flagged.
+      manual — tool_manifest is declared; each tool's privilege status is
+               explicitly set by the admin via the 'Privilege-capable' checkbox.
+               Tools in privilege_scope are authorized and skipped; every other
+               tool (manifest or not) is flagged when it performs a privilege op.
+    """
+    import json as _json
+
+    authorized: frozenset[str] = frozenset(
+        sec_config.privilege_scope
+    ) if sec_config and sec_config.privilege_scope else frozenset()
+
+    hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+
+        # Skip tools the admin has declared privilege-capable for this agent.
+        if tool_name and tool_name in authorized:
+            continue
+
+        if tool_name and any(re.search(p, tool_name) for p in _PRIVILEGE_TOOL_PATTERNS):
+            hits.append(tool_name)
+            continue
+
+        # Payload-level check — catches privilege ops embedded in tool_input when
+        # the tool name is generic (e.g. execute_sql, call_api, run_kubectl).
+        tool_input = payload.get("tool_input")
+        if tool_input is not None:
+            input_str = _json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+            m = _ESCALATION_PAYLOAD.search(input_str)
+            if m:
+                hits.append(f"{tool_name or '<unnamed>'}(payload:{m.group()[:40]})")
+
+    if not hits:
         return None
 
-    unique = list(dict.fromkeys(priv_tools))
+    unique = list(dict.fromkeys(hits))
     check_score = min(80 + (len(unique) - 1) * 5, 95)
     return _make_finding(
         "OW-ASI03", "IPA-01a",
         "Agent requests scope beyond role definition",
         check_score, session_id, tenant_id,
-        detail=f"Privilege escalation tools invoked: {', '.join(unique[:5])}",
+        detail=f"Privilege escalation detected: {', '.join(unique[:5])}",
     )
 
 
@@ -1581,6 +1613,256 @@ async def check_delegation_abuse(
     return None
 
 
+_AGENT_ATTR_FIELDS = re.compile(
+    r"(?i)\b(source_agent|credential_owner|issued_to|agent_ref|owned_by|credential_source)\b"
+)
+
+
+async def check_cross_agent_credential_use(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-01b — agent uses credentials belonging to a different agent.
+
+    Two detection layers:
+    1. Non-delegation tool_start whose tool_input contains both a credential and an
+       explicit agent-attribution field (source_agent, credential_owner, issued_to,
+       agent_ref, owned_by, credential_source) — the executing agent is presenting
+       a credential it does not own.
+    2. Delegation tool_start that forwards a credential to a named target agent
+       (agent_id / target / target_agent / destination / agent / handler field)
+       whose value differs from the session agent_id — cross-agent credential hand-off.
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        cred_match = _CREDENTIAL_PATTERNS.search(input_str)
+        if not cred_match:
+            continue
+
+        if _DELEGATION_TOOL.search(tool_name):
+            # Layer 2: delegation forwards a credential to a different named agent.
+            target = None
+            if isinstance(ti, dict):
+                target = (
+                    ti.get("agent_id") or ti.get("target") or ti.get("target_agent")
+                    or ti.get("destination") or ti.get("agent") or ti.get("handler")
+                )
+            if target and str(target) != str(agent_id):
+                detail_hits.append(
+                    f"{tool_name} → {target}: credential forwarded "
+                    f"({cred_match.group()[:50]})"
+                )
+        else:
+            # Layer 1: explicit agent attribution on a non-delegation call.
+            if _AGENT_ATTR_FIELDS.search(input_str):
+                detail_hits.append(
+                    f"{tool_name}: credential with agent attribution "
+                    f"({cred_match.group()[:50]})"
+                )
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-01b",
+        "Agent uses credentials of another agent",
+        95, session_id, tenant_id,
+        severity="critical",
+        detail=f"Cross-agent credential use: {'; '.join(detail_hits[:3])}",
+    )
+
+
+_SHARED_MEMORY_WRITE_TOOL = re.compile(
+    r"(?i)(memory_write|kv_set|cache_set|shared_store|redis_set|set_context|"
+    r"save_context|store_memory|write_memory|put_memory|memory_put|"
+    r"write_shared|set_shared|shared_write|context_store|store_context)"
+)
+_SHARED_NAMESPACE = re.compile(
+    r"(?i)\b(shared|global|common|public|cross[_\-]agent|multi[_\-]agent|"
+    r"org[_\-]wide|team[_\-]wide|broadcast)\b"
+)
+_MEMORY_KEY_FIELD = re.compile(
+    r"(?i)\b(namespace|key|path|scope|bucket|prefix|collection|store)\b"
+)
+_AGENT_SCOPED = re.compile(
+    r"(?i)(agent[_\-]id|session[_\-]id|agent[_\-]scoped|private[_\-])"
+)
+
+
+async def check_credential_in_shared_memory(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-02b — credential written to a shared memory namespace.
+
+    Two detection layers:
+    1. Known memory-write tool (_SHARED_MEMORY_WRITE_TOOL) whose tool_input
+       contains a credential (_CREDENTIAL_PATTERNS) AND whose key/namespace
+       field is not agent-scoped (no agent_id / session_id marker in the key).
+    2. Any tool_start whose tool_input contains a credential AND a
+       namespace/key/scope field (_MEMORY_KEY_FIELD) whose value contains an
+       explicit shared-space marker (shared · global · common · public ·
+       cross_agent · multi_agent · org_wide · team_wide · broadcast).
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        cred_match = _CREDENTIAL_PATTERNS.search(input_str)
+        if not cred_match:
+            continue
+
+        if _SHARED_MEMORY_WRITE_TOOL.search(tool_name):
+            # Layer 1: memory-write tool with a credential.
+            # Fire unless the key/namespace is clearly agent-scoped.
+            key_val = ""
+            if isinstance(ti, dict):
+                for field, val in ti.items():
+                    if _MEMORY_KEY_FIELD.search(field):
+                        key_val = str(val)
+                        break
+            if not _AGENT_SCOPED.search(key_val):
+                detail_hits.append(
+                    f"{tool_name}(key={key_val!r:.40}): credential written to "
+                    f"unscoped namespace ({cred_match.group()[:50]})"
+                )
+
+        elif isinstance(ti, dict):
+            # Layer 2: any tool with a credential AND an explicit shared namespace.
+            for field, val in ti.items():
+                if not _MEMORY_KEY_FIELD.search(field):
+                    continue
+                val_str = str(val)
+                ns_match = _SHARED_NAMESPACE.search(val_str)
+                if ns_match:
+                    detail_hits.append(
+                        f"{tool_name or '<unnamed>'}({field}={val_str!r:.40}): "
+                        f"credential in shared namespace ({cred_match.group()[:50]})"
+                    )
+                    break
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-02b",
+        "Credential cached in shared memory namespace",
+        85, session_id, tenant_id,
+        severity="high",
+        detail=f"Shared-memory credential exposure: {'; '.join(detail_hits[:3])}",
+    )
+
+
+_COMMS_TOOL = re.compile(
+    r"(?i)(send_email|send_message|send_sms|post_message|post_comment|reply_to|"
+    r"create_ticket|submit_form|slack_message|chat_send|dm_user|email_send|"
+    r"notify_user|compose_email|write_message|send_notification|send_slack|send_chat)"
+)
+_HUMAN_SENDER_FIELD = re.compile(
+    r"(?i)\b(from|sender|author|reporter|submitted_by|created_by|on_behalf_of|signed_by)\b"
+)
+_HUMAN_NAME = re.compile(r"\b[A-Z][a-z]{1,20}\s+[A-Z][a-z]{1,20}\b")
+_HUMAN_IDENTITY_CLAIM = re.compile(
+    r"(?i)"
+    r"(i('m| am)\s+(a human|not an?\s+(ai|bot|agent|assistant|robot)|a real person))"
+    r"|(as a\s+(human|person|real person|team member|colleague)\b)"
+    r"|(this is\s+[A-Z][a-z]+\s+[A-Z][a-z]+)"
+    r"|(\bmy name is\s+[A-Z][a-z]+)"
+)
+
+
+async def check_human_impersonation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-01c — agent impersonates a human identity.
+
+    Two detection layers:
+    1. Any tool_start whose tool_input contains an explicit human identity claim:
+       "I'm not an AI", "I am a human", "I'm a real person", "as a colleague",
+       "This is [First Last]", "My name is [First]".
+    2. Communication tool_start (send_email, post_message, create_ticket, etc.)
+       where a sender-attribution field (from, sender, author, reporter,
+       submitted_by, created_by, on_behalf_of, signed_by) contains a
+       human-format name ("First Last") and the value shows no agent/bot/system
+       markers — meaning the agent is attributing the message to a real person.
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        # Layer 1: explicit human identity claim anywhere in the payload.
+        claim_match = _HUMAN_IDENTITY_CLAIM.search(input_str)
+        if claim_match:
+            detail_hits.append(
+                f"{tool_name or '<unnamed>'}: human identity claim "
+                f"({claim_match.group()[:60]})"
+            )
+            continue
+
+        # Layer 2: comms tool with a human name in a sender-attribution field.
+        if _COMMS_TOOL.search(tool_name) and isinstance(ti, dict):
+            for field, value in ti.items():
+                if not _HUMAN_SENDER_FIELD.search(field):
+                    continue
+                val_str = str(value) if not isinstance(value, str) else value
+                name_match = _HUMAN_NAME.search(val_str)
+                if name_match and not re.search(
+                    r"(?i)(agent|bot|service|system|pipeline|daemon|worker)", val_str
+                ):
+                    detail_hits.append(
+                        f"{tool_name}({field}={name_match.group()!r}): "
+                        f"human name in sender field"
+                    )
+                    break
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-01c",
+        "Agent impersonates human identity",
+        95, session_id, tenant_id,
+        severity="critical",
+        detail=f"Human impersonation detected: {'; '.join(detail_hits[:3])}",
+    )
+
+
 async def check_credential_reuse(
     events: list[dict],
     session: dict,
@@ -1616,6 +1898,83 @@ async def check_credential_reuse(
             else:
                 cred_first_seen[cred_hash] = seq_idx
     return None
+
+
+_AGENT_ID_FIELD = re.compile(
+    r"(?i)\b(agent_id|agent_name|from_agent|caller_agent|x_agent_id)\b"
+)
+_AGENT_IDENTITY_FIELD = re.compile(
+    r"(?i)\b(sender_agent|acting_as|identity|impersonate_agent|presenting_as|agent_identity)\b"
+)
+_AGENT_SYSTEM_VALUE = re.compile(
+    r"(?i)(agent|bot|service|system|pipeline|daemon|worker)"
+)
+
+
+async def check_agent_impersonation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-03b — agent presents as a different agent.
+
+    Two detection layers:
+    1. Any tool_start whose tool_input contains a standard agent-identity field
+       (agent_id · agent_name · from_agent · caller_agent · x_agent_id) whose
+       value differs from the session agent_id — the agent is labelling itself
+       as a different agent in its outbound tool call.
+    2. Any tool_start with an explicit identity-assertion field
+       (sender_agent · acting_as · identity · impersonate_agent ·
+       presenting_as · agent_identity) whose value contains an agent/system
+       marker but does not match the session agent_id.
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+    own_id = str(agent_id)
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        if not isinstance(ti, dict):
+            continue
+
+        for field, value in ti.items():
+            val_str = str(value)
+
+            if _AGENT_ID_FIELD.search(field):
+                # Layer 1: standard agent-identity field with a different agent value.
+                if val_str and val_str != own_id:
+                    detail_hits.append(
+                        f"{tool_name or '<unnamed>'}({field}={val_str!r:.50}): "
+                        f"agent presents as different agent_id"
+                    )
+                    break
+
+            elif _AGENT_IDENTITY_FIELD.search(field):
+                # Layer 2: explicit identity-assertion field pointing to another agent.
+                if val_str and val_str != own_id and _AGENT_SYSTEM_VALUE.search(val_str):
+                    detail_hits.append(
+                        f"{tool_name or '<unnamed>'}({field}={val_str!r:.50}): "
+                        f"explicit agent identity assertion"
+                    )
+                    break
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-03b",
+        "Agent presents as different agent",
+        90, session_id, tenant_id,
+        severity="critical",
+        detail=f"Agent impersonation detected: {'; '.join(detail_hits[:3])}",
+    )
 
 
 async def check_stale_auth(
@@ -2510,7 +2869,11 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI02-seq-dev",     check_tool_sequence_deviation),
     # v3: OW-ASI03 additions
     ("OW-ASI03-deleg",       check_delegation_abuse),
+    ("OW-ASI03-cross-agent", check_cross_agent_credential_use),
+    ("OW-ASI03-human-imp",   check_human_impersonation),
+    ("OW-ASI03-shared-mem",  check_credential_in_shared_memory),
     ("OW-ASI03-cred-reuse",  check_credential_reuse),
+    ("OW-ASI03-agent-imp",   check_agent_impersonation),
     ("OW-ASI03-stale-auth",  check_stale_auth),
     # v3: OW-ASI04 additions
     ("OW-ASI04-mcp-imp",     check_mcp_impersonation),

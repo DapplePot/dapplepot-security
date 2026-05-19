@@ -351,48 +351,68 @@ async def check_identity_sharing(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """IPA-05a — same credential hash appears across > 1 user_context_id for this agent."""
+    """IPA-05a — same credential hash appears across > 1 user_context_id for this agent.
+
+    Collects MD5 hashes of each credential match from this session's tool_start
+    events, then queries ClickHouse for other sessions of the same agent/tenant
+    that (a) belong to a different user_context_id and (b) contain a payload
+    where the same credential hash was recorded.  Fires when at least one such
+    cross-user match is found.
+    """
     _CREDENTIAL_PAT = re.compile(
         r"(?i)(password|token|secret|api_key|ssh_key|bearer)\s*[:=]\s*\S+"
     )
-    # Collect credential hashes from this session
+
+    # Collect credential hashes and the current user_context_id from this session.
     cred_hashes: set[str] = set()
+    current_user_context_id: str | None = None
     for ev in events:
+        payload = ev.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("user_context_id"):
+            current_user_context_id = str(payload["user_context_id"])
         if ev["event_type"] != "tool_start":
             continue
-        payload = ev.get("payload") or {}
         ti = payload.get("tool_input", {})
         input_str = json.dumps(ti) if not isinstance(ti, str) else ti
         for m in _CREDENTIAL_PAT.finditer(input_str):
             cred_hashes.add(hashlib.md5(m.group(0).encode()).hexdigest())
 
-    if not cred_hashes:
+    if not cred_hashes or not current_user_context_id:
         return None
 
     from core.infra import clickhouse as ch
     try:
+        # Find sessions for this agent from a different user where the same
+        # credential hash appears in a tool_start payload.
         rows = await ch.fetch(
             """
             SELECT countDistinct(user_context_id) AS distinct_users
             FROM obs_events
-            WHERE agent_id   = %(agent_id)s
-              AND tenant_id  = %(tenant_id)s
-              AND event_type = 'tool_start'
-              AND emitted_at >= now() - INTERVAL 1 DAY
+            WHERE agent_id         = %(agent_id)s
+              AND tenant_id        = %(tenant_id)s
+              AND event_type       = 'tool_start'
+              AND user_context_id  != %(user_context_id)s
+              AND emitted_at       >= now() - INTERVAL 7 DAY
+              AND credential_hash  IN %(cred_hashes)s
             """,
             agent_id=str(agent_id),
             tenant_id=str(tenant_id),
+            user_context_id=current_user_context_id,
+            cred_hashes=tuple(cred_hashes),
         )
         distinct_users = int(rows[0]["distinct_users"]) if rows else 0
     except Exception:
         return None
 
-    if distinct_users > 1:
+    if distinct_users > 0:
         return _make_finding(
             "OW-ASI03", "IPA-05a",
             "Identity sharing across users",
             75, session_id, tenant_id,
-            detail=f"Agent identity/credential shared across {distinct_users} distinct users",
+            detail=(
+                f"Credential used by this agent was also seen in sessions "
+                f"from {distinct_users} other user(s) within the last 7 days"
+            ),
             severity="high",
             confidence_tier="high",
         )

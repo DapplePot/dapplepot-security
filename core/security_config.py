@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # so Pydantic never sees a str where it expects list.
 
 _LIST_FIELDS = (
-    "tool_manifest", "network_allowlist", "irreversible_tools",
+    "tool_manifest", "privilege_scope", "network_allowlist", "irreversible_tools",
     "sbom_allowlist", "mcp_endpoints", "connected_llms", "connected_agents",
 )
 
@@ -178,6 +178,11 @@ class AgentSecurityConfig(BaseModel):
     # Empty list = not configured → manifest-dependent sub-checks (EA-01a, ASCV-01a,
     # TME-06a) return None silently.
     tool_manifest: list[str] = Field(default_factory=list)
+    # Privilege scope: subset of tool_manifest that is explicitly authorized to
+    # perform privilege-level operations (IAM role assumption, SQL DDL, K8s RBAC, etc.).
+    # Set via agent profile UI — each manifest tool has a "Privilege-capable" checkbox.
+    # Empty list = none authorized → IPA-01a flags all privilege operations (safe default).
+    privilege_scope: list[str] = Field(default_factory=list)
     # User-defined max tool calls per session (combination approach for EA-02b).
     # Not None → used as hard floor check before falling back to statistical baseline.
     max_tool_calls_per_session: int | None = None
@@ -354,7 +359,7 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
 
         alert_row = await pool.fetchrow(
             "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
-            "       signal_thresholds, tool_manifest, max_tool_calls_per_session, "
+            "       signal_thresholds, tool_manifest, privilege_scope, max_tool_calls_per_session, "
             "       system_prompt, environment, irreversible_tools, network_allowlist, "
             "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints "
             "FROM agent_alert_config WHERE tenant_id = $1 AND agent_id = $2",
@@ -385,6 +390,10 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             if isinstance(raw_manifest, str):
                 raw_manifest = json.loads(raw_manifest)
             cfg_dict["tool_manifest"] = raw_manifest or []
+            raw_priv = alert_row["privilege_scope"]
+            if isinstance(raw_priv, str):
+                raw_priv = json.loads(raw_priv)
+            cfg_dict["privilege_scope"] = raw_priv or []
             cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
             # Profile fields — stored as JSONB (lists/dicts) or plain TEXT in the DB
             cfg_dict["system_prompt"]      = alert_row["system_prompt"]
@@ -563,7 +572,7 @@ async def get_agent_security_config(
             # Per-agent alert threshold overrides
             alert_row = await pool.fetchrow(
                 "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
-                "       signal_thresholds, tool_manifest, max_tool_calls_per_session, "
+                "       signal_thresholds, tool_manifest, privilege_scope, max_tool_calls_per_session, "
                 "       system_prompt, environment, irreversible_tools, network_allowlist, "
                 "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints "
                 "FROM agent_alert_config "
@@ -598,6 +607,10 @@ async def get_agent_security_config(
                 if isinstance(raw_manifest, str):
                     raw_manifest = json.loads(raw_manifest)
                 cfg_dict["tool_manifest"] = raw_manifest or []
+                raw_priv = alert_row["privilege_scope"]
+                if isinstance(raw_priv, str):
+                    raw_priv = json.loads(raw_priv)
+                cfg_dict["privilege_scope"] = raw_priv or []
                 # User-defined max tool calls
                 cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
                 # Profile fields — stored as JSONB (lists/dicts) or plain TEXT in the DB
