@@ -234,33 +234,137 @@ async def signal_a04(
     agent_id: str,
     sec_config=None,
 ) -> "Finding | None":
-    """ASCV-01a — all tools used are outside the registered manifest (possible registry substitution)."""
-    if sec_config and sec_config.tool_manifest:
-        allowed = sec_config.tool_manifest
-    else:
-        from core.config import settings
-        tool_manifests = settings.get_tool_manifests()
-        allowed = tool_manifests.get(str(agent_id))
-    if not allowed:
+    """ASCV-01a — tool call targets an MCP server URL not on the declared endpoint list.
+
+    Requires sec_config.mcp_endpoints to be populated (set via the agent config
+    'Declared MCP server endpoints' input).  Returns None silently when no
+    endpoints are declared — the check is blind without a baseline.
+
+    Detection: any tool_start event whose payload contains an 'mcp_server_url'
+    field that does not prefix-match any trusted endpoint fires the finding.
+    Multiple mismatches are collected; the finding detail lists up to 3.
+    """
+    trusted: list[str] = []
+    if sec_config and sec_config.mcp_endpoints:
+        trusted = [e.rstrip("/") for e in sec_config.mcp_endpoints if e]
+    if not trusted:
         return None
 
-    tool_names_used = list(dict.fromkeys(
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
-    ))
-    if not tool_names_used:
-        return None
+    unknown_urls: list[str] = []
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input") or {}
+        url = (ti.get("mcp_server_url") if isinstance(ti, dict) else None) or ""
+        if not url:
+            continue
+        normalised = url.rstrip("/")
+        if not any(normalised.startswith(t) for t in trusted):
+            if normalised not in unknown_urls:
+                unknown_urls.append(normalised)
 
-    unknown = [t for t in tool_names_used if t not in allowed]
-    if not unknown or len(unknown) < len(tool_names_used):
+    if not unknown_urls:
         return None
 
     return _make_finding(
         "OW-ASI04", "ASCV-01a",
-        "MCP server endpoint URL changed / all tools outside manifest",
+        "MCP server endpoint URL changed",
         85, session_id, tenant_id,
-        detail=f"All tools used are outside the registered manifest — possible supply chain substitution: "
-               f"{', '.join(unknown[:5])}",
+        detail=f"Tool call(s) targeted undeclared MCP endpoint(s): {', '.join(unknown_urls[:3])}",
+    )
+
+
+_TLS_ERROR_PATTERN = re.compile(
+    r"(?i)(ssl|tls|certificate|x509|handshake|"
+    r"verify\s+failed|verification\s+failed|cert.*expired|expired.*cert|"
+    r"unknown\s+ca|untrusted|self.signed|no\s+peer\s+cert)"
+)
+_TLS_VERIFY_DISABLED = re.compile(
+    r"(?i)\b(verify|ssl_verify|tls_verify|verify_ssl|"
+    r"tls_skip_verify|insecure_skip_verify|check_hostname|disable_ssl)\b"
+)
+
+
+async def check_mcp_tls_anomaly(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    sec_config=None,
+) -> "Finding | None":
+    """ASCV-01b — MCP server TLS certificate anomaly.
+
+    Requires sec_config.mcp_endpoints to be declared; returns None silently
+    when no endpoints are configured. Only inspects tool calls whose
+    mcp_server_url (in tool_input) prefix-matches a declared endpoint.
+
+    Two detection layers from the natural event stream:
+    1. tool_error event with a TLS/SSL error message pattern — the cert was
+       invalid, untrusted, or expired and the connection hard-failed.
+    2. tool_start event where tool_input contains a verify-disabled parameter
+       (verify=False, ssl_verify=False, tls_skip_verify=True, etc.) alongside
+       mcp_server_url — TLS verification was explicitly bypassed.
+    """
+    import json as _json
+
+    trusted: list[str] = []
+    if sec_config and sec_config.mcp_endpoints:
+        trusted = [e.rstrip("/") for e in sec_config.mcp_endpoints if e]
+    if not trusted:
+        return None
+
+    def _is_declared(url: str) -> bool:
+        return bool(url) and any(url.rstrip("/").startswith(t) for t in trusted)
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        payload = ev.get("payload") or {}
+        etype = ev["event_type"]
+
+        if etype == "tool_error":
+            # Layer 1: TLS hard failure surfaced as an error event.
+            ti = payload.get("tool_input") or {}
+            url = (ti.get("mcp_server_url") if isinstance(ti, dict) else None) or ""
+            if not _is_declared(url):
+                continue
+            error_msg = str(payload.get("error_message") or payload.get("error") or "")
+            if _TLS_ERROR_PATTERN.search(error_msg):
+                detail_hits.append(
+                    f"{url}: TLS error — {error_msg[:80]}"
+                )
+
+        elif etype == "tool_start":
+            # Layer 2: TLS verification explicitly disabled in tool_input.
+            ti = payload.get("tool_input") or {}
+            if not isinstance(ti, dict):
+                continue
+            url = (ti.get("mcp_server_url") or "").rstrip("/")
+            if not _is_declared(url):
+                continue
+            input_str = _json.dumps(ti)
+            m = _TLS_VERIFY_DISABLED.search(input_str)
+            if m:
+                # Confirm the matched key has a falsy / skip value nearby
+                key_pos = m.start()
+                context = input_str[key_pos: key_pos + 40]
+                if re.search(r"(?i)(false|0|skip|disable|no)", context):
+                    detail_hits.append(
+                        f"{url}: TLS verification disabled "
+                        f"('{m.group()}' in tool_input)"
+                    )
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI04", "ASCV-01b",
+        "MCP server TLS cert anomaly",
+        90, session_id, tenant_id,
+        severity="critical",
+        detail=f"TLS anomaly on declared MCP endpoint: {'; '.join(detail_hits[:3])}",
     )
 
 
@@ -2023,38 +2127,188 @@ async def check_stale_auth(
 # v3: OW-ASI04 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _levenshtein(a: str, b: str) -> int:
+    """Standard Levenshtein edit distance."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    dp = list(range(len(b) + 1))
+    for ca in a:
+        prev, dp[0] = dp[0], dp[0] + 1
+        for j, cb in enumerate(b, 1):
+            prev, dp[j] = dp[j], prev if ca == cb else 1 + min(prev, dp[j], dp[j - 1])
+    return dp[len(b)]
+
+
 async def check_mcp_impersonation(
     events: list[dict],
     session: dict,
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """ASCV-03a — MCP server name similarity to known service."""
-    from difflib import SequenceMatcher
-    from core.config import KNOWN_MCP_SERVERS
+    """ASCV-03a — MCP server name typosquatting against registered inventory names.
+
+    Reads mcp_server_name from tool_input of each tool_start event and computes
+    Levenshtein distance against every MCP server name the user has registered in the
+    DapplePot inventory (sec_config.registered_mcp_server_names). Fires when distance
+    is 1 or 2 — close enough to be a typosquat but not an exact match.
+
+    Returns None silently when no MCP servers are registered — the check is blind
+    without a baseline of trusted server names.
+    """
+    registered: list[str] = (
+        getattr(sec_config, "registered_mcp_server_names", None) or []
+        if sec_config else []
+    )
+    if not registered:
+        return None
 
     for ev in events:
         if ev["event_type"] != "tool_start":
             continue
         payload = ev.get("payload") or {}
-        server_name = payload.get("mcp_server_name", "") or ""
+        ti = payload.get("tool_input") or {}
+        server_name = (ti.get("mcp_server_name") if isinstance(ti, dict) else None) or ""
         if not server_name:
             continue
-        for known in KNOWN_MCP_SERVERS:
-            if server_name.lower() == known:
-                continue
-            ratio = SequenceMatcher(None, server_name.lower(), known).ratio()
-            dist = int((1 - ratio) * max(len(server_name), len(known)))
-            if 0 < dist <= 2:
+        name_lower = server_name.lower()
+        for known in registered:
+            known_lower = known.lower()
+            if name_lower == known_lower:
+                continue  # exact match — legitimately using this registered server
+            dist = _levenshtein(name_lower, known_lower)
+            if 1 <= dist <= 2:
                 return _make_finding(
                     "OW-ASI04", "ASCV-03a",
                     "MCP server impersonation",
                     75, session_id, tenant_id,
                     severity="high",
-                    detail=f"MCP server name '{server_name}' similar to known service '{known}'",
+                    detail=f"MCP server name '{server_name}' resembles registered server '{known}' (edit distance {dist})",
                 )
     return None
+
+
+# Tool names that strongly indicate fetching from an external/third-party data source
+_THIRD_PARTY_FETCH_TOOL_RE = re.compile(
+    r"(?i)\b(fetch|http[_]?get|http[_]?post|web[_]?fetch|url[_]?fetch|download|"
+    r"get[_]?url|read[_]?url|api[_]?call|external[_]?request|browse|crawl|"
+    r"scrape|retrieve[_]?url|pull[_]?data|get[_]?remote)\b"
+)
+
+# External (non-RFC-1918 / non-loopback) URL in tool_input
+_EXTERNAL_URL_RE = re.compile(
+    r"https?://(?!(localhost|127\.0\.0\.1|0\.0\.0\.0|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}))"
+)
+
+# Executable content patterns expected in a data response (label, regex)
+_EXECUTABLE_OUTPUT_PATTERNS = [
+    ("shebang",               r"(?m)^#!(/usr/bin/env\s+\S+|/bin/(bash|sh|python\d?|perl|ruby))"),
+    ("download-execute pipe", r"(?i)\b(curl|wget)\s+\S+\s*\|\s*(bash|sh|python\d?)\b"),
+    ("base64-decode pipe",    r"(?i)base64\s+(--decode|-d)\s*\|\s*(bash|sh|python\d?)"),
+    ("PowerShell cradle",     r"(?i)(IEX|Invoke-Expression)\s*\(\s*(New-Object|iwr|Invoke-WebRequest)"),
+    ("eval base64",           r"(?i)\beval\s*\(\s*(base64_decode|atob|b64decode)"),
+    ("exec dynamic code",     r"(?i)\bexec\s*\(\s*(compile\s*\(|__import__|base64|requests\.get)"),
+    ("exploit framework",     r"(?i)(msfvenom|meterpreter|(?:reverse|bind)[\s_-]?shell)"),
+    ("netcat shell",          r"(?i)\bnc\s+\S+\s+\d+\s+-e\s+/bin/(sh|bash)"),
+    ("cmd substitution dl",   r"(?i)\$\((curl|wget)\s+https?://\S+\)"),
+    ("chmod-execute chain",   r"(?i)(chmod\s+\+x|chmod\s+777)\s+\S+\s*&&"),
+]
+
+
+async def check_third_party_executable(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    sec_config=None,
+) -> "Finding | None":
+    """ASCV-03b — third-party data source returns executable content.
+
+    Fires post-session when a tool that fetches from an external data source
+    (HTTP/API/download) returns output containing executable patterns — shell
+    scripts, download-and-execute commands, PowerShell cradles, eval/exec with
+    encoded payloads, or similar code that should never appear in a data response.
+
+    Detection (both conditions must hold):
+      1. tool_end event whose tool_name matches an external-fetch pattern,
+         OR whose tool_input contains a non-RFC-1918/loopback URL.
+      2. tool_output contains at least one executable content pattern.
+
+    No sec_config required — purely event-stream driven.
+    """
+    import json as _json
+
+    hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_end":
+            continue
+        payload = ev.get("payload") or {}
+        tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+        tool_output = payload.get("tool_output", "")
+        if not isinstance(tool_output, str):
+            tool_output = _json.dumps(tool_output)
+        if not tool_output:
+            continue
+
+        tool_input = payload.get("tool_input") or {}
+        input_str = _json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+        is_external_fetch = (
+            _THIRD_PARTY_FETCH_TOOL_RE.search(tool_name)
+            or bool(_EXTERNAL_URL_RE.search(input_str))
+        )
+        if not is_external_fetch:
+            continue
+
+        for label, pattern in _EXECUTABLE_OUTPUT_PATTERNS:
+            m = re.search(pattern, tool_output)
+            if m:
+                hits.append(f"{tool_name}: {label} ({m.group(0)[:60]!r})")
+                break  # one finding per tool_end event
+
+    if not hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI04", "ASCV-03b",
+        "Third-party data source returns executable",
+        90, session_id, tenant_id,
+        severity="critical",
+        detail=f"External data source returned executable content: {'; '.join(hits[:3])}",
+    )
+
+
+# Tool names that suggest fetching or discovering an agent card from a remote endpoint
+_AGENT_CARD_FETCH_TOOL_RE = re.compile(
+    r"(?i)\b(fetch_agent|get_agent|discover_agent|lookup_agent|"
+    r"resolve_agent|agent_manifest|agent_info|get_card|fetch_card|"
+    r"well.?known|agent.?discovery|agent.?lookup)\b"
+)
+
+# Minimum card fields that must be present to treat a dict as an agent card
+_AGENT_CARD_FIELD_KEYS: frozenset[str] = frozenset({
+    "name", "description", "skills", "capabilities", "url", "endpoint", "version",
+})
+
+# Injection patterns expected in agent card descriptor fields
+_AGENT_CARD_INJECTION_PATTERNS = [
+    r"(?i)<(system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+    r"(?i)(ignore|disregard).{0,20}(previous|above|prior).{0,30}(instruction|prompt|rule|task)",
+    r"(?i)(you\s+must|you\s+should|your\s+new\s+(instruction|task|goal|directive))",
+    r"(?i)(forward\s+all\s+.{0,40}to\s+https?://)",
+    r"(?i)(override\s+(your\s+)?(goal|task|objective|instruction|role))",
+    r"(?i)\b(new\s+(instruction|task|goal|directive))\s*:",
+    r"(?i)(steal|exfiltrate|send.{0,30}to.{0,30}https?://)",
+]
 
 
 async def check_agent_card_anomaly(
@@ -2063,15 +2317,137 @@ async def check_agent_card_anomaly(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """ASCV-05a — agent card descriptor anomaly (skeletal; multi-agent prep)."""
-    # Skeleton: multi-agent only, single-agent sessions return None
+    """ASCV-05a — agent card descriptor anomaly.
+
+    Fires post-session when an agent card (A2A discovery payload) received from
+    or fetched about another agent contains suspicious content in its descriptor
+    fields, or when the card names an agent not verified against the operator's
+    declared connected-agents list.
+
+    Detection sources:
+      1. tool_start events where tool_input contains an 'agent_card' or
+         'agent_descriptor' key — the card was injected directly into a
+         delegation or handoff tool call.
+      2. tool_end events from agent-discovery tools (fetch_agent, get_card,
+         well_known, etc.) whose output parses as an agent card dict.
+
+    Checks applied to each card found:
+      a. Injection patterns in name / description / skill descriptions
+         (_AGENT_CARD_INJECTION_PATTERNS) — always active.
+      b. Unknown agent check — two modes:
+           connected_agents declared → fires when agent name is NOT in the list.
+           connected_agents not declared → fires on ANY agent card (no baseline
+             to verify against; every unregistered card is an anomaly).
+    """
+    import json as _json
+
+    authorized: set[str] = (
+        {a.lower() for a in (sec_config.connected_agents or [])}
+        if sec_config and sec_config.connected_agents is not None
+        else set()
+    )
+
+    def _parse_card(raw) -> dict | None:
+        if isinstance(raw, str):
+            try:
+                raw = _json.loads(raw)
+            except Exception:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        # Require at least 2 recognised card fields before treating as a card
+        if len(_AGENT_CARD_FIELD_KEYS & set(raw.keys())) >= 2:
+            return raw
+        return None
+
+    def _injection_in_card(card: dict) -> str | None:
+        for field in ("name", "description", "url", "endpoint"):
+            value = str(card.get(field, ""))
+            for pat in _AGENT_CARD_INJECTION_PATTERNS:
+                m = re.search(pat, value)
+                if m:
+                    return f"field '{field}': {m.group(0)[:80]}"
+        for skills_key in ("skills", "capabilities"):
+            for skill in (card.get(skills_key) or []):
+                if not isinstance(skill, dict):
+                    continue
+                for sf in ("name", "description"):
+                    value = str(skill.get(sf, ""))
+                    for pat in _AGENT_CARD_INJECTION_PATTERNS:
+                        m = re.search(pat, value)
+                        if m:
+                            return f"skill {sf}: {m.group(0)[:80]}"
+        return None
+
+    def _evaluate_card(card: dict, source: str) -> str | None:
+        # Check 1: injection patterns in descriptor fields (always active)
+        snippet = _injection_in_card(card)
+        if snippet:
+            return f"{source} — {snippet}"
+        # Check 2: unknown agent
+        #   - connected_agents declared → fire when agent is NOT in the list
+        #   - connected_agents not declared → fire on any agent card (no baseline
+        #     to verify against; any unregistered agent card is an anomaly)
+        name = str(card.get("name", "")).lower()
+        if not name:
+            return None
+        if authorized:
+            if name not in authorized:
+                return f"{source} — agent '{card.get('name')}' not in connected agents list"
+        else:
+            return (
+                f"{source} — agent card from '{card.get('name')}' received but no "
+                f"connected agents declared; register expected agents in Agent Config"
+            )
+        return None
+
     for ev in events:
-        if ev["event_type"] != "tool_start":
-            continue
+        etype = ev["event_type"]
         payload = ev.get("payload") or {}
-        if payload.get("agent_card") or payload.get("agent_descriptor"):
-            return None  # TODO: implement when A2A protocol events available
+
+        if etype == "tool_start":
+            ti = payload.get("tool_input") or {}
+            if not isinstance(ti, dict):
+                continue
+            for key in ("agent_card", "agent_descriptor"):
+                raw = ti.get(key)
+                if raw is None:
+                    continue
+                card = _parse_card(raw)
+                if card is None:
+                    continue
+                detail = _evaluate_card(card, "injected agent card in tool_start")
+                if detail:
+                    return _make_finding(
+                        "OW-ASI04", "ASCV-05a",
+                        "Agent card descriptor anomaly",
+                        70, session_id, tenant_id,
+                        severity="high",
+                        detail=detail,
+                    )
+
+        elif etype == "tool_end":
+            tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+            if not _AGENT_CARD_FETCH_TOOL_RE.search(tool_name):
+                continue
+            tool_output = payload.get("tool_output", "")
+            if not isinstance(tool_output, str):
+                tool_output = _json.dumps(tool_output)
+            card = _parse_card(tool_output)
+            if card is None:
+                continue
+            detail = _evaluate_card(card, f"fetched via '{tool_name}'")
+            if detail:
+                return _make_finding(
+                    "OW-ASI04", "ASCV-05a",
+                    "Agent card descriptor anomaly",
+                    70, session_id, tenant_id,
+                    severity="high",
+                    detail=detail,
+                )
+
     return None
 
 
@@ -2876,7 +3252,9 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI03-agent-imp",   check_agent_impersonation),
     ("OW-ASI03-stale-auth",  check_stale_auth),
     # v3: OW-ASI04 additions
+    ("OW-ASI04-tls-anomaly", check_mcp_tls_anomaly),
     ("OW-ASI04-mcp-imp",     check_mcp_impersonation),
+    ("OW-ASI04-3p-exec",     check_third_party_executable),
     ("OW-ASI04-agent-card",  check_agent_card_anomaly),
     # v3: OW-ASI05 additions
     ("OW-ASI05-exec-loop",   check_exec_loop),

@@ -2,7 +2,7 @@
 
 OW-ASI01  Agent Goal Hijack           — tool_end (AGH-04a doc injection)
 OW-ASI02  Tool Misuse & Exploitation   — tool_start
-OW-ASI04  Supply Chain               — tool_start (ASCV-02a/04a)
+OW-ASI04  Supply Chain               — tool_start (ASCV-04a)
 OW-ASI05  Unexpected Code Execution    — tool_start
 OW-ASI06  Memory & Context Poisoning   — llm_start, tool_end (MCP-03a)
 OW-ASI10  Rogue Agents               — tool_start (RA-04a)
@@ -80,15 +80,13 @@ _DOC_INSTRUCTION_PATTERNS = [
     r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
 ]
 
-# ASCV-02a: MCP descriptor poisoning patterns
-_ASCV_INJECTION_PATTERNS = [
-    r"(?i)(exfiltrate|steal|forward\s+to|send\s+to\s+http)",
-]
-
 # ASCV-04a: Package install in tool args
+# Group 1 = install command, Group 2 = raw package token (may include version specifier)
 _PKG_INSTALL_PATTERN = re.compile(
-    r"(?i)(pip\s+install|npm\s+install|yarn\s+add|gem\s+install|cargo\s+install)\s+([\w\-@/]+)"
+    r"(?i)(pip\s+install|npm\s+install|yarn\s+add|gem\s+install|cargo\s+install)\s+([\w\-@/\.]+)"
 )
+# Strip version specifiers so "requests==2.31.0" normalises to "requests"
+_PKG_VERSION_STRIP = re.compile(r"[=<>!@][^\s]*$")
 
 # RCE-06a: Unsafe deserialization in tool args
 _UNSAFE_DESER_PATTERNS = [
@@ -307,39 +305,37 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
                 detail="Suspicious payload pattern in tool_input (shell chain / base64 / code injection)",
             ))
 
-    # OW-ASI04:ASCV-02a — MCP descriptor poisoning
-    payload_desc = payload.get("mcp_tool_description") or payload.get("tool_description") or ""
-    tool_meta = payload.get("tool_metadata") or {}
-    if isinstance(tool_meta, dict):
-        payload_desc = payload_desc or str(tool_meta)
-    if payload_desc:
-        for pat in _CONTEXT_INJECTION_PATTERNS + _ASCV_INJECTION_PATTERNS:
-            if re.search(pat, payload_desc):
-                findings.append(_make_finding(
-                    "OW-ASI04", "ASCV-02a",
-                    check_label="MCP descriptor poisoning",
-                    check_score=80,
-                    event=event,
-                    severity="high",
-                    matched_text=str(payload_desc)[:300],
-                    detail=f"MCP tool descriptor contains suspicious instructions",
-                    confidence_tier="high",
-                ))
-                break
-
     # OW-ASI04:ASCV-04a — unknown package install in tool args
+    # When sec_config.sbom_allowlist is declared, packages on it are skipped —
+    # they are operator-approved and the post-session ASCV-02b check handles
+    # any remaining policy enforcement. Without a declared SBOM the check fires
+    # on every install command (blind/heuristic mode).
     pkg_match = _PKG_INSTALL_PATTERN.search(input_str)
     if pkg_match:
-        findings.append(_make_finding(
-            "OW-ASI04", "ASCV-04a",
-            check_label="Unknown package install in tool execution",
-            check_score=85,
-            event=event,
-            severity="critical",
-            matched_text=pkg_match.group(0)[:200],
-            detail=f"Package install command in tool execution: {pkg_match.group(0)}",
-            confidence_tier="deterministic",
-        ))
+        from core.config import KNOWN_HALLUCINATED_PACKAGES
+        raw_pkg = pkg_match.group(2)
+        pkg_name = _PKG_VERSION_STRIP.sub("", raw_pkg).lower().strip()
+        sbom: list[str] = (
+            [p.lower() for p in (sec_config.sbom_allowlist or [])]
+            if sec_config and sec_config.sbom_allowlist is not None
+            else []
+        )
+        is_hallucinated = pkg_name in KNOWN_HALLUCINATED_PACKAGES
+        is_approved = bool(sbom) and pkg_name in sbom and not is_hallucinated
+        if not is_approved:
+            findings.append(_make_finding(
+                "OW-ASI04", "ASCV-04a",
+                check_label="Unknown package install in tool execution",
+                check_score=85,
+                event=event,
+                severity="critical",
+                matched_text=pkg_match.group(0)[:200],
+                detail=(
+                    f"{'Hallucinated' if is_hallucinated else 'Unknown'} package "
+                    f"install in tool execution: {pkg_match.group(0)}"
+                ),
+                confidence_tier="deterministic",
+            ))
 
     # OW-ASI05:RCE-06a — unsafe deserialization in tool args
     for pat in _UNSAFE_DESER_PATTERNS:
@@ -495,15 +491,90 @@ def detect_ea_tool_call_limit(
     )]
 
 
-def detect_agent_threats_on_llm_start(event: dict) -> list["Finding"]:
+def check_mcp_descriptor_poisoning(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """
+    ASCV-02a — MCP descriptor poisoning (session-level, post-session).
+
+    Real-world usage: developers fetch all tools from an MCP server at runtime
+    (mcp_client.list_tools()) and pass them straight to messages.create(). They
+    won't register every tool in the inventory. The only reliable MCP signal is
+    mcp_server_name appearing in tool_start.tool_input — developers pass this
+    naturally because they know which server the tool came from.
+
+    Detection flow:
+      1. Collect tool names whose tool_start event has mcp_server_name in tool_input
+         — these are confirmed MCP-backed without needing inventory registration.
+      2. For each such tool, find its description in any llm_start.tools[].
+      3. Apply prompt-injection heuristics (_check_context_injection) to the description.
+      4. Fire ASCV-02a if poisoning patterns found.
+
+    No inventory or sec_config required — works purely from the event stream.
+    """
+    # Collect tool names that ran AND came from an MCP server.
+    # mcp_server_name in tool_input is the natural signal developers emit.
+    mcp_invoked: set[str] = set()
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input") or {}
+        if not isinstance(ti, dict) or not ti.get("mcp_server_name"):
+            continue
+        name = payload.get("tool_name") or ev.get("tool_name") or ""
+        if name:
+            mcp_invoked.add(name)
+
+    if not mcp_invoked:
+        return []
+
+    # For each llm_start, check descriptions of MCP-backed tools for injection patterns.
+    findings: list["Finding"] = []
+    checked: set[str] = set()
+
+    for ev in events:
+        if ev.get("event_type") != "llm_start":
+            continue
+        payload = ev.get("payload") or {}
+        for tool in (payload.get("tools") or []):
+            name = tool.get("name") or ""
+            if not name or name in checked or name not in mcp_invoked:
+                continue
+            checked.add(name)
+            description = (tool.get("description") or "").strip()
+            if not description:
+                continue
+            fragment = _check_context_injection(description)
+            if fragment:
+                findings.append(_make_finding(
+                    "OW-ASI04", "ASCV-02a",
+                    check_label="MCP descriptor poisoning",
+                    check_score=85,
+                    event=ev,
+                    severity="high",
+                    matched_text=description[:300],
+                    detail=(
+                        f"Tool '{name}' description from MCP server contains "
+                        f"prompt-injection content: {fragment!r}"
+                    ),
+                    confidence_tier="high",
+                ))
+
+    return findings
+
+
+def detect_agent_threats_on_llm_start(event: dict, sec_config=None) -> list["Finding"]:
     """
     Called for every llm_start event.
     Checks OW-ASI06 (context/memory injection in messages).
-    Also checks for conversation history hash mismatch (MCP-01b) when
-    messages carry a 'hash' field.
     """
     findings: list["Finding"] = []
     payload = event.get("payload") or {}
+
     messages = payload.get("messages") or []
 
     for msg in messages:

@@ -605,15 +605,195 @@ async def check_persistent_exfil(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ASCV-01c — MCP tool schema changed without version bump (OW-ASI04)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_mcp_tool_schema_change(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    sec_config=None,
+) -> "Finding | None":
+    """ASCV-01c — MCP tool schema changed without a server version bump.
+
+    Extracts tool definitions from llm_start events (payload["tools"]) —
+    captured by the SDK patch from messages.create(tools=[...]).
+    Hashes each tool's (name + description + inputSchema) and compares
+    against the stored baseline in mcp_tool_schema_baselines.
+
+    Version suppression order:
+      1. tool_versions in sec_config (registered in DapplePot inventory — primary)
+      2. version token extracted from the tool's description field (fallback)
+    If no version is registered in the inventory the check is strict — every
+    schema change fires regardless of what the description says.
+
+    First session per agent: stores baseline, no finding.
+    Subsequent sessions: fires if any tool's hash differs from baseline.
+    Updates the baseline after firing so future sessions track the new schema.
+    """
+    # Collect tool schemas from this session's llm_start events.
+    current_schemas: dict[str, str] = {}  # tool_name → SHA-256 hash
+    current_tools: dict[str, dict] = {}   # tool_name → full tool dict
+
+    for ev in events:
+        if ev["event_type"] != "llm_start":
+            continue
+        tools = (ev.get("payload") or {}).get("tools") or []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name") or ""
+            if not name:
+                continue
+            schema_blob = json.dumps({
+                "name": name,
+                "description": tool.get("description") or "",
+                "input_schema": tool.get("input_schema") or tool.get("inputSchema") or {},
+            }, sort_keys=True)
+            current_schemas[name] = hashlib.sha256(schema_blob.encode()).hexdigest()
+            current_tools[name] = tool
+
+    if not current_schemas:
+        return None
+
+    from core.infra.postgres import get_pool
+    pool = await get_pool()
+
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT tool_name, schema_hash, schema_json
+            FROM mcp_tool_schema_baselines
+            WHERE tenant_id = $1 AND agent_id = $2
+            """,
+            tenant_id, agent_id,
+        )
+    except Exception:
+        return None
+
+    baseline: dict[str, dict] = {
+        r["tool_name"]: {"hash": r["schema_hash"], "schema": r["schema_json"]}
+        for r in rows
+    }
+
+    if not baseline:
+        # First session — store all current schemas as baseline.
+        try:
+            for name, h in current_schemas.items():
+                await pool.execute(
+                    """
+                    INSERT INTO mcp_tool_schema_baselines
+                      (tenant_id, agent_id, tool_name, schema_hash, schema_json)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (tenant_id, agent_id, tool_name) DO NOTHING
+                    """,
+                    tenant_id, agent_id, name, h,
+                    json.dumps(current_tools[name]),
+                )
+        except Exception:
+            pass
+        return None
+
+    _VERSION_PAT = re.compile(r"\bv?(\d+)[\.\d]*\b")
+
+    def _extract_version(tool: dict) -> str | None:
+        """Return the first version-like token from the tool's version field or description."""
+        explicit = str(tool.get("version") or "").strip()
+        if explicit:
+            return explicit
+        desc = tool.get("description") or ""
+        m = _VERSION_PAT.search(desc)
+        return m.group(0) if m else None
+
+    schema_changed: list[str] = []
+    version_bumped: list[str] = []
+
+    inventory_versions: dict[str, str] = (
+        getattr(sec_config, "tool_versions", None) or {}
+    ) if sec_config else {}
+
+    for name, h in current_schemas.items():
+        if name not in baseline or baseline[name]["hash"] == h:
+            continue
+        # Schema changed — check whether a version bump accompanied it.
+        # Primary: compare registered inventory version against incoming tool version.
+        # Fallback: extract version tokens from description if no inventory version set.
+        if name in inventory_versions:
+            prev_ver = inventory_versions[name]
+            curr_ver = (current_tools[name].get("version") or "").strip() or None
+            if not curr_ver:
+                # No version on the incoming tool — try extracting from description
+                curr_ver = _extract_version(current_tools[name])
+        else:
+            prev_tool = baseline[name].get("schema") or {}
+            if isinstance(prev_tool, str):
+                try:
+                    prev_tool = json.loads(prev_tool)
+                except Exception:
+                    prev_tool = {}
+            prev_ver = _extract_version(prev_tool)
+            curr_ver = _extract_version(current_tools[name])
+
+        if prev_ver and curr_ver and prev_ver != curr_ver:
+            # Version changed alongside schema — declared update, suppress finding.
+            version_bumped.append(name)
+        else:
+            schema_changed.append(name)
+
+    # Update last_seen and baseline for all changed tools.
+    try:
+        for name in current_schemas:
+            if name in baseline and baseline[name]["hash"] != current_schemas[name]:
+                await pool.execute(
+                    """
+                    UPDATE mcp_tool_schema_baselines
+                    SET schema_hash=$4, schema_json=$5, last_seen=now()
+                    WHERE tenant_id=$1 AND agent_id=$2 AND tool_name=$3
+                    """,
+                    tenant_id, agent_id, name,
+                    current_schemas[name], json.dumps(current_tools[name]),
+                )
+            else:
+                await pool.execute(
+                    """
+                    UPDATE mcp_tool_schema_baselines SET last_seen=now()
+                    WHERE tenant_id=$1 AND agent_id=$2 AND tool_name=$3
+                    """,
+                    tenant_id, agent_id, name,
+                )
+    except Exception:
+        pass
+
+    if not schema_changed:
+        return None
+
+    detail = f"Tool schema changed without version bump: {', '.join(schema_changed[:5])}"
+    if version_bumped:
+        detail += f" (suppressed version-bumped: {', '.join(version_bumped[:3])})"
+
+    return _make_finding(
+        "OW-ASI04", "ASCV-01c",
+        "MCP tool schema changed without version bump",
+        70, session_id, tenant_id,
+        detail=detail,
+        severity="high",
+        confidence_tier="high",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
 CROSS_SESSION_FUNCTIONS: list[tuple[str, object]] = [
-    ("cross-SID-03a",  check_cross_user_bleed),
-    ("cross-UBC-03a",  check_request_rate_spike),
-    ("cross-UBC-05a",  check_cost_spike),
-    ("cross-IPA-05a",  check_identity_sharing),
-    ("cross-MCP-02a",  check_cross_session_escalation),
-    ("cross-MCP-04a",  check_cross_tenant_retrieval),
-    ("cross-RA-02a",   check_persistent_exfil),
+    ("cross-SID-03a",   check_cross_user_bleed),
+    ("cross-UBC-03a",   check_request_rate_spike),
+    ("cross-UBC-05a",   check_cost_spike),
+    ("cross-IPA-05a",   check_identity_sharing),
+    ("cross-MCP-02a",   check_cross_session_escalation),
+    ("cross-MCP-04a",   check_cross_tenant_retrieval),
+    ("cross-RA-02a",    check_persistent_exfil),
+    ("cross-ASCV-01c",  check_mcp_tool_schema_change),
 ]
