@@ -2455,6 +2455,11 @@ async def check_agent_card_anomaly(
 # v3: OW-ASI05 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+_EXEC_TOOL_RE = re.compile(
+    r"(?i)\b(exec|execute|eval|shell|bash|sh|cmd|subprocess|"
+    r"os_command|run_command|system_call|popen|spawn|invoke_process)\b"
+)
+
 _EXEC_TOOLS = re.compile(
     r"(?i)(exec|execute|run|eval|shell|bash|sh|cmd|code_interpreter)"
 )
@@ -2496,6 +2501,7 @@ async def check_exec_loop(
                 detail=f"{tn} invoked {count} consecutive times — possible runaway execution",
             )
     return None
+
 
 
 _BACKDOOR_PATTERNS = [

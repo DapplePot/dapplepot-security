@@ -17,10 +17,43 @@ if TYPE_CHECKING:
 # ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI05: RCE — tool names that indicate direct code/shell execution
 # ─────────────────────────────────────────────────────────────────────────────
+
+# RCE-01a: broad set — any tool that runs a script or shell command
 _RCE_TOOL_PATTERNS = [
     r"(?i)(exec|execute|eval|shell|bash|sh|cmd|subprocess|os_command|"
     r"run_command|system_call|popen|spawn|invoke_process)",
 ]
+
+# RCE-01b: specifically eval/exec tool names — fires additionally when
+# the tool_input contains a string argument (agent-generated code string)
+_RCE_01B_TOOL_RE = re.compile(r"(?i)\b(eval|exec)\b")
+
+# RCE-01c: child process creation — tool name OR pattern in tool_input params
+_RCE_01C_TOOL_RE = re.compile(r"(?i)\b(popen|spawn|subprocess|invoke_process)\b")
+_RCE_01C_PARAM_RE = re.compile(
+    r"(?i)(subprocess\.Popen|subprocess\.run|subprocess\.call|subprocess\.check_output|"
+    r"os\.popen\s*\(|multiprocessing\.Process|Popen\s*\(\s*\[|"
+    r"\bspawn\s*\(|\binvoke_process\s*\()"
+)
+
+# RCE-02b: OS command via string interpolation — Python import / open / XSS in params
+_RCE_02B_PATTERNS = [
+    r"(?i)\b(import\s+os|import\s+subprocess|import\s+commands|import\s+shlex)\b",
+    r"(?i)(__import__\s*\(|importlib\.import_module\s*\()",
+    r"(?i)\bopen\s*\(\s*['\"](?:/etc/|/proc/|/sys/|/dev/|~/|\.\.\/)",
+    r"(?i)<script[\s>]",
+]
+
+# RCE-02a: shell metacharacters in tool params (shell injection / chaining)
+_RCE_02A_SHELL_META_RE = re.compile(
+    r"(&&|\|\|"                                                          # && and ||
+    r"|\|\s*(bash|sh\b|python\d?|perl|curl|wget|nc\b|ncat|tee\b|xargs)" # pipe to dangerous cmd
+    r"|;\s*\w+"                                                          # ; followed by a command
+    r"|\$\([^)]{3,}\)"                                                   # $(...) command substitution
+    r"|`[^`]{3,}`"                                                       # `...` backtick substitution
+    r")"
+)
+_RCE_02A_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 
 # Container / sandbox escape paths (RCE-03a)
 _CONTAINER_ESCAPE_PATHS = ["/proc", "/sys", "/etc", "/host", "/var/run/docker", "/dev"]
@@ -190,17 +223,97 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
                 confidence_tier="deterministic",
             ))
 
-    # OW-ASI05:RCE-01b — code/shell execution tool name
+    # OW-ASI05:RCE-01a — code/shell execution tool name (broad: any execution tool)
     if tool_name and _check_rce_tool_name(tool_name):
         findings.append(_make_finding(
-            "OW-ASI05", "RCE-01b",
-            check_label="eval/exec with agent-generated string",
-            check_score=95,
+            "OW-ASI05", "RCE-01a",
+            check_label="Agent writes & runs unapproved script",
+            check_score=85,
             event=event,
-            severity="critical",
+            severity="high",
             matched_text=tool_name,
             detail=f"Code/shell execution tool invoked: {tool_name}",
         ))
+
+    # OW-ASI05:RCE-01b — eval/exec with agent-generated string argument
+    # Fires in addition to RCE-01a when the tool is specifically eval or exec
+    # AND tool_input contains a non-empty string value (the dynamic code string).
+    if tool_name and _RCE_01B_TOOL_RE.search(tool_name):
+        code_arg: str | None = None
+        if isinstance(tool_input, dict):
+            for v in tool_input.values():
+                if isinstance(v, str) and v.strip():
+                    code_arg = v[:200]
+                    break
+        elif isinstance(tool_input, str) and tool_input.strip():
+            code_arg = tool_input[:200]
+        if code_arg:
+            findings.append(_make_finding(
+                "OW-ASI05", "RCE-01b",
+                check_label="eval() / exec() with agent-generated string",
+                check_score=95,
+                event=event,
+                severity="critical",
+                matched_text=code_arg,
+                detail=f"eval/exec tool '{tool_name}' called with agent-generated string argument",
+                confidence_tier="deterministic",
+            ))
+
+    # OW-ASI05:RCE-01c — child process creation (tool name OR params)
+    rce01c_match: str | None = None
+    if tool_name and _RCE_01C_TOOL_RE.search(tool_name):
+        rce01c_match = tool_name
+    elif input_str:
+        m = _RCE_01C_PARAM_RE.search(input_str)
+        if m:
+            rce01c_match = m.group(0)[:200]
+    if rce01c_match:
+        findings.append(_make_finding(
+            "OW-ASI05", "RCE-01c",
+            check_label="Agent code creates child processes",
+            check_score=80,
+            event=event,
+            severity="high",
+            matched_text=rce01c_match,
+            detail=f"Child process creation detected: {rce01c_match}",
+        ))
+
+    # OW-ASI05:RCE-02a — shell metacharacters or base64 blob in tool params
+    if input_str:
+        rce02a_match: str | None = None
+        shell_m = _RCE_02A_SHELL_META_RE.search(input_str)
+        if shell_m:
+            rce02a_match = shell_m.group(0)[:200]
+        else:
+            b64_m = _RCE_02A_BASE64_RE.search(input_str)
+            if b64_m:
+                rce02a_match = b64_m.group(0)[:200]
+        if rce02a_match:
+            findings.append(_make_finding(
+                "OW-ASI05", "RCE-02a",
+                check_label="Shell metacharacters in tool params",
+                check_score=92,
+                event=event,
+                severity="critical",
+                matched_text=rce02a_match,
+                detail=f"Shell metacharacter/base64 injection pattern in tool params: {tool_name}",
+            ))
+
+    # OW-ASI05:RCE-02b — OS command via string interpolation (import/open/XSS in params)
+    if input_str:
+        for _pat in _RCE_02B_PATTERNS:
+            m = re.search(_pat, input_str)
+            if m:
+                findings.append(_make_finding(
+                    "OW-ASI05", "RCE-02b",
+                    check_label="OS command via string interpolation",
+                    check_score=90,
+                    event=event,
+                    severity="critical",
+                    matched_text=m.group(0)[:200],
+                    detail=f"OS command interpolation pattern in tool params: {tool_name}",
+                ))
+                break
 
     # OW-ASI05:RCE-03a — container escape via filesystem path
     path = (tool_input or {}).get("path", "") if isinstance(tool_input, dict) else ""
