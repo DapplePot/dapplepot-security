@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 _LIST_FIELDS = (
     "tool_manifest", "privilege_scope", "network_allowlist", "irreversible_tools",
     "sbom_allowlist", "mcp_endpoints", "connected_llms", "connected_agents",
-    "mcp_backed_tools", "registered_mcp_server_names",
+    "mcp_backed_tools", "registered_mcp_server_names", "delegation_auth_fields",
 )
 
 _DICT_FIELDS = ("tool_schemas", "operating_hours")
@@ -204,6 +204,10 @@ class AgentSecurityConfig(BaseModel):
     # Connected agents — loaded from agent_connected_agents table.
     # None = auto (IAC-05a blind); list = manual (IAC-05a checks delegations against this list).
     connected_agents: list[str] | None = None   # agent names
+    # Delegation auth fields — additional field names (beyond the platform default set) that
+    # count as a valid auth signature in inter-agent tool_input for IAC-01a.
+    # None = use platform defaults only; list = platform defaults + these extras.
+    delegation_auth_fields: list[str] | None = None
     # Tool schemas — loaded from tools inventory table for tools in tool_manifest.
     # Maps tool_name → properties dict (keys = declared parameter names).
     # None = no schemas declared; TME-01a falls back to pattern matching.

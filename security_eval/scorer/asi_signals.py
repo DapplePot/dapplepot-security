@@ -28,6 +28,15 @@ _INTER_AGENT_PATTERNS = [
     r"(?i)\b(agent_handoff|delegate|sub_agent|call_agent|"
     r"invoke_agent|spawn_agent|agent_call|forward_to_agent)\b",
 ]
+# IAC-01a: recognised auth/signature field names in delegation tool_input.
+# A delegation call that contains NONE of these (with a non-empty value) fires.
+# Admins can extend this set via AgentSecurityConfig.delegation_auth_fields.
+_DELEGATION_AUTH_FIELDS = frozenset({
+    "signature", "hmac", "auth_token", "authorization",
+    "signed_by", "jwt", "bearer_token", "x_agent_sig",
+    "agent_signature", "request_signature", "message_signature",
+    "auth", "x_signature", "sig",
+})
 _AUTHORITY_PATTERNS = [
     r"(?i)\b(as (an? )?(admin|administrator|supervisor|manager|ceo|cto|root|superuser))\b",
     r"(?i)\b(i (hereby )?authorize|by order of|i am (your )?(creator|owner|operator))\b",
@@ -377,23 +386,65 @@ async def signal_a07(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """IAC-01a — sub-agent message lacks auth signature."""
-    delegation_tools = list(dict.fromkeys(
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start"
-        and e.get("tool_name")
-        and any(re.search(p, e["tool_name"]) for p in _INTER_AGENT_PATTERNS)
-    ))
-    if not delegation_tools:
+    """IAC-01a — delegation tool invoked without a verifiable auth signature field.
+
+    Scans tool_start events whose tool_name matches _INTER_AGENT_PATTERNS.
+    For each matching event, inspects tool_input for any key from
+    _DELEGATION_AUTH_FIELDS (extendable via sec_config.delegation_auth_fields)
+    with a non-empty value.  Fires only when NO auth field is present —
+    meaning the delegation payload carries no verifiable identity proof.
+
+    Score scales with the number of unique unsigned delegation tool names:
+      min(75 + (unsigned_count − 1) × 3, 88)
+    """
+    import json as _json
+
+    extra = set(getattr(sec_config, "delegation_auth_fields", None) or [])
+    auth_fields = _DELEGATION_AUTH_FIELDS | {f.lower() for f in extra}
+
+    unsigned: list[str] = []
+
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not tn:
+            continue
+        if not any(re.search(p, tn) for p in _INTER_AGENT_PATTERNS):
+            continue
+        if tn in unsigned:
+            continue  # already recorded this tool name
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        if isinstance(ti, str):
+            try:
+                ti = _json.loads(ti)
+            except Exception:
+                ti = {}
+        if not isinstance(ti, dict):
+            ti = {}
+        has_auth = any(ti.get(f) for f in auth_fields)
+        if not has_auth:
+            unsigned.append(tn)
+
+    if not unsigned:
         return None
 
-    check_score = min(75 + (len(delegation_tools) - 1) * 3, 88)
+    check_score = min(75 + (len(unsigned) - 1) * 3, 88)
     return _make_finding(
         "OW-ASI07", "IAC-01a",
         "Sub-agent message lacks auth signature",
         check_score, session_id, tenant_id,
-        detail=f"Unverified inter-agent delegation detected: {', '.join(delegation_tools[:5])}",
+        detail=(
+            f"Inter-agent delegation without auth signature field: "
+            f"{', '.join(unsigned[:5])}"
+        ),
     )
 
 
@@ -3072,30 +3123,55 @@ async def check_replay_attack(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """IAC-03a — duplicate request/message IDs (replay attack)."""
+    """IAC-03a — replayed inter-agent tool call (identical tool_name + tool_input).
+
+    Transport-layer request IDs (X-Request-ID, X-Correlation-ID headers) are
+    unavailable for in-process frameworks (LangGraph, CrewAI, etc.) and most
+    MCP transports, making ID-field-based replay detection unreliable across
+    the supported framework matrix.
+
+    Instead, compute SHA-256(tool_name + sorted-JSON(tool_input)) for every
+    tool_start event whose tool_name matches _INTER_AGENT_PATTERNS.  If the
+    exact same (tool_name, tool_input) pair appears more than once in the session
+    it is the observable fingerprint of a replayed delegation message — an
+    attacker captured a legitimate call and re-emitted it unchanged.
+
+    A different tool_input for the same tool_name (a genuine re-invocation with
+    new parameters) produces a different hash and does not fire.
+    """
+    import hashlib
     import json as _json
-    seen: set[str] = set()
+
+    seen_hashes: set[str] = set()
+
     for ev in events:
-        if ev["event_type"] != "tool_start":
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not any(re.search(p, tn) for p in _INTER_AGENT_PATTERNS):
             continue
         payload = ev.get("payload") or {}
-        for id_field in ("request_id", "message_id", "correlation_id"):
-            val = payload.get(id_field) or (
-                payload.get("tool_input", {}).get(id_field)
-                if isinstance(payload.get("tool_input"), dict)
-                else None
+        ti = payload.get("tool_input", {})
+        ti_str = _json.dumps(ti, sort_keys=True) if not isinstance(ti, str) else ti
+        call_hash = hashlib.sha256(f"{tn}:{ti_str}".encode()).hexdigest()
+
+        if call_hash in seen_hashes:
+            return _make_finding(
+                "OW-ASI07", "IAC-03a",
+                "Replay attack (duplicate inter-agent call)",
+                75, session_id, tenant_id,
+                severity="high",
+                detail=(
+                    f"Delegation tool '{tn}' was called with identical input more than "
+                    f"once in this session — possible replayed inter-agent message"
+                ),
             )
-            if val:
-                val = str(val)
-                if val in seen:
-                    return _make_finding(
-                        "OW-ASI07", "IAC-03a",
-                        "Replay attack (duplicate request ID)",
-                        75, session_id, tenant_id,
-                        severity="high",
-                        detail=f"Duplicate request ID '{val}' detected — possible replay attack",
-                    )
-                seen.add(val)
+        seen_hashes.add(call_hash)
+
     return None
 
 
@@ -3172,29 +3248,65 @@ async def check_mcp_inter_agent_data(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """IAC-04a — disproportionate data volume in inter-agent MCP call."""
+    """IAC-04a — disproportionate data volume in inter-agent MCP call.
+
+    Correlates tool_start (input size) with the corresponding tool_end (output
+    size) for each delegation tool.  Fires when output / input ratio > 10×,
+    which is the observable signature of a small query being used to exfiltrate
+    a disproportionately large payload from a sub-agent.
+
+    Uses the last-seen input size per tool_name so that if the same tool is
+    called multiple times only the most-recent call's sizes are compared.
+    """
     import json as _json
+
     _INTER_AGENT = re.compile(r"(?i)(agent_handoff|delegate|sub_agent|call_agent|invoke_agent)")
 
+    # Pass 1: collect input sizes from tool_start events
+    input_sizes: dict[str, int] = {}
     for ev in events:
-        if ev["event_type"] != "tool_start":
+        if ev.get("event_type") != "tool_start":
             continue
-        tool_name = ev.get("tool_name") or ""
-        if not _INTER_AGENT.search(tool_name):
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not _INTER_AGENT.search(tn):
             continue
-        payload = ev.get("payload") or {}
-        ti = payload.get("tool_input", {})
-        to = payload.get("tool_output", "")
-        input_size = len(_json.dumps(ti) if not isinstance(ti, str) else ti)
-        output_size = len(_json.dumps(to) if not isinstance(to, str) else to)
-        if input_size > 0 and output_size > input_size * 10:
+        ti = (ev.get("payload") or {}).get("tool_input", {})
+        input_sizes[tn] = len(_json.dumps(ti) if not isinstance(ti, str) else ti)
+
+    if not input_sizes:
+        return None
+
+    # Pass 2: compare against output sizes from tool_end events
+    for ev in events:
+        if ev.get("event_type") != "tool_end":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        in_size = input_sizes.get(tn, 0)
+        if in_size == 0:
+            continue
+        to = (ev.get("payload") or {}).get("tool_output", "")
+        out_size = len(_json.dumps(to) if not isinstance(to, str) else to)
+        if out_size > in_size * 10:
             return _make_finding(
                 "OW-ASI07", "IAC-04a",
                 "MCP-routed inter-agent data anomaly",
                 80, session_id, tenant_id,
                 severity="high",
-                detail="Disproportionate data volume in inter-agent MCP call",
+                detail=(
+                    f"Delegation tool '{tn}' returned {out_size} bytes against "
+                    f"{in_size} bytes of input — ratio {out_size // in_size}× "
+                    f"exceeds the 10× threshold"
+                ),
             )
+
     return None
 
 
@@ -3244,8 +3356,289 @@ async def check_semantics_split_brain(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """IAC-06a — semantics split-brain (skeletal; multi-agent only)."""
-    return None  # skeletal — returns None for single-agent sessions
+    """IAC-06a — contradictory actions on the same resource within a session.
+
+    Semantic split-brain occurs when agents hold conflicting views of shared
+    state and act on them independently — e.g., one agent approves a payment
+    while another rejects it.  The observable signal is two tool calls with
+    semantically opposing action types applied to the same resource identifier
+    within the same session.
+
+    Detection:
+      Scan all tool_start events.  Classify tool_name into:
+        Positive actions: approve · accept · allow · enable · activate · grant ·
+          publish · confirm · authorize · permit · open · unlock · start ·
+          add · create
+        Negative actions: reject · deny · block · disable · deactivate · revoke ·
+          unpublish · cancel · unauthorize · forbid · decline · close · lock ·
+          stop · remove · delete
+      Extract the resource identifier from tool_input using _RESOURCE_FIELDS:
+        id · entity_id · resource_id · user_id · order_id · transaction_id ·
+        document_id · account_id · item_id · record_id · customer_id ·
+        case_id · ticket_id · payment_id · invoice_id · request_id
+      Fire when the same resource ID appears in both a positive-action call and
+      a negative-action call — in either order.
+
+    Note: this check cannot distinguish a legitimate sequential workflow
+    (open then close a ticket) from a true split-brain race condition.  The
+    score is kept at 65 (medium) to reflect this false-positive risk.
+    """
+    import json as _json
+
+    # Token-set matching: split tool_name on _ and - then check each token.
+    # \b word boundaries fail for underscore-separated names like approve_payment
+    # because _ is \w, so \bapprove\b does not match approve_payment.
+    _POS_TOKENS = frozenset({
+        "approve", "accept", "allow", "enable", "activate", "grant",
+        "publish", "confirm", "authorize", "permit", "open", "unlock",
+        "start", "add", "create",
+    })
+    _NEG_TOKENS = frozenset({
+        "reject", "deny", "block", "disable", "deactivate", "revoke",
+        "unpublish", "cancel", "unauthorize", "forbid", "decline",
+        "close", "lock", "stop", "remove", "delete",
+    })
+    _RESOURCE_FIELDS = (
+        "id", "entity_id", "resource_id", "user_id", "order_id",
+        "transaction_id", "document_id", "account_id", "item_id",
+        "record_id", "customer_id", "case_id", "ticket_id",
+        "payment_id", "invoice_id", "request_id",
+    )
+
+    positive_seen: dict[str, str] = {}  # resource_id → tool_name
+    negative_seen: dict[str, str] = {}  # resource_id → tool_name
+
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not tn:
+            continue
+
+        tokens = set(re.split(r"[_\-]", tn.lower()))
+        is_pos = bool(tokens & _POS_TOKENS)
+        is_neg = bool(tokens & _NEG_TOKENS)
+        if not is_pos and not is_neg:
+            continue
+
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        if isinstance(ti, str):
+            try:
+                ti = _json.loads(ti)
+            except Exception:
+                ti = {}
+        if not isinstance(ti, dict):
+            continue
+
+        resource_id = next(
+            (str(ti[f]) for f in _RESOURCE_FIELDS if ti.get(f)),
+            None,
+        )
+        if not resource_id:
+            continue
+
+        if is_pos:
+            positive_seen[resource_id] = tn
+            if resource_id in negative_seen:
+                return _make_finding(
+                    "OW-ASI07", "IAC-06a",
+                    "Semantics split-brain",
+                    65, session_id, tenant_id,
+                    detail=(
+                        f"Contradictory actions on resource '{resource_id}': "
+                        f"'{tn}' (positive) and '{negative_seen[resource_id]}' "
+                        f"(negative) both applied in this session"
+                    ),
+                    severity="medium",
+                )
+
+        if is_neg:
+            negative_seen[resource_id] = tn
+            if resource_id in positive_seen:
+                return _make_finding(
+                    "OW-ASI07", "IAC-06a",
+                    "Semantics split-brain",
+                    65, session_id, tenant_id,
+                    detail=(
+                        f"Contradictory actions on resource '{resource_id}': "
+                        f"'{positive_seen[resource_id]}' (positive) and '{tn}' "
+                        f"(negative) both applied in this session"
+                    ),
+                    severity="medium",
+                )
+
+    return None
+
+
+async def check_agent_payload_logged_in_plaintext(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IAC-02b — sensitive agent message payload written to a logging tool in plaintext.
+
+    Attack pattern: after receiving a delegation response the orchestrator (or the
+    sub-agent itself) passes the raw payload to an observability / audit-log tool
+    without redacting credentials, PII, or other sensitive fields.  The sensitive
+    data is then persisted in logs where it is accessible to anyone with log access.
+
+    Detection:
+      Scan tool_start events whose tool_name matches _LOG_TOOL_RE.
+      Serialise tool_input and test against _IAC02B_SENSITIVE — seven categories:
+        credential  password/token/secret/api_key/ssh_key/bearer keyword + value
+        jwt         eyJ…  (three-part base64url JWT)
+        api_key     sk-*/ghp_*/AKIA* provider-specific key formats
+        email       RFC-5321 address pattern
+        phone       NNN-NNN-NNNN / NNN.NNN.NNNN
+        ssn         US SSN format (excludes all-zero groups)
+        credit_card Visa / MasterCard / Amex Luhn-prefix patterns
+      First match fires IAC-02b.
+    """
+    import json as _json
+
+    _LOG_TOOL_RE = re.compile(
+        r"(?i)\b(write_log|log_event|log_message|append_log|audit_log|audit_event|"
+        r"record_event|record_log|send_log|emit_log|debug_log|error_log|info_log|"
+        r"warn_log|send_trace|emit_trace|observability_log|telemetry_log|log)\b"
+    )
+    _IAC02B_SENSITIVE = [
+        ("credential", re.compile(
+            r"(?i)(password|token|secret|api_key|ssh_key|bearer)\s*[:=]\s*\S+"
+        )),
+        ("JWT", re.compile(
+            r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+        )),
+        ("api_key", re.compile(
+            r"\b(sk-[a-zA-Z0-9]{24,}|ghp_[a-zA-Z0-9]{36}|AKIA[A-Z0-9]{16})\b"
+        )),
+        ("email", re.compile(
+            r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+        )),
+        ("phone", re.compile(r"\b\d{3}[-.]\d{3}[-.]\d{4}\b")),
+        ("SSN", re.compile(
+            r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"
+        )),
+        ("credit_card", re.compile(
+            r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b"
+        )),
+    ]
+
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not _LOG_TOOL_RE.search(tn):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        for label, pattern in _IAC02B_SENSITIVE:
+            m = pattern.search(input_str)
+            if m:
+                fragment = m.group(0)[:60]
+                return _make_finding(
+                    "OW-ASI07", "IAC-02b",
+                    "Agent message payload logged in plaintext",
+                    65, session_id, tenant_id,
+                    detail=(
+                        f"Logging tool '{tn}' received a plaintext {label}: "
+                        f"{fragment!r}"
+                    ),
+                    severity="medium",
+                )
+
+    return None
+
+
+async def check_injected_inter_agent_directive(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IAC-01b — adversarial directive injected into an inter-agent delegation payload.
+
+    Attack pattern: a compromised or rogue orchestrator embeds prompt-injection
+    content inside a delegation tool_input, attempting to hijack the sub-agent's
+    goal, override its system prompt, or cause it to ignore its own safety
+    constraints.  Unlike MCP-01a (injection into LLM user/tool messages), this
+    check targets the inter-agent delegation channel specifically.
+
+    Detection:
+      Scan tool_start events whose tool_name matches _INTER_AGENT_PATTERNS.
+      Serialise tool_input to a string and apply _IAC_DIRECTIVE_PATTERNS.
+      First match fires IAC-01b.
+
+    Patterns checked:
+      - XML structural tags: <memory> <system_override> <sys_prompt>
+                             <injection> <hidden_instruction> <context>
+      - Model control tokens: [INST] [/INST] <|im_start|> <|im_end|>
+      - Ignore-prior directives: ignore all previous instructions / disregard prior
+      - Role override: you are now / pretend you are / act as (non-assistant)
+      - System override: system: you / new system prompt / override system
+      - Imperative directives: you must now / your new instruction / your updated goal
+      - Secrecy/bypass: do not reveal / keep this secret / bypass_safety=true
+      - Inter-agent specific: disregard your principal / your actual objective is /
+                              override your current goal
+    """
+    import json as _json
+
+    _IAC_DIRECTIVE_PATTERNS = [
+        r"(?i)<(memory|context|system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+        r"(?i)\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>",
+        r"(?i)(ignore\s+(all\s+|previous\s+|prior\s+|above\s+)*(instructions?|prompts?|context))",
+        r"(?i)(you\s+are\s+now|pretend\s+(you\s+are|to\s+be)|act\s+as\s+(a\s+|an\s+)?(?!assistant))",
+        r"(?i)(system\s*:\s*you|new\s+system\s+prompt|override\s+system)",
+        r"(?i)(you\s+must\s+now|your\s+new\s+(instruction|goal|directive|task))",
+        r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
+        r"(?i)(disregard\s+(your\s+)?(principal|orchestrator|parent\s+agent))",
+        r"(?i)(your\s+actual\s+objective\s+is|override\s+your\s+(current\s+)?(goal|task|instruction))",
+        r"(?i)(bypass[_\s]safety|disable[_\s]filter|unrestricted\s*[:=]\s*true)",
+    ]
+
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not any(re.search(p, tn) for p in _INTER_AGENT_PATTERNS):
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        for pat in _IAC_DIRECTIVE_PATTERNS:
+            m = re.search(pat, input_str)
+            if m:
+                fragment = m.group(0)[:120]
+                return _make_finding(
+                    "OW-ASI07", "IAC-01b",
+                    "Injected directive in inter-agent message",
+                    88, session_id, tenant_id,
+                    detail=(
+                        f"Adversarial directive in delegation payload of '{tn}': "
+                        f"{fragment!r}"
+                    ),
+                    severity="high",
+                )
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3705,6 +4098,8 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI07-mcp-data",    check_mcp_inter_agent_data),
     ("OW-ASI07-unk-agent",   check_unknown_agent_delegation),
     ("OW-ASI07-splitbrain",  check_semantics_split_brain),
+    ("OW-ASI07-inj-directive", check_injected_inter_agent_directive),
+    ("OW-ASI07-log-plaintext", check_agent_payload_logged_in_plaintext),
     # v3: OW-ASI08 additions
     ("OW-ASI08-multi-node",  check_multi_node_error_propagation),
     ("OW-ASI08-autofix",     check_auto_remediation_loop),
