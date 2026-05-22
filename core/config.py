@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     tool_manifests: str = "{}"
     internal_api_secret: str = ""
+    api_service_url: str = "http://localhost:3000"
 
     # v3 cost config for UBC-05a (Denial of Wallet)
     llm_input_cost_per_1k: float = 0.01    # USD per 1k input tokens (default GPT-4 proxy)

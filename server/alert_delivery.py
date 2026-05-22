@@ -44,3 +44,26 @@ async def deliver_alert(alert: dict[str, Any]) -> None:
             alert.get('dedup_key', alert.get('alert_id', '')),
             json.dumps(alert.get('payload', {})),
         )
+
+    from core.config import settings
+    import urllib.request
+    import asyncio
+
+    def _trigger_delivery_sync() -> None:
+        if not settings.internal_api_secret:
+            return
+        req = urllib.request.Request(
+            f"{settings.api_service_url}/v1/internal/alerts/deliver",
+            data=json.dumps({"alert_id": alert.get('alert_id'), "tenant_id": alert.get('tenant_id')}).encode('utf-8'),
+            headers={'Content-Type': 'application/json', 'X-Internal-Secret': settings.internal_api_secret},
+            method='POST'
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                response.read()
+        except Exception as e:
+            log.error("Failed to trigger delivery via internal API: %s", e)
+
+    asyncio.create_task(asyncio.to_thread(_trigger_delivery_sync))
+
+

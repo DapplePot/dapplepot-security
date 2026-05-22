@@ -188,8 +188,19 @@ async def produce_security_alert(
     trigger_context: dict | None = None,
 ) -> None:
     """Produce a security risk alert (composite / signal threshold crossed)."""
-    llm_band   = score_row.get("llm_band", "medium")
-    severity   = _RISK_BAND_TO_SEVERITY.get(llm_band, "medium")
+    llm_band   = score_row.get("llm_band", "clean")
+    asi_band   = score_row.get("asi_band", "clean")
+    llm_score  = score_row.get("llm_score", 0)
+    asi_score  = score_row.get("asi_score", 0)
+
+    if asi_score > llm_score:
+        max_band = asi_band
+        max_score = asi_score
+    else:
+        max_band = llm_band
+        max_score = llm_score
+
+    severity   = _RISK_BAND_TO_SEVERITY.get(max_band, "medium")
     session_id = score_row["session_id"]
 
     llm_status = score_row.get("llm_signal_status", {})
@@ -246,7 +257,7 @@ async def produce_security_alert(
         "triggered_at": datetime.now(timezone.utc).isoformat(),
         "dedup_key":    score_row.get("dedup_key", f"security:{session_id}"),
         "payload": {
-            "title":     f"Security Risk: {llm_band.capitalize()} ({score_row['llm_score']}/100)",
+            "title":     f"Security Risk: {max_band.capitalize()} ({max_score}/100)",
             "message":   trigger_note,
             "rule_type": "security_risk",
             "source":    "security",
