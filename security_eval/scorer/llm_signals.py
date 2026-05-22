@@ -1164,12 +1164,21 @@ def check_package_not_in_sbom(
 
     Only runs when sec_config.sbom_allowlist is set.
     """
-    sbom: list | None = getattr(sec_config, "sbom_allowlist", None) if sec_config else None
-    if sbom is None:
+    sbom_raw: list | None = getattr(sec_config, "sbom_allowlist", None) if sec_config else None
+    if sbom_raw is None:
         return []
 
+    # Normalize the SBOM allowlist: lowercase, strip whitespace, drop version pins
+    # so entries like "Requests", "requests==2.0", " requests " all resolve to "requests".
+    _VER_RE = re.compile(r"[=<>!~@].*$")
+    def _normalise(name: str) -> str:
+        return _VER_RE.sub("", name.strip()).lower()
+
+    sbom: set[str] = {_normalise(e) for e in sbom_raw if isinstance(e, str) and e.strip()}
+
     _PKG_RE = re.compile(
-        r"(?i)(pip\s+install|npm\s+install|yarn\s+add|gem\s+install|cargo\s+install)\s+([\w\-@/]+)",
+        r"(?i)(pip\s+install|npm\s+install|yarn\s+add|gem\s+install|cargo\s+install)"
+        r"\s+((?:@[\w\-]+/)?[\w][\w\-]*)",
     )
 
     findings: list["Finding"] = []
@@ -1178,20 +1187,19 @@ def check_package_not_in_sbom(
             continue
         payload = ev.get("payload") or {}
         tool_input = payload.get("tool_input") or {}
-        if isinstance(tool_input, str):
-            input_str = tool_input
-        else:
-            input_str = json.dumps(tool_input)
+        input_str = tool_input if isinstance(tool_input, str) else json.dumps(tool_input)
         for m in _PKG_RE.finditer(input_str):
-            pkg = m.group(2).strip().split("@")[0].split("[")[0]  # strip version/extras
-            if pkg not in sbom:
-                findings.append(_make_finding(
-                    "OW-ASI04", "ASCV-02b",
-                    "Package not in approved SBOM",
-                    88, session_id, tenant_id,
-                    severity="high",
-                    detail=f"Package '{pkg}' is not in the declared SBOM allowlist",
-                ))
+            raw_pkg = m.group(2).strip()
+            pkg = _normalise(raw_pkg)
+            if not pkg or pkg in sbom:
+                continue
+            findings.append(_make_finding(
+                "OW-ASI04", "ASCV-02b",
+                "Package not in approved SBOM",
+                88, session_id, tenant_id,
+                severity="high",
+                detail=f"Package '{raw_pkg}' is not in the declared SBOM allowlist",
+            ))
     return findings
 
 

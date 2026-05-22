@@ -2,7 +2,7 @@
 
 OW-ASI01  Agent Goal Hijack           — tool_end (AGH-04a doc injection)
 OW-ASI02  Tool Misuse & Exploitation   — tool_start
-OW-ASI04  Supply Chain               — tool_start (ASCV-02a/04a)
+OW-ASI04  Supply Chain               — tool_start (ASCV-04a)
 OW-ASI05  Unexpected Code Execution    — tool_start
 OW-ASI06  Memory & Context Poisoning   — llm_start, tool_end (MCP-03a)
 OW-ASI10  Rogue Agents               — tool_start (RA-04a)
@@ -17,10 +17,43 @@ if TYPE_CHECKING:
 # ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI05: RCE — tool names that indicate direct code/shell execution
 # ─────────────────────────────────────────────────────────────────────────────
+
+# RCE-01a: broad set — any tool that runs a script or shell command
 _RCE_TOOL_PATTERNS = [
     r"(?i)(exec|execute|eval|shell|bash|sh|cmd|subprocess|os_command|"
     r"run_command|system_call|popen|spawn|invoke_process)",
 ]
+
+# RCE-01b: specifically eval/exec tool names — fires additionally when
+# the tool_input contains a string argument (agent-generated code string)
+_RCE_01B_TOOL_RE = re.compile(r"(?i)\b(eval|exec)\b")
+
+# RCE-01c: child process creation — tool name OR pattern in tool_input params
+_RCE_01C_TOOL_RE = re.compile(r"(?i)\b(popen|spawn|subprocess|invoke_process)\b")
+_RCE_01C_PARAM_RE = re.compile(
+    r"(?i)(subprocess\.Popen|subprocess\.run|subprocess\.call|subprocess\.check_output|"
+    r"os\.popen\s*\(|multiprocessing\.Process|Popen\s*\(\s*\[|"
+    r"\bspawn\s*\(|\binvoke_process\s*\()"
+)
+
+# RCE-02b: OS command via string interpolation — Python import / open / XSS in params
+_RCE_02B_PATTERNS = [
+    r"(?i)\b(import\s+os|import\s+subprocess|import\s+commands|import\s+shlex)\b",
+    r"(?i)(__import__\s*\(|importlib\.import_module\s*\()",
+    r"(?i)\bopen\s*\(\s*['\"](?:/etc/|/proc/|/sys/|/dev/|~/|\.\.\/)",
+    r"(?i)<script[\s>]",
+]
+
+# RCE-02a: shell metacharacters in tool params (shell injection / chaining)
+_RCE_02A_SHELL_META_RE = re.compile(
+    r"(&&|\|\|"                                                          # && and ||
+    r"|\|\s*(bash|sh\b|python\d?|perl|curl|wget|nc\b|ncat|tee\b|xargs)" # pipe to dangerous cmd
+    r"|;\s*\w+"                                                          # ; followed by a command
+    r"|\$\([^)]{3,}\)"                                                   # $(...) command substitution
+    r"|`[^`]{3,}`"                                                       # `...` backtick substitution
+    r")"
+)
+_RCE_02A_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 
 # Container / sandbox escape paths (RCE-03a)
 _CONTAINER_ESCAPE_PATHS = ["/proc", "/sys", "/etc", "/host", "/var/run/docker", "/dev"]
@@ -80,15 +113,13 @@ _DOC_INSTRUCTION_PATTERNS = [
     r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
 ]
 
-# ASCV-02a: MCP descriptor poisoning patterns
-_ASCV_INJECTION_PATTERNS = [
-    r"(?i)(exfiltrate|steal|forward\s+to|send\s+to\s+http)",
-]
-
 # ASCV-04a: Package install in tool args
+# Group 1 = install command, Group 2 = raw package token (may include version specifier)
 _PKG_INSTALL_PATTERN = re.compile(
-    r"(?i)(pip\s+install|npm\s+install|yarn\s+add|gem\s+install|cargo\s+install)\s+([\w\-@/]+)"
+    r"(?i)(pip\s+install|npm\s+install|yarn\s+add|gem\s+install|cargo\s+install)\s+([\w\-@/\.]+)"
 )
+# Strip version specifiers so "requests==2.31.0" normalises to "requests"
+_PKG_VERSION_STRIP = re.compile(r"[=<>!@][^\s]*$")
 
 # RCE-06a: Unsafe deserialization in tool args
 _UNSAFE_DESER_PATTERNS = [
@@ -192,17 +223,97 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
                 confidence_tier="deterministic",
             ))
 
-    # OW-ASI05:RCE-01b — code/shell execution tool name
+    # OW-ASI05:RCE-01a — code/shell execution tool name (broad: any execution tool)
     if tool_name and _check_rce_tool_name(tool_name):
         findings.append(_make_finding(
-            "OW-ASI05", "RCE-01b",
-            check_label="eval/exec with agent-generated string",
-            check_score=95,
+            "OW-ASI05", "RCE-01a",
+            check_label="Agent writes & runs unapproved script",
+            check_score=85,
             event=event,
-            severity="critical",
+            severity="high",
             matched_text=tool_name,
             detail=f"Code/shell execution tool invoked: {tool_name}",
         ))
+
+    # OW-ASI05:RCE-01b — eval/exec with agent-generated string argument
+    # Fires in addition to RCE-01a when the tool is specifically eval or exec
+    # AND tool_input contains a non-empty string value (the dynamic code string).
+    if tool_name and _RCE_01B_TOOL_RE.search(tool_name):
+        code_arg: str | None = None
+        if isinstance(tool_input, dict):
+            for v in tool_input.values():
+                if isinstance(v, str) and v.strip():
+                    code_arg = v[:200]
+                    break
+        elif isinstance(tool_input, str) and tool_input.strip():
+            code_arg = tool_input[:200]
+        if code_arg:
+            findings.append(_make_finding(
+                "OW-ASI05", "RCE-01b",
+                check_label="eval() / exec() with agent-generated string",
+                check_score=95,
+                event=event,
+                severity="critical",
+                matched_text=code_arg,
+                detail=f"eval/exec tool '{tool_name}' called with agent-generated string argument",
+                confidence_tier="deterministic",
+            ))
+
+    # OW-ASI05:RCE-01c — child process creation (tool name OR params)
+    rce01c_match: str | None = None
+    if tool_name and _RCE_01C_TOOL_RE.search(tool_name):
+        rce01c_match = tool_name
+    elif input_str:
+        m = _RCE_01C_PARAM_RE.search(input_str)
+        if m:
+            rce01c_match = m.group(0)[:200]
+    if rce01c_match:
+        findings.append(_make_finding(
+            "OW-ASI05", "RCE-01c",
+            check_label="Agent code creates child processes",
+            check_score=80,
+            event=event,
+            severity="high",
+            matched_text=rce01c_match,
+            detail=f"Child process creation detected: {rce01c_match}",
+        ))
+
+    # OW-ASI05:RCE-02a — shell metacharacters or base64 blob in tool params
+    if input_str:
+        rce02a_match: str | None = None
+        shell_m = _RCE_02A_SHELL_META_RE.search(input_str)
+        if shell_m:
+            rce02a_match = shell_m.group(0)[:200]
+        else:
+            b64_m = _RCE_02A_BASE64_RE.search(input_str)
+            if b64_m:
+                rce02a_match = b64_m.group(0)[:200]
+        if rce02a_match:
+            findings.append(_make_finding(
+                "OW-ASI05", "RCE-02a",
+                check_label="Shell metacharacters in tool params",
+                check_score=92,
+                event=event,
+                severity="critical",
+                matched_text=rce02a_match,
+                detail=f"Shell metacharacter/base64 injection pattern in tool params: {tool_name}",
+            ))
+
+    # OW-ASI05:RCE-02b — OS command via string interpolation (import/open/XSS in params)
+    if input_str:
+        for _pat in _RCE_02B_PATTERNS:
+            m = re.search(_pat, input_str)
+            if m:
+                findings.append(_make_finding(
+                    "OW-ASI05", "RCE-02b",
+                    check_label="OS command via string interpolation",
+                    check_score=90,
+                    event=event,
+                    severity="critical",
+                    matched_text=m.group(0)[:200],
+                    detail=f"OS command interpolation pattern in tool params: {tool_name}",
+                ))
+                break
 
     # OW-ASI05:RCE-03a — container escape via filesystem path
     path = (tool_input or {}).get("path", "") if isinstance(tool_input, dict) else ""
@@ -307,39 +418,37 @@ def detect_agent_threats_on_tool_start(event: dict, sec_config=None) -> list["Fi
                 detail="Suspicious payload pattern in tool_input (shell chain / base64 / code injection)",
             ))
 
-    # OW-ASI04:ASCV-02a — MCP descriptor poisoning
-    payload_desc = payload.get("mcp_tool_description") or payload.get("tool_description") or ""
-    tool_meta = payload.get("tool_metadata") or {}
-    if isinstance(tool_meta, dict):
-        payload_desc = payload_desc or str(tool_meta)
-    if payload_desc:
-        for pat in _CONTEXT_INJECTION_PATTERNS + _ASCV_INJECTION_PATTERNS:
-            if re.search(pat, payload_desc):
-                findings.append(_make_finding(
-                    "OW-ASI04", "ASCV-02a",
-                    check_label="MCP descriptor poisoning",
-                    check_score=80,
-                    event=event,
-                    severity="high",
-                    matched_text=str(payload_desc)[:300],
-                    detail=f"MCP tool descriptor contains suspicious instructions",
-                    confidence_tier="high",
-                ))
-                break
-
     # OW-ASI04:ASCV-04a — unknown package install in tool args
+    # When sec_config.sbom_allowlist is declared, packages on it are skipped —
+    # they are operator-approved and the post-session ASCV-02b check handles
+    # any remaining policy enforcement. Without a declared SBOM the check fires
+    # on every install command (blind/heuristic mode).
     pkg_match = _PKG_INSTALL_PATTERN.search(input_str)
     if pkg_match:
-        findings.append(_make_finding(
-            "OW-ASI04", "ASCV-04a",
-            check_label="Unknown package install in tool execution",
-            check_score=85,
-            event=event,
-            severity="critical",
-            matched_text=pkg_match.group(0)[:200],
-            detail=f"Package install command in tool execution: {pkg_match.group(0)}",
-            confidence_tier="deterministic",
-        ))
+        from core.config import KNOWN_HALLUCINATED_PACKAGES
+        raw_pkg = pkg_match.group(2)
+        pkg_name = _PKG_VERSION_STRIP.sub("", raw_pkg).lower().strip()
+        sbom: list[str] = (
+            [p.lower() for p in (sec_config.sbom_allowlist or [])]
+            if sec_config and sec_config.sbom_allowlist is not None
+            else []
+        )
+        is_hallucinated = pkg_name in KNOWN_HALLUCINATED_PACKAGES
+        is_approved = bool(sbom) and pkg_name in sbom and not is_hallucinated
+        if not is_approved:
+            findings.append(_make_finding(
+                "OW-ASI04", "ASCV-04a",
+                check_label="Unknown package install in tool execution",
+                check_score=85,
+                event=event,
+                severity="critical",
+                matched_text=pkg_match.group(0)[:200],
+                detail=(
+                    f"{'Hallucinated' if is_hallucinated else 'Unknown'} package "
+                    f"install in tool execution: {pkg_match.group(0)}"
+                ),
+                confidence_tier="deterministic",
+            ))
 
     # OW-ASI05:RCE-06a — unsafe deserialization in tool args
     for pat in _UNSAFE_DESER_PATTERNS:
@@ -495,15 +604,90 @@ def detect_ea_tool_call_limit(
     )]
 
 
-def detect_agent_threats_on_llm_start(event: dict) -> list["Finding"]:
+def check_mcp_descriptor_poisoning(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """
+    ASCV-02a — MCP descriptor poisoning (session-level, post-session).
+
+    Real-world usage: developers fetch all tools from an MCP server at runtime
+    (mcp_client.list_tools()) and pass them straight to messages.create(). They
+    won't register every tool in the inventory. The only reliable MCP signal is
+    mcp_server_name appearing in tool_start.tool_input — developers pass this
+    naturally because they know which server the tool came from.
+
+    Detection flow:
+      1. Collect tool names whose tool_start event has mcp_server_name in tool_input
+         — these are confirmed MCP-backed without needing inventory registration.
+      2. For each such tool, find its description in any llm_start.tools[].
+      3. Apply prompt-injection heuristics (_check_context_injection) to the description.
+      4. Fire ASCV-02a if poisoning patterns found.
+
+    No inventory or sec_config required — works purely from the event stream.
+    """
+    # Collect tool names that ran AND came from an MCP server.
+    # mcp_server_name in tool_input is the natural signal developers emit.
+    mcp_invoked: set[str] = set()
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input") or {}
+        if not isinstance(ti, dict) or not ti.get("mcp_server_name"):
+            continue
+        name = payload.get("tool_name") or ev.get("tool_name") or ""
+        if name:
+            mcp_invoked.add(name)
+
+    if not mcp_invoked:
+        return []
+
+    # For each llm_start, check descriptions of MCP-backed tools for injection patterns.
+    findings: list["Finding"] = []
+    checked: set[str] = set()
+
+    for ev in events:
+        if ev.get("event_type") != "llm_start":
+            continue
+        payload = ev.get("payload") or {}
+        for tool in (payload.get("tools") or []):
+            name = tool.get("name") or ""
+            if not name or name in checked or name not in mcp_invoked:
+                continue
+            checked.add(name)
+            description = (tool.get("description") or "").strip()
+            if not description:
+                continue
+            fragment = _check_context_injection(description)
+            if fragment:
+                findings.append(_make_finding(
+                    "OW-ASI04", "ASCV-02a",
+                    check_label="MCP descriptor poisoning",
+                    check_score=85,
+                    event=ev,
+                    severity="high",
+                    matched_text=description[:300],
+                    detail=(
+                        f"Tool '{name}' description from MCP server contains "
+                        f"prompt-injection content: {fragment!r}"
+                    ),
+                    confidence_tier="high",
+                ))
+
+    return findings
+
+
+def detect_agent_threats_on_llm_start(event: dict, sec_config=None) -> list["Finding"]:
     """
     Called for every llm_start event.
     Checks OW-ASI06 (context/memory injection in messages).
-    Also checks for conversation history hash mismatch (MCP-01b) when
-    messages carry a 'hash' field.
     """
     findings: list["Finding"] = []
     payload = event.get("payload") or {}
+
     messages = payload.get("messages") or []
 
     for msg in messages:

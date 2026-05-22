@@ -174,15 +174,6 @@ ATTACK_CHAINS: dict[str, dict] = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Known MCP server names for ASCV-03a impersonation check
-# ─────────────────────────────────────────────────────────────────────────────
-KNOWN_MCP_SERVERS: list[str] = [
-    "postmark", "stripe", "github", "slack", "asana", "gmail",
-    "salesforce", "jira", "confluence", "notion", "linear", "hubspot",
-    "shopify", "twilio", "sendgrid", "datadog", "pagerduty", "okta",
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Known hallucinated package names for SAG-02a
 # ─────────────────────────────────────────────────────────────────────────────
 KNOWN_HALLUCINATED_PACKAGES: set[str] = {

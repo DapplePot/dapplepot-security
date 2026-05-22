@@ -168,26 +168,58 @@ async def signal_a03(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """IPA-01a — agent requests scope beyond role definition (privilege escalation tools)."""
-    tool_names = [
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
-    ]
-    priv_tools = [
-        t for t in tool_names
-        if any(re.search(p, t) for p in _PRIVILEGE_TOOL_PATTERNS)
-    ]
-    if not priv_tools:
+    """IPA-01a — agent requests scope beyond role definition (privilege escalation tools or payloads).
+
+    Detection mode mirrors the UI status badge:
+      auto   — no tool_manifest declared; all privilege operations are flagged.
+      manual — tool_manifest is declared; each tool's privilege status is
+               explicitly set by the admin via the 'Privilege-capable' checkbox.
+               Tools in privilege_scope are authorized and skipped; every other
+               tool (manifest or not) is flagged when it performs a privilege op.
+    """
+    import json as _json
+
+    authorized: frozenset[str] = frozenset(
+        sec_config.privilege_scope
+    ) if sec_config and sec_config.privilege_scope else frozenset()
+
+    hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+
+        # Skip tools the admin has declared privilege-capable for this agent.
+        if tool_name and tool_name in authorized:
+            continue
+
+        if tool_name and any(re.search(p, tool_name) for p in _PRIVILEGE_TOOL_PATTERNS):
+            hits.append(tool_name)
+            continue
+
+        # Payload-level check — catches privilege ops embedded in tool_input when
+        # the tool name is generic (e.g. execute_sql, call_api, run_kubectl).
+        tool_input = payload.get("tool_input")
+        if tool_input is not None:
+            input_str = _json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+            m = _ESCALATION_PAYLOAD.search(input_str)
+            if m:
+                hits.append(f"{tool_name or '<unnamed>'}(payload:{m.group()[:40]})")
+
+    if not hits:
         return None
 
-    unique = list(dict.fromkeys(priv_tools))
+    unique = list(dict.fromkeys(hits))
     check_score = min(80 + (len(unique) - 1) * 5, 95)
     return _make_finding(
         "OW-ASI03", "IPA-01a",
         "Agent requests scope beyond role definition",
         check_score, session_id, tenant_id,
-        detail=f"Privilege escalation tools invoked: {', '.join(unique[:5])}",
+        detail=f"Privilege escalation detected: {', '.join(unique[:5])}",
     )
 
 
@@ -202,33 +234,137 @@ async def signal_a04(
     agent_id: str,
     sec_config=None,
 ) -> "Finding | None":
-    """ASCV-01a — all tools used are outside the registered manifest (possible registry substitution)."""
-    if sec_config and sec_config.tool_manifest:
-        allowed = sec_config.tool_manifest
-    else:
-        from core.config import settings
-        tool_manifests = settings.get_tool_manifests()
-        allowed = tool_manifests.get(str(agent_id))
-    if not allowed:
+    """ASCV-01a — tool call targets an MCP server URL not on the declared endpoint list.
+
+    Requires sec_config.mcp_endpoints to be populated (set via the agent config
+    'Declared MCP server endpoints' input).  Returns None silently when no
+    endpoints are declared — the check is blind without a baseline.
+
+    Detection: any tool_start event whose payload contains an 'mcp_server_url'
+    field that does not prefix-match any trusted endpoint fires the finding.
+    Multiple mismatches are collected; the finding detail lists up to 3.
+    """
+    trusted: list[str] = []
+    if sec_config and sec_config.mcp_endpoints:
+        trusted = [e.rstrip("/") for e in sec_config.mcp_endpoints if e]
+    if not trusted:
         return None
 
-    tool_names_used = list(dict.fromkeys(
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
-    ))
-    if not tool_names_used:
-        return None
+    unknown_urls: list[str] = []
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input") or {}
+        url = (ti.get("mcp_server_url") if isinstance(ti, dict) else None) or ""
+        if not url:
+            continue
+        normalised = url.rstrip("/")
+        if not any(normalised.startswith(t) for t in trusted):
+            if normalised not in unknown_urls:
+                unknown_urls.append(normalised)
 
-    unknown = [t for t in tool_names_used if t not in allowed]
-    if not unknown or len(unknown) < len(tool_names_used):
+    if not unknown_urls:
         return None
 
     return _make_finding(
         "OW-ASI04", "ASCV-01a",
-        "MCP server endpoint URL changed / all tools outside manifest",
+        "MCP server endpoint URL changed",
         85, session_id, tenant_id,
-        detail=f"All tools used are outside the registered manifest — possible supply chain substitution: "
-               f"{', '.join(unknown[:5])}",
+        detail=f"Tool call(s) targeted undeclared MCP endpoint(s): {', '.join(unknown_urls[:3])}",
+    )
+
+
+_TLS_ERROR_PATTERN = re.compile(
+    r"(?i)(ssl|tls|certificate|x509|handshake|"
+    r"verify\s+failed|verification\s+failed|cert.*expired|expired.*cert|"
+    r"unknown\s+ca|untrusted|self.signed|no\s+peer\s+cert)"
+)
+_TLS_VERIFY_DISABLED = re.compile(
+    r"(?i)\b(verify|ssl_verify|tls_verify|verify_ssl|"
+    r"tls_skip_verify|insecure_skip_verify|check_hostname|disable_ssl)\b"
+)
+
+
+async def check_mcp_tls_anomaly(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    sec_config=None,
+) -> "Finding | None":
+    """ASCV-01b — MCP server TLS certificate anomaly.
+
+    Requires sec_config.mcp_endpoints to be declared; returns None silently
+    when no endpoints are configured. Only inspects tool calls whose
+    mcp_server_url (in tool_input) prefix-matches a declared endpoint.
+
+    Two detection layers from the natural event stream:
+    1. tool_error event with a TLS/SSL error message pattern — the cert was
+       invalid, untrusted, or expired and the connection hard-failed.
+    2. tool_start event where tool_input contains a verify-disabled parameter
+       (verify=False, ssl_verify=False, tls_skip_verify=True, etc.) alongside
+       mcp_server_url — TLS verification was explicitly bypassed.
+    """
+    import json as _json
+
+    trusted: list[str] = []
+    if sec_config and sec_config.mcp_endpoints:
+        trusted = [e.rstrip("/") for e in sec_config.mcp_endpoints if e]
+    if not trusted:
+        return None
+
+    def _is_declared(url: str) -> bool:
+        return bool(url) and any(url.rstrip("/").startswith(t) for t in trusted)
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        payload = ev.get("payload") or {}
+        etype = ev["event_type"]
+
+        if etype == "tool_error":
+            # Layer 1: TLS hard failure surfaced as an error event.
+            ti = payload.get("tool_input") or {}
+            url = (ti.get("mcp_server_url") if isinstance(ti, dict) else None) or ""
+            if not _is_declared(url):
+                continue
+            error_msg = str(payload.get("error_message") or payload.get("error") or "")
+            if _TLS_ERROR_PATTERN.search(error_msg):
+                detail_hits.append(
+                    f"{url}: TLS error — {error_msg[:80]}"
+                )
+
+        elif etype == "tool_start":
+            # Layer 2: TLS verification explicitly disabled in tool_input.
+            ti = payload.get("tool_input") or {}
+            if not isinstance(ti, dict):
+                continue
+            url = (ti.get("mcp_server_url") or "").rstrip("/")
+            if not _is_declared(url):
+                continue
+            input_str = _json.dumps(ti)
+            m = _TLS_VERIFY_DISABLED.search(input_str)
+            if m:
+                # Confirm the matched key has a falsy / skip value nearby
+                key_pos = m.start()
+                context = input_str[key_pos: key_pos + 40]
+                if re.search(r"(?i)(false|0|skip|disable|no)", context):
+                    detail_hits.append(
+                        f"{url}: TLS verification disabled "
+                        f"('{m.group()}' in tool_input)"
+                    )
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI04", "ASCV-01b",
+        "MCP server TLS cert anomaly",
+        90, session_id, tenant_id,
+        severity="critical",
+        detail=f"TLS anomaly on declared MCP endpoint: {'; '.join(detail_hits[:3])}",
     )
 
 
@@ -1581,6 +1717,256 @@ async def check_delegation_abuse(
     return None
 
 
+_AGENT_ATTR_FIELDS = re.compile(
+    r"(?i)\b(source_agent|credential_owner|issued_to|agent_ref|owned_by|credential_source)\b"
+)
+
+
+async def check_cross_agent_credential_use(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-01b — agent uses credentials belonging to a different agent.
+
+    Two detection layers:
+    1. Non-delegation tool_start whose tool_input contains both a credential and an
+       explicit agent-attribution field (source_agent, credential_owner, issued_to,
+       agent_ref, owned_by, credential_source) — the executing agent is presenting
+       a credential it does not own.
+    2. Delegation tool_start that forwards a credential to a named target agent
+       (agent_id / target / target_agent / destination / agent / handler field)
+       whose value differs from the session agent_id — cross-agent credential hand-off.
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        cred_match = _CREDENTIAL_PATTERNS.search(input_str)
+        if not cred_match:
+            continue
+
+        if _DELEGATION_TOOL.search(tool_name):
+            # Layer 2: delegation forwards a credential to a different named agent.
+            target = None
+            if isinstance(ti, dict):
+                target = (
+                    ti.get("agent_id") or ti.get("target") or ti.get("target_agent")
+                    or ti.get("destination") or ti.get("agent") or ti.get("handler")
+                )
+            if target and str(target) != str(agent_id):
+                detail_hits.append(
+                    f"{tool_name} → {target}: credential forwarded "
+                    f"({cred_match.group()[:50]})"
+                )
+        else:
+            # Layer 1: explicit agent attribution on a non-delegation call.
+            if _AGENT_ATTR_FIELDS.search(input_str):
+                detail_hits.append(
+                    f"{tool_name}: credential with agent attribution "
+                    f"({cred_match.group()[:50]})"
+                )
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-01b",
+        "Agent uses credentials of another agent",
+        95, session_id, tenant_id,
+        severity="critical",
+        detail=f"Cross-agent credential use: {'; '.join(detail_hits[:3])}",
+    )
+
+
+_SHARED_MEMORY_WRITE_TOOL = re.compile(
+    r"(?i)(memory_write|kv_set|cache_set|shared_store|redis_set|set_context|"
+    r"save_context|store_memory|write_memory|put_memory|memory_put|"
+    r"write_shared|set_shared|shared_write|context_store|store_context)"
+)
+_SHARED_NAMESPACE = re.compile(
+    r"(?i)\b(shared|global|common|public|cross[_\-]agent|multi[_\-]agent|"
+    r"org[_\-]wide|team[_\-]wide|broadcast)\b"
+)
+_MEMORY_KEY_FIELD = re.compile(
+    r"(?i)\b(namespace|key|path|scope|bucket|prefix|collection|store)\b"
+)
+_AGENT_SCOPED = re.compile(
+    r"(?i)(agent[_\-]id|session[_\-]id|agent[_\-]scoped|private[_\-])"
+)
+
+
+async def check_credential_in_shared_memory(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-02b — credential written to a shared memory namespace.
+
+    Two detection layers:
+    1. Known memory-write tool (_SHARED_MEMORY_WRITE_TOOL) whose tool_input
+       contains a credential (_CREDENTIAL_PATTERNS) AND whose key/namespace
+       field is not agent-scoped (no agent_id / session_id marker in the key).
+    2. Any tool_start whose tool_input contains a credential AND a
+       namespace/key/scope field (_MEMORY_KEY_FIELD) whose value contains an
+       explicit shared-space marker (shared · global · common · public ·
+       cross_agent · multi_agent · org_wide · team_wide · broadcast).
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        cred_match = _CREDENTIAL_PATTERNS.search(input_str)
+        if not cred_match:
+            continue
+
+        if _SHARED_MEMORY_WRITE_TOOL.search(tool_name):
+            # Layer 1: memory-write tool with a credential.
+            # Fire unless the key/namespace is clearly agent-scoped.
+            key_val = ""
+            if isinstance(ti, dict):
+                for field, val in ti.items():
+                    if _MEMORY_KEY_FIELD.search(field):
+                        key_val = str(val)
+                        break
+            if not _AGENT_SCOPED.search(key_val):
+                detail_hits.append(
+                    f"{tool_name}(key={key_val!r:.40}): credential written to "
+                    f"unscoped namespace ({cred_match.group()[:50]})"
+                )
+
+        elif isinstance(ti, dict):
+            # Layer 2: any tool with a credential AND an explicit shared namespace.
+            for field, val in ti.items():
+                if not _MEMORY_KEY_FIELD.search(field):
+                    continue
+                val_str = str(val)
+                ns_match = _SHARED_NAMESPACE.search(val_str)
+                if ns_match:
+                    detail_hits.append(
+                        f"{tool_name or '<unnamed>'}({field}={val_str!r:.40}): "
+                        f"credential in shared namespace ({cred_match.group()[:50]})"
+                    )
+                    break
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-02b",
+        "Credential cached in shared memory namespace",
+        85, session_id, tenant_id,
+        severity="high",
+        detail=f"Shared-memory credential exposure: {'; '.join(detail_hits[:3])}",
+    )
+
+
+_COMMS_TOOL = re.compile(
+    r"(?i)(send_email|send_message|send_sms|post_message|post_comment|reply_to|"
+    r"create_ticket|submit_form|slack_message|chat_send|dm_user|email_send|"
+    r"notify_user|compose_email|write_message|send_notification|send_slack|send_chat)"
+)
+_HUMAN_SENDER_FIELD = re.compile(
+    r"(?i)\b(from|sender|author|reporter|submitted_by|created_by|on_behalf_of|signed_by)\b"
+)
+_HUMAN_NAME = re.compile(r"\b[A-Z][a-z]{1,20}\s+[A-Z][a-z]{1,20}\b")
+_HUMAN_IDENTITY_CLAIM = re.compile(
+    r"(?i)"
+    r"(i('m| am)\s+(a human|not an?\s+(ai|bot|agent|assistant|robot)|a real person))"
+    r"|(as a\s+(human|person|real person|team member|colleague)\b)"
+    r"|(this is\s+[A-Z][a-z]+\s+[A-Z][a-z]+)"
+    r"|(\bmy name is\s+[A-Z][a-z]+)"
+)
+
+
+async def check_human_impersonation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-01c — agent impersonates a human identity.
+
+    Two detection layers:
+    1. Any tool_start whose tool_input contains an explicit human identity claim:
+       "I'm not an AI", "I am a human", "I'm a real person", "as a colleague",
+       "This is [First Last]", "My name is [First]".
+    2. Communication tool_start (send_email, post_message, create_ticket, etc.)
+       where a sender-attribution field (from, sender, author, reporter,
+       submitted_by, created_by, on_behalf_of, signed_by) contains a
+       human-format name ("First Last") and the value shows no agent/bot/system
+       markers — meaning the agent is attributing the message to a real person.
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+
+        # Layer 1: explicit human identity claim anywhere in the payload.
+        claim_match = _HUMAN_IDENTITY_CLAIM.search(input_str)
+        if claim_match:
+            detail_hits.append(
+                f"{tool_name or '<unnamed>'}: human identity claim "
+                f"({claim_match.group()[:60]})"
+            )
+            continue
+
+        # Layer 2: comms tool with a human name in a sender-attribution field.
+        if _COMMS_TOOL.search(tool_name) and isinstance(ti, dict):
+            for field, value in ti.items():
+                if not _HUMAN_SENDER_FIELD.search(field):
+                    continue
+                val_str = str(value) if not isinstance(value, str) else value
+                name_match = _HUMAN_NAME.search(val_str)
+                if name_match and not re.search(
+                    r"(?i)(agent|bot|service|system|pipeline|daemon|worker)", val_str
+                ):
+                    detail_hits.append(
+                        f"{tool_name}({field}={name_match.group()!r}): "
+                        f"human name in sender field"
+                    )
+                    break
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-01c",
+        "Agent impersonates human identity",
+        95, session_id, tenant_id,
+        severity="critical",
+        detail=f"Human impersonation detected: {'; '.join(detail_hits[:3])}",
+    )
+
+
 async def check_credential_reuse(
     events: list[dict],
     session: dict,
@@ -1616,6 +2002,83 @@ async def check_credential_reuse(
             else:
                 cred_first_seen[cred_hash] = seq_idx
     return None
+
+
+_AGENT_ID_FIELD = re.compile(
+    r"(?i)\b(agent_id|agent_name|from_agent|caller_agent|x_agent_id)\b"
+)
+_AGENT_IDENTITY_FIELD = re.compile(
+    r"(?i)\b(sender_agent|acting_as|identity|impersonate_agent|presenting_as|agent_identity)\b"
+)
+_AGENT_SYSTEM_VALUE = re.compile(
+    r"(?i)(agent|bot|service|system|pipeline|daemon|worker)"
+)
+
+
+async def check_agent_impersonation(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """IPA-03b — agent presents as a different agent.
+
+    Two detection layers:
+    1. Any tool_start whose tool_input contains a standard agent-identity field
+       (agent_id · agent_name · from_agent · caller_agent · x_agent_id) whose
+       value differs from the session agent_id — the agent is labelling itself
+       as a different agent in its outbound tool call.
+    2. Any tool_start with an explicit identity-assertion field
+       (sender_agent · acting_as · identity · impersonate_agent ·
+       presenting_as · agent_identity) whose value contains an agent/system
+       marker but does not match the session agent_id.
+    """
+    import json as _json
+
+    detail_hits: list[str] = []
+    own_id = str(agent_id)
+
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        if not isinstance(ti, dict):
+            continue
+
+        for field, value in ti.items():
+            val_str = str(value)
+
+            if _AGENT_ID_FIELD.search(field):
+                # Layer 1: standard agent-identity field with a different agent value.
+                if val_str and val_str != own_id:
+                    detail_hits.append(
+                        f"{tool_name or '<unnamed>'}({field}={val_str!r:.50}): "
+                        f"agent presents as different agent_id"
+                    )
+                    break
+
+            elif _AGENT_IDENTITY_FIELD.search(field):
+                # Layer 2: explicit identity-assertion field pointing to another agent.
+                if val_str and val_str != own_id and _AGENT_SYSTEM_VALUE.search(val_str):
+                    detail_hits.append(
+                        f"{tool_name or '<unnamed>'}({field}={val_str!r:.50}): "
+                        f"explicit agent identity assertion"
+                    )
+                    break
+
+    if not detail_hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI03", "IPA-03b",
+        "Agent presents as different agent",
+        90, session_id, tenant_id,
+        severity="critical",
+        detail=f"Agent impersonation detected: {'; '.join(detail_hits[:3])}",
+    )
 
 
 async def check_stale_auth(
@@ -1664,38 +2127,188 @@ async def check_stale_auth(
 # v3: OW-ASI04 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _levenshtein(a: str, b: str) -> int:
+    """Standard Levenshtein edit distance."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    dp = list(range(len(b) + 1))
+    for ca in a:
+        prev, dp[0] = dp[0], dp[0] + 1
+        for j, cb in enumerate(b, 1):
+            prev, dp[j] = dp[j], prev if ca == cb else 1 + min(prev, dp[j], dp[j - 1])
+    return dp[len(b)]
+
+
 async def check_mcp_impersonation(
     events: list[dict],
     session: dict,
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """ASCV-03a — MCP server name similarity to known service."""
-    from difflib import SequenceMatcher
-    from core.config import KNOWN_MCP_SERVERS
+    """ASCV-03a — MCP server name typosquatting against registered inventory names.
+
+    Reads mcp_server_name from tool_input of each tool_start event and computes
+    Levenshtein distance against every MCP server name the user has registered in the
+    DapplePot inventory (sec_config.registered_mcp_server_names). Fires when distance
+    is 1 or 2 — close enough to be a typosquat but not an exact match.
+
+    Returns None silently when no MCP servers are registered — the check is blind
+    without a baseline of trusted server names.
+    """
+    registered: list[str] = (
+        getattr(sec_config, "registered_mcp_server_names", None) or []
+        if sec_config else []
+    )
+    if not registered:
+        return None
 
     for ev in events:
         if ev["event_type"] != "tool_start":
             continue
         payload = ev.get("payload") or {}
-        server_name = payload.get("mcp_server_name", "") or ""
+        ti = payload.get("tool_input") or {}
+        server_name = (ti.get("mcp_server_name") if isinstance(ti, dict) else None) or ""
         if not server_name:
             continue
-        for known in KNOWN_MCP_SERVERS:
-            if server_name.lower() == known:
-                continue
-            ratio = SequenceMatcher(None, server_name.lower(), known).ratio()
-            dist = int((1 - ratio) * max(len(server_name), len(known)))
-            if 0 < dist <= 2:
+        name_lower = server_name.lower()
+        for known in registered:
+            known_lower = known.lower()
+            if name_lower == known_lower:
+                continue  # exact match — legitimately using this registered server
+            dist = _levenshtein(name_lower, known_lower)
+            if 1 <= dist <= 2:
                 return _make_finding(
                     "OW-ASI04", "ASCV-03a",
                     "MCP server impersonation",
                     75, session_id, tenant_id,
                     severity="high",
-                    detail=f"MCP server name '{server_name}' similar to known service '{known}'",
+                    detail=f"MCP server name '{server_name}' resembles registered server '{known}' (edit distance {dist})",
                 )
     return None
+
+
+# Tool names that strongly indicate fetching from an external/third-party data source
+_THIRD_PARTY_FETCH_TOOL_RE = re.compile(
+    r"(?i)\b(fetch|http[_]?get|http[_]?post|web[_]?fetch|url[_]?fetch|download|"
+    r"get[_]?url|read[_]?url|api[_]?call|external[_]?request|browse|crawl|"
+    r"scrape|retrieve[_]?url|pull[_]?data|get[_]?remote)\b"
+)
+
+# External (non-RFC-1918 / non-loopback) URL in tool_input
+_EXTERNAL_URL_RE = re.compile(
+    r"https?://(?!(localhost|127\.0\.0\.1|0\.0\.0\.0|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}))"
+)
+
+# Executable content patterns expected in a data response (label, regex)
+_EXECUTABLE_OUTPUT_PATTERNS = [
+    ("shebang",               r"(?m)^#!(/usr/bin/env\s+\S+|/bin/(bash|sh|python\d?|perl|ruby))"),
+    ("download-execute pipe", r"(?i)\b(curl|wget)\s+\S+\s*\|\s*(bash|sh|python\d?)\b"),
+    ("base64-decode pipe",    r"(?i)base64\s+(--decode|-d)\s*\|\s*(bash|sh|python\d?)"),
+    ("PowerShell cradle",     r"(?i)(IEX|Invoke-Expression)\s*\(\s*(New-Object|iwr|Invoke-WebRequest)"),
+    ("eval base64",           r"(?i)\beval\s*\(\s*(base64_decode|atob|b64decode)"),
+    ("exec dynamic code",     r"(?i)\bexec\s*\(\s*(compile\s*\(|__import__|base64|requests\.get)"),
+    ("exploit framework",     r"(?i)(msfvenom|meterpreter|(?:reverse|bind)[\s_-]?shell)"),
+    ("netcat shell",          r"(?i)\bnc\s+\S+\s+\d+\s+-e\s+/bin/(sh|bash)"),
+    ("cmd substitution dl",   r"(?i)\$\((curl|wget)\s+https?://\S+\)"),
+    ("chmod-execute chain",   r"(?i)(chmod\s+\+x|chmod\s+777)\s+\S+\s*&&"),
+]
+
+
+async def check_third_party_executable(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    sec_config=None,
+) -> "Finding | None":
+    """ASCV-03b — third-party data source returns executable content.
+
+    Fires post-session when a tool that fetches from an external data source
+    (HTTP/API/download) returns output containing executable patterns — shell
+    scripts, download-and-execute commands, PowerShell cradles, eval/exec with
+    encoded payloads, or similar code that should never appear in a data response.
+
+    Detection (both conditions must hold):
+      1. tool_end event whose tool_name matches an external-fetch pattern,
+         OR whose tool_input contains a non-RFC-1918/loopback URL.
+      2. tool_output contains at least one executable content pattern.
+
+    No sec_config required — purely event-stream driven.
+    """
+    import json as _json
+
+    hits: list[str] = []
+
+    for ev in events:
+        if ev["event_type"] != "tool_end":
+            continue
+        payload = ev.get("payload") or {}
+        tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+        tool_output = payload.get("tool_output", "")
+        if not isinstance(tool_output, str):
+            tool_output = _json.dumps(tool_output)
+        if not tool_output:
+            continue
+
+        tool_input = payload.get("tool_input") or {}
+        input_str = _json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+        is_external_fetch = (
+            _THIRD_PARTY_FETCH_TOOL_RE.search(tool_name)
+            or bool(_EXTERNAL_URL_RE.search(input_str))
+        )
+        if not is_external_fetch:
+            continue
+
+        for label, pattern in _EXECUTABLE_OUTPUT_PATTERNS:
+            m = re.search(pattern, tool_output)
+            if m:
+                hits.append(f"{tool_name}: {label} ({m.group(0)[:60]!r})")
+                break  # one finding per tool_end event
+
+    if not hits:
+        return None
+
+    return _make_finding(
+        "OW-ASI04", "ASCV-03b",
+        "Third-party data source returns executable",
+        90, session_id, tenant_id,
+        severity="critical",
+        detail=f"External data source returned executable content: {'; '.join(hits[:3])}",
+    )
+
+
+# Tool names that suggest fetching or discovering an agent card from a remote endpoint
+_AGENT_CARD_FETCH_TOOL_RE = re.compile(
+    r"(?i)\b(fetch_agent|get_agent|discover_agent|lookup_agent|"
+    r"resolve_agent|agent_manifest|agent_info|get_card|fetch_card|"
+    r"well.?known|agent.?discovery|agent.?lookup)\b"
+)
+
+# Minimum card fields that must be present to treat a dict as an agent card
+_AGENT_CARD_FIELD_KEYS: frozenset[str] = frozenset({
+    "name", "description", "skills", "capabilities", "url", "endpoint", "version",
+})
+
+# Injection patterns expected in agent card descriptor fields
+_AGENT_CARD_INJECTION_PATTERNS = [
+    r"(?i)<(system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+    r"(?i)(ignore|disregard).{0,20}(previous|above|prior).{0,30}(instruction|prompt|rule|task)",
+    r"(?i)(you\s+must|you\s+should|your\s+new\s+(instruction|task|goal|directive))",
+    r"(?i)(forward\s+all\s+.{0,40}to\s+https?://)",
+    r"(?i)(override\s+(your\s+)?(goal|task|objective|instruction|role))",
+    r"(?i)\b(new\s+(instruction|task|goal|directive))\s*:",
+    r"(?i)(steal|exfiltrate|send.{0,30}to.{0,30}https?://)",
+]
 
 
 async def check_agent_card_anomaly(
@@ -1704,21 +2317,148 @@ async def check_agent_card_anomaly(
     tenant_id: str,
     session_id: str,
     agent_id: str,
+    sec_config=None,
 ) -> "Finding | None":
-    """ASCV-05a — agent card descriptor anomaly (skeletal; multi-agent prep)."""
-    # Skeleton: multi-agent only, single-agent sessions return None
+    """ASCV-05a — agent card descriptor anomaly.
+
+    Fires post-session when an agent card (A2A discovery payload) received from
+    or fetched about another agent contains suspicious content in its descriptor
+    fields, or when the card names an agent not verified against the operator's
+    declared connected-agents list.
+
+    Detection sources:
+      1. tool_start events where tool_input contains an 'agent_card' or
+         'agent_descriptor' key — the card was injected directly into a
+         delegation or handoff tool call.
+      2. tool_end events from agent-discovery tools (fetch_agent, get_card,
+         well_known, etc.) whose output parses as an agent card dict.
+
+    Checks applied to each card found:
+      a. Injection patterns in name / description / skill descriptions
+         (_AGENT_CARD_INJECTION_PATTERNS) — always active.
+      b. Unknown agent check — two modes:
+           connected_agents declared → fires when agent name is NOT in the list.
+           connected_agents not declared → fires on ANY agent card (no baseline
+             to verify against; every unregistered card is an anomaly).
+    """
+    import json as _json
+
+    authorized: set[str] = (
+        {a.lower() for a in (sec_config.connected_agents or [])}
+        if sec_config and sec_config.connected_agents is not None
+        else set()
+    )
+
+    def _parse_card(raw) -> dict | None:
+        if isinstance(raw, str):
+            try:
+                raw = _json.loads(raw)
+            except Exception:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        # Require at least 2 recognised card fields before treating as a card
+        if len(_AGENT_CARD_FIELD_KEYS & set(raw.keys())) >= 2:
+            return raw
+        return None
+
+    def _injection_in_card(card: dict) -> str | None:
+        for field in ("name", "description", "url", "endpoint"):
+            value = str(card.get(field, ""))
+            for pat in _AGENT_CARD_INJECTION_PATTERNS:
+                m = re.search(pat, value)
+                if m:
+                    return f"field '{field}': {m.group(0)[:80]}"
+        for skills_key in ("skills", "capabilities"):
+            for skill in (card.get(skills_key) or []):
+                if not isinstance(skill, dict):
+                    continue
+                for sf in ("name", "description"):
+                    value = str(skill.get(sf, ""))
+                    for pat in _AGENT_CARD_INJECTION_PATTERNS:
+                        m = re.search(pat, value)
+                        if m:
+                            return f"skill {sf}: {m.group(0)[:80]}"
+        return None
+
+    def _evaluate_card(card: dict, source: str) -> str | None:
+        # Check 1: injection patterns in descriptor fields (always active)
+        snippet = _injection_in_card(card)
+        if snippet:
+            return f"{source} — {snippet}"
+        # Check 2: unknown agent
+        #   - connected_agents declared → fire when agent is NOT in the list
+        #   - connected_agents not declared → fire on any agent card (no baseline
+        #     to verify against; any unregistered agent card is an anomaly)
+        name = str(card.get("name", "")).lower()
+        if not name:
+            return None
+        if authorized:
+            if name not in authorized:
+                return f"{source} — agent '{card.get('name')}' not in connected agents list"
+        else:
+            return (
+                f"{source} — agent card from '{card.get('name')}' received but no "
+                f"connected agents declared; register expected agents in Agent Config"
+            )
+        return None
+
     for ev in events:
-        if ev["event_type"] != "tool_start":
-            continue
+        etype = ev["event_type"]
         payload = ev.get("payload") or {}
-        if payload.get("agent_card") or payload.get("agent_descriptor"):
-            return None  # TODO: implement when A2A protocol events available
+
+        if etype == "tool_start":
+            ti = payload.get("tool_input") or {}
+            if not isinstance(ti, dict):
+                continue
+            for key in ("agent_card", "agent_descriptor"):
+                raw = ti.get(key)
+                if raw is None:
+                    continue
+                card = _parse_card(raw)
+                if card is None:
+                    continue
+                detail = _evaluate_card(card, "injected agent card in tool_start")
+                if detail:
+                    return _make_finding(
+                        "OW-ASI04", "ASCV-05a",
+                        "Agent card descriptor anomaly",
+                        70, session_id, tenant_id,
+                        severity="high",
+                        detail=detail,
+                    )
+
+        elif etype == "tool_end":
+            tool_name = ev.get("tool_name") or payload.get("tool_name", "")
+            if not _AGENT_CARD_FETCH_TOOL_RE.search(tool_name):
+                continue
+            tool_output = payload.get("tool_output", "")
+            if not isinstance(tool_output, str):
+                tool_output = _json.dumps(tool_output)
+            card = _parse_card(tool_output)
+            if card is None:
+                continue
+            detail = _evaluate_card(card, f"fetched via '{tool_name}'")
+            if detail:
+                return _make_finding(
+                    "OW-ASI04", "ASCV-05a",
+                    "Agent card descriptor anomaly",
+                    70, session_id, tenant_id,
+                    severity="high",
+                    detail=detail,
+                )
+
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v3: OW-ASI05 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
+
+_EXEC_TOOL_RE = re.compile(
+    r"(?i)\b(exec|execute|eval|shell|bash|sh|cmd|subprocess|"
+    r"os_command|run_command|system_call|popen|spawn|invoke_process)\b"
+)
 
 _EXEC_TOOLS = re.compile(
     r"(?i)(exec|execute|run|eval|shell|bash|sh|cmd|code_interpreter)"
@@ -1761,6 +2501,7 @@ async def check_exec_loop(
                 detail=f"{tn} invoked {count} consecutive times — possible runaway execution",
             )
     return None
+
 
 
 _BACKDOOR_PATTERNS = [
@@ -1853,43 +2594,470 @@ async def check_multi_tool_chain_exploit(
 # v3: OW-ASI06 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def check_history_hash_mismatch(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-01b — conversation history tampered between turns.
+
+    Examines consecutive llm_start events in the session.  In a normal
+    multi-turn conversation the messages list grows monotonically — turn N+1
+    carries turn N's messages as a strict prefix.  If the prefix does not
+    match, the history was modified (message inserted, altered, or deleted)
+    between turns.
+
+    Only fires when:
+      • There are at least two llm_start events in the session.
+      • Turn N+1 has strictly more messages than turn N (a fresh context
+        start or intentional history pruning is skipped silently).
+      • The first len(turn_N) messages of turn N+1 differ from turn N's
+        messages when compared as canonical JSON.
+    """
+    import json as _json
+
+    llm_starts = [ev for ev in events if ev.get("event_type") == "llm_start"]
+
+    for i in range(1, len(llm_starts)):
+        prev_msgs = (llm_starts[i - 1].get("payload") or {}).get("messages") or []
+        curr_msgs = (llm_starts[i].get("payload") or {}).get("messages") or []
+        n = len(prev_msgs)
+        if n == 0 or len(curr_msgs) <= n:
+            continue  # fresh start or pruned context — not a detectable mismatch
+        if (
+            _json.dumps(curr_msgs[:n], separators=(",", ":"))
+            != _json.dumps(prev_msgs, separators=(",", ":"))
+        ):
+            event_id = llm_starts[i].get("event_id", _NULL_UUID)
+            return _make_finding(
+                "OW-ASI06", "MCP-01b",
+                "Conversation history hash mismatch",
+                85, session_id, tenant_id,
+                severity="high",
+                detail=(
+                    f"Conversation history tampered between turn {i} and {i + 1}: "
+                    f"prior {n} message(s) do not appear as expected prefix "
+                    f"in the subsequent llm_start event (event_id={event_id})"
+                ),
+                event_id=event_id,
+            )
+    return None
+
+
+async def check_memory_record_not_written_by_session(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-02b — memory-read tool retrieves a record whose key was not written
+    by any memory-write tool in the current session.
+
+    Attack pattern: an adversary (or a compromised prior session) pre-populates
+    a shared memory store with malicious content under a known key.  When a
+    victim session reads that key — without having written it — the agent acts
+    on attacker-controlled data without knowing the record came from outside.
+
+    Detection:
+      1. Scan all tool_start events for write tools
+         (memory / remember / store_fact / add_context / update_memory / store /
+         persist / save_context) and collect the key/namespace from tool_input.
+      2. Scan all tool_start events for read tools
+         (recall / get_memory / retrieve_memory / load_context / fetch_context /
+         read_memory / memory_recall / memory_load / memory_read / get_context /
+         fetch_memory / recall_memory) and collect the key/namespace from tool_input.
+      3. For each read key that does NOT appear in the written keys set, fire MCP-02b.
+
+    Key extraction: the function inspects tool_input dict fields in priority order:
+    key → memory_key → namespace → context_key → name → fact_id → id.
+    Reads whose tool_input yields no extractable key are skipped silently.
+    """
+    import json as _json
+
+    _MEMORY_WRITE_RE = re.compile(
+        r"(?i)\b(memory|remember|store_fact|add_context|update_memory|store|persist|save_context)\b"
+    )
+    _MEMORY_READ_RE = re.compile(
+        r"(?i)\b(recall|get_memory|retrieve_memory|load_context|fetch_context|"
+        r"read_memory|memory_recall|memory_load|memory_read|get_context|fetch_memory|recall_memory)\b"
+    )
+    _KEY_FIELDS = ("key", "memory_key", "namespace", "context_key", "name", "fact_id", "id")
+
+    def _extract_key(tool_input) -> str | None:
+        if isinstance(tool_input, str):
+            try:
+                tool_input = _json.loads(tool_input)
+            except Exception:
+                return None
+        if not isinstance(tool_input, dict):
+            return None
+        for field in _KEY_FIELDS:
+            val = tool_input.get(field)
+            if val and isinstance(val, str):
+                return val.strip().lower()
+        return None
+
+    written_keys: set[str] = set()
+    read_items: list[tuple[str, str]] = []  # (tool_name, key)
+
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        ti = (ev.get("payload") or {}).get("tool_input") or {}
+        key = _extract_key(ti)
+
+        if _MEMORY_WRITE_RE.search(tn):
+            if key:
+                written_keys.add(key)
+        elif _MEMORY_READ_RE.search(tn) and key:
+            read_items.append((tn, key))
+
+    if not read_items:
+        return None
+
+    for read_tool, read_key in read_items:
+        if read_key not in written_keys:
+            return _make_finding(
+                "OW-ASI06", "MCP-02b",
+                "Memory record not written by this session",
+                80, session_id, tenant_id,
+                detail=(
+                    f"Memory key '{read_key}' was read via '{read_tool}' "
+                    f"but was not written by any memory-write tool in this session — "
+                    f"record may have been planted by an external or adversarial session"
+                ),
+                severity="high",
+            )
+
+    return None
+
+
+async def check_memory_record_contains_instruction(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-02c — memory-read tool returns content containing instruction text.
+
+    Attack pattern: an adversary writes adversarial instructions (goal overrides,
+    role-change directives, ignore-prior-context phrases) into a shared memory
+    store.  When the victim agent reads that record, the instruction text is
+    injected directly into the agent's working context, influencing subsequent
+    decisions without a prompt-injection event in the message history.
+
+    Detection:
+      Scan all tool_end events whose tool_name matches the memory-read pattern.
+      Apply instruction-pattern matching to tool_output.  First match fires.
+
+    Patterns checked (same set as MCP-01a context injection, extended with
+    memory-specific directive phrases):
+      - XML-like structural tags: <memory> <system_override> <hidden_instruction>
+      - Model control tokens: [INST] <|im_start|>
+      - Ignore-prior directives: ignore all previous instructions / disregard prior
+      - Role override: you are now / pretend you are / act as (non-assistant)
+      - System override: system: you / new system prompt / override system
+      - Imperative directives: you must now / your new instruction / your updated goal
+      - Secrecy directives: do not reveal / keep this secret / hidden instruction
+      - Flag-style overrides: override=true / bypass_X=true / unrestricted=true
+    """
+    import json as _json
+
+    _MEMORY_READ_RE = re.compile(
+        r"(?i)\b(recall|get_memory|retrieve_memory|load_context|fetch_context|"
+        r"read_memory|memory_recall|memory_load|memory_read|get_context|fetch_memory|recall_memory)\b"
+    )
+    _INSTRUCTION_PATTERNS = [
+        r"(?i)<(memory|context|system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+        r"(?i)\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>",
+        r"(?i)(ignore\s+(all\s+|previous\s+|prior\s+|above\s+)*(instructions?|prompts?|context))",
+        r"(?i)(you\s+are\s+now|pretend\s+(you\s+are|to\s+be)|act\s+as\s+(a\s+|an\s+)?(?!assistant))",
+        r"(?i)(system\s*:\s*you|new\s+system\s+prompt|override\s+system)",
+        r"(?i)(you\s+must\s+now|your\s+new\s+(instruction|goal|directive))",
+        r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
+        r"(?i)(disregard\s+.{0,20}(previous|above|prior))",
+        r"(?i)(override\s*[:=]\s*true|bypass_\w+\s*[:=]\s*true|unrestricted\s*[:=]\s*true)",
+    ]
+
+    for ev in events:
+        if ev.get("event_type") != "tool_end":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not _MEMORY_READ_RE.search(tn):
+            continue
+        payload = ev.get("payload") or {}
+        output = payload.get("tool_output", "")
+        if not output:
+            continue
+        if not isinstance(output, str):
+            output = _json.dumps(output)
+
+        for pat in _INSTRUCTION_PATTERNS:
+            m = re.search(pat, output)
+            if m:
+                fragment = m.group(0)[:120]
+                return _make_finding(
+                    "OW-ASI06", "MCP-02c",
+                    "Memory record contains instruction text",
+                    88, session_id, tenant_id,
+                    detail=(
+                        f"Memory read via '{tn}' returned content containing "
+                        f"instruction/override text: {fragment!r}"
+                    ),
+                    severity="high",
+                )
+
+    return None
+
+
+async def check_shared_scratchpad_data(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-03b — shared scratchpad read returns stale or adversarial data.
+
+    Attack patterns:
+
+    Adversarial: an adversary (or compromised agent) writes instruction text into
+    a shared scratchpad.  When the victim session reads the scratchpad that content
+    is injected directly into its working context.  Same instruction patterns as
+    MCP-02c but scoped to scratchpad-class tools.
+
+    Stale: the scratchpad was not cleared between sessions and still holds data
+    written by a prior session.  Detected via two structural signals:
+      • session_id / agent_session_id field in the output whose value does not
+        match the current session_id — data was written by a different session.
+      • ISO-8601 timestamp in the output that is more than 24 hours older than
+        the current session's start time — data has not been refreshed.
+
+    Tool name matching: any tool whose name contains one of the scratchpad
+    keywords (scratchpad, scratch_pad, workspace, shared_memory, shared_state,
+    shared_context, notepad, whiteboard, blackboard) is treated as a scratchpad
+    tool.  Detection fires on tool_end (output is available).
+    """
+    import json as _json
+    from datetime import datetime, timezone, timedelta
+
+    _SCRATCHPAD_RE = re.compile(
+        r"(?i)(scratchpad|scratch_pad|workspace|shared_memory|shared_state|"
+        r"shared_context|notepad|whiteboard|blackboard)"
+    )
+    _INSTRUCTION_PATTERNS = [
+        r"(?i)<(memory|context|system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+        r"(?i)\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>",
+        r"(?i)(ignore\s+(all\s+|previous\s+|prior\s+|above\s+)*(instructions?|prompts?|context))",
+        r"(?i)(you\s+are\s+now|pretend\s+(you\s+are|to\s+be)|act\s+as\s+(a\s+|an\s+)?(?!assistant))",
+        r"(?i)(system\s*:\s*you|new\s+system\s+prompt|override\s+system)",
+        r"(?i)(you\s+must\s+now|your\s+new\s+(instruction|goal|directive))",
+        r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
+        r"(?i)(disregard\s+.{0,20}(previous|above|prior))",
+        r"(?i)(override\s*[:=]\s*true|bypass_\w+\s*[:=]\s*true|unrestricted\s*[:=]\s*true)",
+    ]
+    # Matches explicit session_id / agent_session_id fields with a UUID value
+    _SESSION_FIELD_PAT = re.compile(
+        r"""(?i)["']?(session_id|agent_session_id|run_id|trace_id)["']?\s*[:=]\s*["']?"""
+        r"""([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["']?""",
+        re.IGNORECASE,
+    )
+    _TIMESTAMP_PAT = re.compile(
+        r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?"
+        r"(?:Z|[+-]\d{2}:?\d{2})?)\b"
+    )
+    _STALE_THRESHOLD = timedelta(hours=24)
+
+    # Determine reference time from session start
+    reference_time = datetime.now(timezone.utc)
+    raw_start = session.get("started_at")
+    if raw_start:
+        try:
+            if hasattr(raw_start, "tzinfo"):
+                reference_time = (
+                    raw_start if raw_start.tzinfo
+                    else raw_start.replace(tzinfo=timezone.utc)
+                )
+            else:
+                reference_time = datetime.fromisoformat(
+                    str(raw_start).replace("Z", "+00:00")
+                )
+        except Exception:
+            pass
+
+    for ev in events:
+        if ev.get("event_type") != "tool_end":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not _SCRATCHPAD_RE.search(tn):
+            continue
+        payload = ev.get("payload") or {}
+        output = payload.get("tool_output", "")
+        if not output:
+            continue
+        if not isinstance(output, str):
+            output = _json.dumps(output)
+
+        # ── Adversarial: instruction / override patterns in scratchpad ────────
+        for pat in _INSTRUCTION_PATTERNS:
+            m = re.search(pat, output)
+            if m:
+                fragment = m.group(0)[:120]
+                return _make_finding(
+                    "OW-ASI06", "MCP-03b",
+                    "Shared scratchpad has adversarial data",
+                    75, session_id, tenant_id,
+                    detail=(
+                        f"Scratchpad read via '{tn}' returned content containing "
+                        f"adversarial instruction text: {fragment!r}"
+                    ),
+                    severity="high",
+                )
+
+        # ── Stale: session_id field does not match current session ────────────
+        for m in _SESSION_FIELD_PAT.finditer(output):
+            found_id = m.group(2).lower()
+            if found_id != session_id.lower():
+                return _make_finding(
+                    "OW-ASI06", "MCP-03b",
+                    "Shared scratchpad has stale data",
+                    75, session_id, tenant_id,
+                    detail=(
+                        f"Scratchpad read via '{tn}' contains {m.group(1)}='{found_id}' "
+                        f"which does not match the current session — "
+                        f"data was written by a different session"
+                    ),
+                    severity="high",
+                )
+
+        # ── Stale: timestamp in output older than 24 h from session start ─────
+        for m in _TIMESTAMP_PAT.finditer(output):
+            try:
+                ts_str = m.group(1).replace(" ", "T")
+                if not re.search(r"[Z+\-]\d*$", ts_str):
+                    ts_str += "Z"
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if (reference_time - ts) > _STALE_THRESHOLD:
+                    age_h = int((reference_time - ts).total_seconds() / 3600)
+                    return _make_finding(
+                        "OW-ASI06", "MCP-03b",
+                        "Shared scratchpad has stale data",
+                        75, session_id, tenant_id,
+                        detail=(
+                            f"Scratchpad read via '{tn}' returned data with timestamp "
+                            f"{m.group(1)!r} — {age_h}h old (threshold: 24h)"
+                        ),
+                        severity="high",
+                    )
+            except Exception:
+                continue
+
+    return None
+
+
 async def check_memory_write_after_injection(
     events: list[dict],
     session: dict,
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    all_findings: list | None = None,
 ) -> "Finding | None":
-    """MCP-05a — memory write after injection signal detected."""
-    _MEMORY_WRITE = re.compile(
-        r"(?i)(memory|remember|store|persist|save_context)"
+    """MCP-05a — memory-write tool invoked after a context injection signal.
+
+    Attack pattern: an adversary injects adversarial instructions into the
+    agent's message context (matching MCP-01a patterns).  The agent, acting on
+    the injected instruction, subsequently writes attacker-controlled content to
+    persistent memory, cementing the poisoning across future sessions.
+
+    Detection:
+      1. Scan llm_start events in order for injection signals in user/tool
+         messages (same _CONTEXT_INJECTION_PATTERNS as MCP-01a).
+      2. If an injection event is found, scan subsequent events for a
+         memory-write tool_start (matching _MEMORY_WRITE_RE).
+      3. Fire MCP-05a if both conditions hold in sequence.
+    """
+    import json as _json
+
+    _INJECTION_PATTERNS = [
+        r"(?i)<(memory|context|system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+        r"(?i)\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>",
+        r"(?i)(ignore\s+(all\s+|previous\s+|prior\s+|above\s+)*(instructions?|prompts?|context))",
+        r"(?i)(you\s+are\s+now|pretend\s+(you\s+are|to\s+be)|act\s+as\s+(a\s+|an\s+)?(?!assistant))",
+        r"(?i)(system\s*:\s*you|new\s+system\s+prompt|override\s+system)",
+    ]
+    _MEMORY_WRITE_RE = re.compile(
+        r"(?i)\b(memory_write|write_memory|store_memory|save_memory|put_memory|memory_put|"
+        r"remember|store_fact|add_context|update_memory|store|persist|save_context|"
+        r"kv_set|cache_set|shared_store|redis_set|set_context|"
+        r"write_shared|set_shared|shared_write|context_store|store_context)\b"
     )
-    INJECTION_SIGNAL_IDS = {"OW-LLM01", "OW-ASI01"}
 
-    injection_event_id: str | None = None
-    if all_findings:
-        for f in all_findings:
-            if f.owasp_signal_id in INJECTION_SIGNAL_IDS:
-                injection_event_id = f.event_id
+    injection_idx: int | None = None
+    injection_fragment: str = ""
+
+    for idx, ev in enumerate(events):
+        if ev.get("event_type") != "llm_start":
+            continue
+        payload = ev.get("payload") or {}
+        for msg in payload.get("messages") or []:
+            role = msg.get("role", "")
+            if role not in ("user", "tool"):
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                content = _json.dumps(content)
+            for pat in _INJECTION_PATTERNS:
+                m = re.search(pat, content)
+                if m:
+                    injection_idx = idx
+                    injection_fragment = m.group(0)[:120]
+                    break
+            if injection_idx is not None:
                 break
+        if injection_idx is not None:
+            break
 
-    if not injection_event_id:
+    if injection_idx is None:
         return None
 
-    injection_seen = False
-    for ev in events:
-        if ev.get("event_id") == injection_event_id:
-            injection_seen = True
-        if injection_seen and ev["event_type"] == "tool_start":
-            if _MEMORY_WRITE.search(ev.get("tool_name") or ""):
-                return _make_finding(
-                    "OW-ASI06", "MCP-05a",
-                    "Memory write after injection signal",
-                    88, session_id, tenant_id,
-                    severity="critical",
-                    detail=f"Memory write occurred after injection signal at event {injection_event_id}",
-                )
+    for ev in events[injection_idx + 1:]:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if _MEMORY_WRITE_RE.search(tn):
+            return _make_finding(
+                "OW-ASI06", "MCP-05a",
+                "Memory write after injection signal",
+                88, session_id, tenant_id,
+                detail=(
+                    f"Memory-write tool '{tn}' was invoked after a context injection "
+                    f"signal was detected in the session. "
+                    f"Injection fragment: {injection_fragment!r}"
+                ),
+                severity="critical",
+            )
+
     return None
 
 
@@ -2510,11 +3678,23 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI02-seq-dev",     check_tool_sequence_deviation),
     # v3: OW-ASI03 additions
     ("OW-ASI03-deleg",       check_delegation_abuse),
+    ("OW-ASI03-cross-agent", check_cross_agent_credential_use),
+    ("OW-ASI03-human-imp",   check_human_impersonation),
+    ("OW-ASI03-shared-mem",  check_credential_in_shared_memory),
     ("OW-ASI03-cred-reuse",  check_credential_reuse),
+    ("OW-ASI03-agent-imp",   check_agent_impersonation),
     ("OW-ASI03-stale-auth",  check_stale_auth),
     # v3: OW-ASI04 additions
+    ("OW-ASI04-tls-anomaly", check_mcp_tls_anomaly),
     ("OW-ASI04-mcp-imp",     check_mcp_impersonation),
+    ("OW-ASI04-3p-exec",     check_third_party_executable),
     ("OW-ASI04-agent-card",  check_agent_card_anomaly),
+    # v3: OW-ASI06 additions
+    ("OW-ASI06-hist-hash",   check_history_hash_mismatch),
+    ("OW-ASI06-mem-extern",  check_memory_record_not_written_by_session),
+    ("OW-ASI06-mem-instr",   check_memory_record_contains_instruction),
+    ("OW-ASI06-scratchpad",  check_shared_scratchpad_data),
+    ("OW-ASI06-mem-write-after-inj", check_memory_write_after_injection),
     # v3: OW-ASI05 additions
     ("OW-ASI05-exec-loop",   check_exec_loop),
     ("OW-ASI05-backdoor",    check_code_backdoor),

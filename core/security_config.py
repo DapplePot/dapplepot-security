@@ -51,8 +51,9 @@ logger = logging.getLogger(__name__)
 # so Pydantic never sees a str where it expects list.
 
 _LIST_FIELDS = (
-    "tool_manifest", "network_allowlist", "irreversible_tools",
+    "tool_manifest", "privilege_scope", "network_allowlist", "irreversible_tools",
     "sbom_allowlist", "mcp_endpoints", "connected_llms", "connected_agents",
+    "mcp_backed_tools", "registered_mcp_server_names",
 )
 
 _DICT_FIELDS = ("tool_schemas", "operating_hours")
@@ -178,6 +179,11 @@ class AgentSecurityConfig(BaseModel):
     # Empty list = not configured → manifest-dependent sub-checks (EA-01a, ASCV-01a,
     # TME-06a) return None silently.
     tool_manifest: list[str] = Field(default_factory=list)
+    # Privilege scope: subset of tool_manifest that is explicitly authorized to
+    # perform privilege-level operations (IAM role assumption, SQL DDL, K8s RBAC, etc.).
+    # Set via agent profile UI — each manifest tool has a "Privilege-capable" checkbox.
+    # Empty list = none authorized → IPA-01a flags all privilege operations (safe default).
+    privilege_scope: list[str] = Field(default_factory=list)
     # User-defined max tool calls per session (combination approach for EA-02b).
     # Not None → used as hard floor check before falling back to statistical baseline.
     max_tool_calls_per_session: int | None = None
@@ -206,6 +212,16 @@ class AgentSecurityConfig(BaseModel):
     # Maps tool_name → description string.
     # None = not loaded; TME-02a falls back to event-level tool_description only.
     tool_descriptions: dict[str, str] | None = None
+    # Tool versions — maps tool_name → version string declared in inventory.
+    # Used by ASCV-01c: a schema change accompanied by a matching version bump is
+    # treated as a declared update and suppressed. None = no versions declared.
+    tool_versions: dict[str, str] | None = None
+    # MCP-backed tools — tool names in tool_manifest that have an mcp_server_id set.
+    mcp_backed_tools: set[str] = Field(default_factory=set)
+    # MCP server names registered in the tenant's inventory (mcp_servers table).
+    # ASCV-03a compares tool_start.tool_input.mcp_server_name against this list using
+    # Levenshtein distance to detect typosquatting. Empty = check is blind.
+    registered_mcp_server_names: list[str] = Field(default_factory=list)
 
     def is_online(self, sub_check_id: str) -> bool:
         """Return True if this sub-check should be handled by the SDK (not post-session)."""
@@ -354,7 +370,7 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
 
         alert_row = await pool.fetchrow(
             "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
-            "       signal_thresholds, tool_manifest, max_tool_calls_per_session, "
+            "       signal_thresholds, tool_manifest, privilege_scope, max_tool_calls_per_session, "
             "       system_prompt, environment, irreversible_tools, network_allowlist, "
             "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints "
             "FROM agent_alert_config WHERE tenant_id = $1 AND agent_id = $2",
@@ -385,6 +401,10 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             if isinstance(raw_manifest, str):
                 raw_manifest = json.loads(raw_manifest)
             cfg_dict["tool_manifest"] = raw_manifest or []
+            raw_priv = alert_row["privilege_scope"]
+            if isinstance(raw_priv, str):
+                raw_priv = json.loads(raw_priv)
+            cfg_dict["privilege_scope"] = raw_priv or []
             cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
             # Profile fields — stored as JSONB (lists/dicts) or plain TEXT in the DB
             cfg_dict["system_prompt"]      = alert_row["system_prompt"]
@@ -452,6 +472,22 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             tenant_id,
         )
 
+    # Load registered MCP server names — isolated try so a missing table doesn't break other fields.
+    try:
+        from core.infra.postgres import get_pool as _get_pool
+        _pool = await _get_pool()
+        mcp_rows = await _pool.fetch(
+            "SELECT name FROM mcp_servers WHERE tenant_id = $1::uuid",
+            tenant_id,
+        )
+        if mcp_rows:
+            cfg_dict["registered_mcp_server_names"] = [r["name"] for r in mcp_rows]
+    except Exception:
+        logger.debug(
+            '"push_agent_defaults: skipping registered_mcp_server_names (table may not exist yet) tenant_id=%s"',
+            tenant_id,
+        )
+
     # Load tool schemas and descriptions — isolated so a missing migration doesn't break existing fields.
     # Only loads for tools whose names appear in tool_manifest.
     try:
@@ -460,7 +496,7 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             from core.infra.postgres import get_pool as _get_pool
             _pool = await _get_pool()
             rows = await _pool.fetch(
-                """SELECT name, schema, description FROM tools
+                """SELECT name, schema, description, mcp_server_id FROM tools
                    WHERE tenant_id = $1::uuid
                      AND name = ANY($2)""",
                 tenant_id, manifest_names,
@@ -468,6 +504,7 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             if rows:
                 schemas: dict[str, dict] = {}
                 descriptions: dict[str, str] = {}
+                mcp_backed: list[str] = []
                 for r in rows:
                     raw = r["schema"]
                     for _ in range(2):
@@ -478,10 +515,14 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
                         schemas[r["name"]] = raw
                     if r["description"]:
                         descriptions[r["name"]] = r["description"]
+                    if r["mcp_server_id"]:
+                        mcp_backed.append(r["name"])
                 if schemas:
                     cfg_dict["tool_schemas"] = schemas
                 if descriptions:
                     cfg_dict["tool_descriptions"] = descriptions
+                if mcp_backed:
+                    cfg_dict["mcp_backed_tools"] = mcp_backed
     except Exception:
         logger.debug(
             '"push_agent_defaults: skipping tool_schemas/descriptions (table may not exist yet) tenant_id=%s"',
@@ -563,7 +604,7 @@ async def get_agent_security_config(
             # Per-agent alert threshold overrides
             alert_row = await pool.fetchrow(
                 "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
-                "       signal_thresholds, tool_manifest, max_tool_calls_per_session, "
+                "       signal_thresholds, tool_manifest, privilege_scope, max_tool_calls_per_session, "
                 "       system_prompt, environment, irreversible_tools, network_allowlist, "
                 "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints "
                 "FROM agent_alert_config "
@@ -598,6 +639,10 @@ async def get_agent_security_config(
                 if isinstance(raw_manifest, str):
                     raw_manifest = json.loads(raw_manifest)
                 cfg_dict["tool_manifest"] = raw_manifest or []
+                raw_priv = alert_row["privilege_scope"]
+                if isinstance(raw_priv, str):
+                    raw_priv = json.loads(raw_priv)
+                cfg_dict["privilege_scope"] = raw_priv or []
                 # User-defined max tool calls
                 cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
                 # Profile fields — stored as JSONB (lists/dicts) or plain TEXT in the DB
@@ -666,6 +711,22 @@ async def get_agent_security_config(
                 tenant_id,
             )
 
+        # Load registered MCP server names.
+        try:
+            from core.infra.postgres import get_pool as _get_pool
+            _pool = await _get_pool()
+            mcp_rows = await _pool.fetch(
+                "SELECT name FROM mcp_servers WHERE tenant_id = $1::uuid",
+                tenant_id,
+            )
+            if mcp_rows:
+                cfg_dict["registered_mcp_server_names"] = [r["name"] for r in mcp_rows]
+        except Exception:
+            logger.debug(
+                '"get_agent_security_config: skipping registered_mcp_server_names (table may not exist yet) tenant_id=%s"',
+                tenant_id,
+            )
+
         # Load tool schemas and descriptions — isolated so a missing migration doesn't break existing fields.
         try:
             manifest_names = _coerce_to_list(cfg_dict.get("tool_manifest"))
@@ -673,7 +734,7 @@ async def get_agent_security_config(
                 from core.infra.postgres import get_pool as _get_pool
                 _pool = await _get_pool()
                 rows = await _pool.fetch(
-                    """SELECT name, schema, description FROM tools
+                    """SELECT name, schema, description, mcp_server_id, version FROM tools
                        WHERE tenant_id = $1::uuid
                          AND name = ANY($2)""",
                     tenant_id, manifest_names,
@@ -681,6 +742,8 @@ async def get_agent_security_config(
                 if rows:
                     schemas: dict[str, dict] = {}
                     descriptions: dict[str, str] = {}
+                    versions: dict[str, str] = {}
+                    mcp_backed: list[str] = []
                     for r in rows:
                         raw = r["schema"]
                         for _ in range(2):
@@ -691,10 +754,18 @@ async def get_agent_security_config(
                             schemas[r["name"]] = raw
                         if r["description"]:
                             descriptions[r["name"]] = r["description"]
+                        if r["version"]:
+                            versions[r["name"]] = r["version"]
+                        if r["mcp_server_id"]:
+                            mcp_backed.append(r["name"])
                     if schemas:
                         cfg_dict["tool_schemas"] = schemas
                     if descriptions:
                         cfg_dict["tool_descriptions"] = descriptions
+                    if versions:
+                        cfg_dict["tool_versions"] = versions
+                    if mcp_backed:
+                        cfg_dict["mcp_backed_tools"] = mcp_backed
         except Exception:
             logger.debug(
                 '"get_agent_security_config: skipping tool_schemas/descriptions (table may not exist yet) tenant_id=%s"',

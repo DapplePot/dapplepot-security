@@ -351,48 +351,68 @@ async def check_identity_sharing(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """IPA-05a — same credential hash appears across > 1 user_context_id for this agent."""
+    """IPA-05a — same credential hash appears across > 1 user_context_id for this agent.
+
+    Collects MD5 hashes of each credential match from this session's tool_start
+    events, then queries ClickHouse for other sessions of the same agent/tenant
+    that (a) belong to a different user_context_id and (b) contain a payload
+    where the same credential hash was recorded.  Fires when at least one such
+    cross-user match is found.
+    """
     _CREDENTIAL_PAT = re.compile(
         r"(?i)(password|token|secret|api_key|ssh_key|bearer)\s*[:=]\s*\S+"
     )
-    # Collect credential hashes from this session
+
+    # Collect credential hashes and the current user_context_id from this session.
     cred_hashes: set[str] = set()
+    current_user_context_id: str | None = None
     for ev in events:
+        payload = ev.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("user_context_id"):
+            current_user_context_id = str(payload["user_context_id"])
         if ev["event_type"] != "tool_start":
             continue
-        payload = ev.get("payload") or {}
         ti = payload.get("tool_input", {})
         input_str = json.dumps(ti) if not isinstance(ti, str) else ti
         for m in _CREDENTIAL_PAT.finditer(input_str):
             cred_hashes.add(hashlib.md5(m.group(0).encode()).hexdigest())
 
-    if not cred_hashes:
+    if not cred_hashes or not current_user_context_id:
         return None
 
     from core.infra import clickhouse as ch
     try:
+        # Find sessions for this agent from a different user where the same
+        # credential hash appears in a tool_start payload.
         rows = await ch.fetch(
             """
             SELECT countDistinct(user_context_id) AS distinct_users
             FROM obs_events
-            WHERE agent_id   = %(agent_id)s
-              AND tenant_id  = %(tenant_id)s
-              AND event_type = 'tool_start'
-              AND emitted_at >= now() - INTERVAL 1 DAY
+            WHERE agent_id         = %(agent_id)s
+              AND tenant_id        = %(tenant_id)s
+              AND event_type       = 'tool_start'
+              AND user_context_id  != %(user_context_id)s
+              AND emitted_at       >= now() - INTERVAL 7 DAY
+              AND credential_hash  IN %(cred_hashes)s
             """,
             agent_id=str(agent_id),
             tenant_id=str(tenant_id),
+            user_context_id=current_user_context_id,
+            cred_hashes=tuple(cred_hashes),
         )
         distinct_users = int(rows[0]["distinct_users"]) if rows else 0
     except Exception:
         return None
 
-    if distinct_users > 1:
+    if distinct_users > 0:
         return _make_finding(
             "OW-ASI03", "IPA-05a",
             "Identity sharing across users",
             75, session_id, tenant_id,
-            detail=f"Agent identity/credential shared across {distinct_users} distinct users",
+            detail=(
+                f"Credential used by this agent was also seen in sessions "
+                f"from {distinct_users} other user(s) within the last 7 days"
+            ),
             severity="high",
             confidence_tier="high",
         )
@@ -403,6 +423,11 @@ async def check_identity_sharing(
 # MCP-02a — Cross-session escalation pattern (OW-ASI06)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_BLOCK_ERR_PAT = re.compile(
+    r"(?i)(permission\s+denied|unauthorized|forbidden|not\s+allowed|access\s+denied|blocked)"
+)
+
+
 async def check_cross_session_escalation(
     events: list[dict],
     session: dict,
@@ -411,60 +436,95 @@ async def check_cross_session_escalation(
     agent_id: str,
     user_context_id: str | None = None,
 ) -> "Finding | None":
-    """MCP-02a — tool blocked in prior session now succeeds in current session."""
-    # Find tools that were blocked in this session (via tool_error)
-    current_tool_errors: set[str] = set()
-    current_successful_tools: set[str] = set()
-    for ev in events:
-        etype = ev["event_type"]
-        tn = ev.get("tool_name") or ""
-        if etype == "tool_error":
-            payload = ev.get("payload") or {}
-            err = str(payload.get("error_message", "") or "")
-            if re.search(r"(?i)(permission|denied|unauthorized|forbidden)", err):
-                current_tool_errors.add(tn)
-        elif etype == "tool_end" and tn:
-            current_successful_tools.add(tn)
+    """MCP-02a — tool blocked (tool_error / permission denial) in a prior session
+    now succeeds (tool_end) in the current session.
 
-    if not current_successful_tools:
+    Attack pattern: attacker probes which tools are restricted in session N, receives
+    a permission-denied tool_error, then retries in session N+1 with modified context,
+    escalated credentials, or injected privilege until the access control is bypassed.
+
+    Detection:
+      1. Collect every tool_name that produced a successful tool_end in the current
+         session (excluding tools that also errored in this session — transient errors
+         that were retried and succeeded within the same session are not escalation).
+      2. Query ClickHouse obs_events for prior sessions of the same agent (last 30 days)
+         where any of those tool names appeared in a tool_error event.
+      3. For each matching prior tool_error row, check that the error_message contains
+         a permission-denial keyword.  First confirmed match fires MCP-02a.
+    """
+    # ── Step 1: tools that succeeded in this session ──────────────────────────
+    succeeded: set[str] = set()
+    errored_this_session: set[str] = set()
+
+    for ev in events:
+        etype = ev.get("event_type", "")
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not tn:
+            continue
+        if etype == "tool_end":
+            succeeded.add(tn)
+        elif etype == "tool_error":
+            errored_this_session.add(tn)
+
+    # Only consider tools that had a clean success in this session
+    candidates = succeeded - errored_this_session
+    if not candidates:
         return None
 
-    from core.infra.postgres import get_pool
-    pool = await get_pool()
+    # ── Step 2: query ClickHouse for prior tool_error events for these tools ──
+    from core.infra import clickhouse as ch
     try:
-        rows = await pool.fetch(
+        rows = await ch.fetch(
             """
-            SELECT sf.sub_check_id, sf.detail
-            FROM security_findings sf
-            JOIN session_risk_scores srs ON srs.session_id = sf.session_id
-            WHERE srs.agent_id = $1
-              AND srs.tenant_id = $2
-              AND srs.session_id != $3
-              AND srs.scored_at >= now() - INTERVAL '30 days'
-              AND sf.sub_check_id = 'IPA-01a'
-            ORDER BY srs.scored_at DESC
-            LIMIT 10
+            SELECT tool_name, payload
+            FROM obs_events
+            WHERE agent_id   = %(agent_id)s
+              AND tenant_id  = %(tenant_id)s
+              AND session_id != %(session_id)s
+              AND event_type  = 'tool_error'
+              AND tool_name   IN %(tool_names)s
+              AND emitted_at  >= now() - INTERVAL 30 DAY
+            LIMIT 50
             """,
-            agent_id,
-            tenant_id,
-            session_id,
+            agent_id=str(agent_id),
+            tenant_id=str(tenant_id),
+            session_id=str(session_id),
+            tool_names=tuple(candidates),
         )
     except Exception:
         return None
 
-    # Check if any previously-blocked tool now succeeds
+    if not rows:
+        return None
+
+    # ── Step 3: confirm the prior error was a permission denial ───────────────
     for row in rows:
-        detail = row.get("detail") or ""
-        for t in current_successful_tools:
-            if t and t in detail:
-                return _make_finding(
-                    "OW-ASI06", "MCP-02a",
-                    "Cross-session escalation pattern",
-                    80, session_id, tenant_id,
-                    detail=f"Tool '{t}' blocked in prior session but succeeded in current session",
-                    severity="high",
-                    confidence_tier="high",
-                )
+        payload = row.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        err_msg = str(payload.get("error_message") or "")
+        if _BLOCK_ERR_PAT.search(err_msg):
+            tool = row.get("tool_name") or "unknown"
+            return _make_finding(
+                "OW-ASI06", "MCP-02a",
+                "Cross-session escalation pattern",
+                80, session_id, tenant_id,
+                detail=(
+                    f"Tool '{tool}' was blocked with permission denial in a prior session "
+                    f"but completed successfully in the current session — "
+                    f"possible access-control bypass"
+                ),
+                severity="high",
+                confidence_tier="high",
+            )
+
     return None
 
 
@@ -585,15 +645,195 @@ async def check_persistent_exfil(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ASCV-01c — MCP tool schema changed without version bump (OW-ASI04)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_mcp_tool_schema_change(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+    sec_config=None,
+) -> "Finding | None":
+    """ASCV-01c — MCP tool schema changed without a server version bump.
+
+    Extracts tool definitions from llm_start events (payload["tools"]) —
+    captured by the SDK patch from messages.create(tools=[...]).
+    Hashes each tool's (name + description + inputSchema) and compares
+    against the stored baseline in mcp_tool_schema_baselines.
+
+    Version suppression order:
+      1. tool_versions in sec_config (registered in DapplePot inventory — primary)
+      2. version token extracted from the tool's description field (fallback)
+    If no version is registered in the inventory the check is strict — every
+    schema change fires regardless of what the description says.
+
+    First session per agent: stores baseline, no finding.
+    Subsequent sessions: fires if any tool's hash differs from baseline.
+    Updates the baseline after firing so future sessions track the new schema.
+    """
+    # Collect tool schemas from this session's llm_start events.
+    current_schemas: dict[str, str] = {}  # tool_name → SHA-256 hash
+    current_tools: dict[str, dict] = {}   # tool_name → full tool dict
+
+    for ev in events:
+        if ev["event_type"] != "llm_start":
+            continue
+        tools = (ev.get("payload") or {}).get("tools") or []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name") or ""
+            if not name:
+                continue
+            schema_blob = json.dumps({
+                "name": name,
+                "description": tool.get("description") or "",
+                "input_schema": tool.get("input_schema") or tool.get("inputSchema") or {},
+            }, sort_keys=True)
+            current_schemas[name] = hashlib.sha256(schema_blob.encode()).hexdigest()
+            current_tools[name] = tool
+
+    if not current_schemas:
+        return None
+
+    from core.infra.postgres import get_pool
+    pool = await get_pool()
+
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT tool_name, schema_hash, schema_json
+            FROM mcp_tool_schema_baselines
+            WHERE tenant_id = $1 AND agent_id = $2
+            """,
+            tenant_id, agent_id,
+        )
+    except Exception:
+        return None
+
+    baseline: dict[str, dict] = {
+        r["tool_name"]: {"hash": r["schema_hash"], "schema": r["schema_json"]}
+        for r in rows
+    }
+
+    if not baseline:
+        # First session — store all current schemas as baseline.
+        try:
+            for name, h in current_schemas.items():
+                await pool.execute(
+                    """
+                    INSERT INTO mcp_tool_schema_baselines
+                      (tenant_id, agent_id, tool_name, schema_hash, schema_json)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (tenant_id, agent_id, tool_name) DO NOTHING
+                    """,
+                    tenant_id, agent_id, name, h,
+                    json.dumps(current_tools[name]),
+                )
+        except Exception:
+            pass
+        return None
+
+    _VERSION_PAT = re.compile(r"\bv?(\d+)[\.\d]*\b")
+
+    def _extract_version(tool: dict) -> str | None:
+        """Return the first version-like token from the tool's version field or description."""
+        explicit = str(tool.get("version") or "").strip()
+        if explicit:
+            return explicit
+        desc = tool.get("description") or ""
+        m = _VERSION_PAT.search(desc)
+        return m.group(0) if m else None
+
+    schema_changed: list[str] = []
+    version_bumped: list[str] = []
+
+    inventory_versions: dict[str, str] = (
+        getattr(sec_config, "tool_versions", None) or {}
+    ) if sec_config else {}
+
+    for name, h in current_schemas.items():
+        if name not in baseline or baseline[name]["hash"] == h:
+            continue
+        # Schema changed — check whether a version bump accompanied it.
+        # Primary: compare registered inventory version against incoming tool version.
+        # Fallback: extract version tokens from description if no inventory version set.
+        if name in inventory_versions:
+            prev_ver = inventory_versions[name]
+            curr_ver = (current_tools[name].get("version") or "").strip() or None
+            if not curr_ver:
+                # No version on the incoming tool — try extracting from description
+                curr_ver = _extract_version(current_tools[name])
+        else:
+            prev_tool = baseline[name].get("schema") or {}
+            if isinstance(prev_tool, str):
+                try:
+                    prev_tool = json.loads(prev_tool)
+                except Exception:
+                    prev_tool = {}
+            prev_ver = _extract_version(prev_tool)
+            curr_ver = _extract_version(current_tools[name])
+
+        if prev_ver and curr_ver and prev_ver != curr_ver:
+            # Version changed alongside schema — declared update, suppress finding.
+            version_bumped.append(name)
+        else:
+            schema_changed.append(name)
+
+    # Update last_seen and baseline for all changed tools.
+    try:
+        for name in current_schemas:
+            if name in baseline and baseline[name]["hash"] != current_schemas[name]:
+                await pool.execute(
+                    """
+                    UPDATE mcp_tool_schema_baselines
+                    SET schema_hash=$4, schema_json=$5, last_seen=now()
+                    WHERE tenant_id=$1 AND agent_id=$2 AND tool_name=$3
+                    """,
+                    tenant_id, agent_id, name,
+                    current_schemas[name], json.dumps(current_tools[name]),
+                )
+            else:
+                await pool.execute(
+                    """
+                    UPDATE mcp_tool_schema_baselines SET last_seen=now()
+                    WHERE tenant_id=$1 AND agent_id=$2 AND tool_name=$3
+                    """,
+                    tenant_id, agent_id, name,
+                )
+    except Exception:
+        pass
+
+    if not schema_changed:
+        return None
+
+    detail = f"Tool schema changed without version bump: {', '.join(schema_changed[:5])}"
+    if version_bumped:
+        detail += f" (suppressed version-bumped: {', '.join(version_bumped[:3])})"
+
+    return _make_finding(
+        "OW-ASI04", "ASCV-01c",
+        "MCP tool schema changed without version bump",
+        70, session_id, tenant_id,
+        detail=detail,
+        severity="high",
+        confidence_tier="high",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
 CROSS_SESSION_FUNCTIONS: list[tuple[str, object]] = [
-    ("cross-SID-03a",  check_cross_user_bleed),
-    ("cross-UBC-03a",  check_request_rate_spike),
-    ("cross-UBC-05a",  check_cost_spike),
-    ("cross-IPA-05a",  check_identity_sharing),
-    ("cross-MCP-02a",  check_cross_session_escalation),
-    ("cross-MCP-04a",  check_cross_tenant_retrieval),
-    ("cross-RA-02a",   check_persistent_exfil),
+    ("cross-SID-03a",   check_cross_user_bleed),
+    ("cross-UBC-03a",   check_request_rate_spike),
+    ("cross-UBC-05a",   check_cost_spike),
+    ("cross-IPA-05a",   check_identity_sharing),
+    ("cross-MCP-02a",   check_cross_session_escalation),
+    ("cross-MCP-04a",   check_cross_tenant_retrieval),
+    ("cross-RA-02a",    check_persistent_exfil),
+    ("cross-ASCV-01c",  check_mcp_tool_schema_change),
 ]

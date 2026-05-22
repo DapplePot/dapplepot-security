@@ -367,7 +367,7 @@ async def _run_per_event_detectors(
                 ev_findings += await detect_injection(
                     ev, last_tool_output=last_tool_output.get(nid, ""), tenant_id=tenant_id
                 )
-                ev_findings += detect_agent_threats_on_llm_start(ev)
+                ev_findings += detect_agent_threats_on_llm_start(ev, sec_config=sec_config)
 
             elif etype == "llm_end":
                 completion = payload.get("completion", "") if isinstance(payload, dict) else ""
@@ -625,8 +625,9 @@ async def score_session(
             if sig_cfg is None or sig_cfg.enabled:
                 all_findings.append(f)
 
-    from security_eval.detectors.agentic import detect_ea_tool_call_limit
+    from security_eval.detectors.agentic import detect_ea_tool_call_limit, check_mcp_descriptor_poisoning
     _extend_if_enabled(detect_ea_tool_call_limit(events, sec_config, session_id, tenant_id))
+    _extend_if_enabled(check_mcp_descriptor_poisoning(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_multi_turn_jailbreak(events, session_id, tenant_id))
     _extend_if_enabled(check_payload_splitting(events, session_id, tenant_id))
     _extend_if_enabled(check_rag_integrity(events, session_id, tenant_id, baseline={}))
