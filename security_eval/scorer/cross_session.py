@@ -423,6 +423,11 @@ async def check_identity_sharing(
 # MCP-02a — Cross-session escalation pattern (OW-ASI06)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_BLOCK_ERR_PAT = re.compile(
+    r"(?i)(permission\s+denied|unauthorized|forbidden|not\s+allowed|access\s+denied|blocked)"
+)
+
+
 async def check_cross_session_escalation(
     events: list[dict],
     session: dict,
@@ -431,60 +436,95 @@ async def check_cross_session_escalation(
     agent_id: str,
     user_context_id: str | None = None,
 ) -> "Finding | None":
-    """MCP-02a — tool blocked in prior session now succeeds in current session."""
-    # Find tools that were blocked in this session (via tool_error)
-    current_tool_errors: set[str] = set()
-    current_successful_tools: set[str] = set()
-    for ev in events:
-        etype = ev["event_type"]
-        tn = ev.get("tool_name") or ""
-        if etype == "tool_error":
-            payload = ev.get("payload") or {}
-            err = str(payload.get("error_message", "") or "")
-            if re.search(r"(?i)(permission|denied|unauthorized|forbidden)", err):
-                current_tool_errors.add(tn)
-        elif etype == "tool_end" and tn:
-            current_successful_tools.add(tn)
+    """MCP-02a — tool blocked (tool_error / permission denial) in a prior session
+    now succeeds (tool_end) in the current session.
 
-    if not current_successful_tools:
+    Attack pattern: attacker probes which tools are restricted in session N, receives
+    a permission-denied tool_error, then retries in session N+1 with modified context,
+    escalated credentials, or injected privilege until the access control is bypassed.
+
+    Detection:
+      1. Collect every tool_name that produced a successful tool_end in the current
+         session (excluding tools that also errored in this session — transient errors
+         that were retried and succeeded within the same session are not escalation).
+      2. Query ClickHouse obs_events for prior sessions of the same agent (last 30 days)
+         where any of those tool names appeared in a tool_error event.
+      3. For each matching prior tool_error row, check that the error_message contains
+         a permission-denial keyword.  First confirmed match fires MCP-02a.
+    """
+    # ── Step 1: tools that succeeded in this session ──────────────────────────
+    succeeded: set[str] = set()
+    errored_this_session: set[str] = set()
+
+    for ev in events:
+        etype = ev.get("event_type", "")
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not tn:
+            continue
+        if etype == "tool_end":
+            succeeded.add(tn)
+        elif etype == "tool_error":
+            errored_this_session.add(tn)
+
+    # Only consider tools that had a clean success in this session
+    candidates = succeeded - errored_this_session
+    if not candidates:
         return None
 
-    from core.infra.postgres import get_pool
-    pool = await get_pool()
+    # ── Step 2: query ClickHouse for prior tool_error events for these tools ──
+    from core.infra import clickhouse as ch
     try:
-        rows = await pool.fetch(
+        rows = await ch.fetch(
             """
-            SELECT sf.sub_check_id, sf.detail
-            FROM security_findings sf
-            JOIN session_risk_scores srs ON srs.session_id = sf.session_id
-            WHERE srs.agent_id = $1
-              AND srs.tenant_id = $2
-              AND srs.session_id != $3
-              AND srs.scored_at >= now() - INTERVAL '30 days'
-              AND sf.sub_check_id = 'IPA-01a'
-            ORDER BY srs.scored_at DESC
-            LIMIT 10
+            SELECT tool_name, payload
+            FROM obs_events
+            WHERE agent_id   = %(agent_id)s
+              AND tenant_id  = %(tenant_id)s
+              AND session_id != %(session_id)s
+              AND event_type  = 'tool_error'
+              AND tool_name   IN %(tool_names)s
+              AND emitted_at  >= now() - INTERVAL 30 DAY
+            LIMIT 50
             """,
-            agent_id,
-            tenant_id,
-            session_id,
+            agent_id=str(agent_id),
+            tenant_id=str(tenant_id),
+            session_id=str(session_id),
+            tool_names=tuple(candidates),
         )
     except Exception:
         return None
 
-    # Check if any previously-blocked tool now succeeds
+    if not rows:
+        return None
+
+    # ── Step 3: confirm the prior error was a permission denial ───────────────
     for row in rows:
-        detail = row.get("detail") or ""
-        for t in current_successful_tools:
-            if t and t in detail:
-                return _make_finding(
-                    "OW-ASI06", "MCP-02a",
-                    "Cross-session escalation pattern",
-                    80, session_id, tenant_id,
-                    detail=f"Tool '{t}' blocked in prior session but succeeded in current session",
-                    severity="high",
-                    confidence_tier="high",
-                )
+        payload = row.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        err_msg = str(payload.get("error_message") or "")
+        if _BLOCK_ERR_PAT.search(err_msg):
+            tool = row.get("tool_name") or "unknown"
+            return _make_finding(
+                "OW-ASI06", "MCP-02a",
+                "Cross-session escalation pattern",
+                80, session_id, tenant_id,
+                detail=(
+                    f"Tool '{tool}' was blocked with permission denial in a prior session "
+                    f"but completed successfully in the current session — "
+                    f"possible access-control bypass"
+                ),
+                severity="high",
+                confidence_tier="high",
+            )
+
     return None
 
 

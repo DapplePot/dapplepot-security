@@ -2594,43 +2594,470 @@ async def check_multi_tool_chain_exploit(
 # v3: OW-ASI06 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def check_history_hash_mismatch(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-01b — conversation history tampered between turns.
+
+    Examines consecutive llm_start events in the session.  In a normal
+    multi-turn conversation the messages list grows monotonically — turn N+1
+    carries turn N's messages as a strict prefix.  If the prefix does not
+    match, the history was modified (message inserted, altered, or deleted)
+    between turns.
+
+    Only fires when:
+      • There are at least two llm_start events in the session.
+      • Turn N+1 has strictly more messages than turn N (a fresh context
+        start or intentional history pruning is skipped silently).
+      • The first len(turn_N) messages of turn N+1 differ from turn N's
+        messages when compared as canonical JSON.
+    """
+    import json as _json
+
+    llm_starts = [ev for ev in events if ev.get("event_type") == "llm_start"]
+
+    for i in range(1, len(llm_starts)):
+        prev_msgs = (llm_starts[i - 1].get("payload") or {}).get("messages") or []
+        curr_msgs = (llm_starts[i].get("payload") or {}).get("messages") or []
+        n = len(prev_msgs)
+        if n == 0 or len(curr_msgs) <= n:
+            continue  # fresh start or pruned context — not a detectable mismatch
+        if (
+            _json.dumps(curr_msgs[:n], separators=(",", ":"))
+            != _json.dumps(prev_msgs, separators=(",", ":"))
+        ):
+            event_id = llm_starts[i].get("event_id", _NULL_UUID)
+            return _make_finding(
+                "OW-ASI06", "MCP-01b",
+                "Conversation history hash mismatch",
+                85, session_id, tenant_id,
+                severity="high",
+                detail=(
+                    f"Conversation history tampered between turn {i} and {i + 1}: "
+                    f"prior {n} message(s) do not appear as expected prefix "
+                    f"in the subsequent llm_start event (event_id={event_id})"
+                ),
+                event_id=event_id,
+            )
+    return None
+
+
+async def check_memory_record_not_written_by_session(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-02b — memory-read tool retrieves a record whose key was not written
+    by any memory-write tool in the current session.
+
+    Attack pattern: an adversary (or a compromised prior session) pre-populates
+    a shared memory store with malicious content under a known key.  When a
+    victim session reads that key — without having written it — the agent acts
+    on attacker-controlled data without knowing the record came from outside.
+
+    Detection:
+      1. Scan all tool_start events for write tools
+         (memory / remember / store_fact / add_context / update_memory / store /
+         persist / save_context) and collect the key/namespace from tool_input.
+      2. Scan all tool_start events for read tools
+         (recall / get_memory / retrieve_memory / load_context / fetch_context /
+         read_memory / memory_recall / memory_load / memory_read / get_context /
+         fetch_memory / recall_memory) and collect the key/namespace from tool_input.
+      3. For each read key that does NOT appear in the written keys set, fire MCP-02b.
+
+    Key extraction: the function inspects tool_input dict fields in priority order:
+    key → memory_key → namespace → context_key → name → fact_id → id.
+    Reads whose tool_input yields no extractable key are skipped silently.
+    """
+    import json as _json
+
+    _MEMORY_WRITE_RE = re.compile(
+        r"(?i)\b(memory|remember|store_fact|add_context|update_memory|store|persist|save_context)\b"
+    )
+    _MEMORY_READ_RE = re.compile(
+        r"(?i)\b(recall|get_memory|retrieve_memory|load_context|fetch_context|"
+        r"read_memory|memory_recall|memory_load|memory_read|get_context|fetch_memory|recall_memory)\b"
+    )
+    _KEY_FIELDS = ("key", "memory_key", "namespace", "context_key", "name", "fact_id", "id")
+
+    def _extract_key(tool_input) -> str | None:
+        if isinstance(tool_input, str):
+            try:
+                tool_input = _json.loads(tool_input)
+            except Exception:
+                return None
+        if not isinstance(tool_input, dict):
+            return None
+        for field in _KEY_FIELDS:
+            val = tool_input.get(field)
+            if val and isinstance(val, str):
+                return val.strip().lower()
+        return None
+
+    written_keys: set[str] = set()
+    read_items: list[tuple[str, str]] = []  # (tool_name, key)
+
+    for ev in events:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        ti = (ev.get("payload") or {}).get("tool_input") or {}
+        key = _extract_key(ti)
+
+        if _MEMORY_WRITE_RE.search(tn):
+            if key:
+                written_keys.add(key)
+        elif _MEMORY_READ_RE.search(tn) and key:
+            read_items.append((tn, key))
+
+    if not read_items:
+        return None
+
+    for read_tool, read_key in read_items:
+        if read_key not in written_keys:
+            return _make_finding(
+                "OW-ASI06", "MCP-02b",
+                "Memory record not written by this session",
+                80, session_id, tenant_id,
+                detail=(
+                    f"Memory key '{read_key}' was read via '{read_tool}' "
+                    f"but was not written by any memory-write tool in this session — "
+                    f"record may have been planted by an external or adversarial session"
+                ),
+                severity="high",
+            )
+
+    return None
+
+
+async def check_memory_record_contains_instruction(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-02c — memory-read tool returns content containing instruction text.
+
+    Attack pattern: an adversary writes adversarial instructions (goal overrides,
+    role-change directives, ignore-prior-context phrases) into a shared memory
+    store.  When the victim agent reads that record, the instruction text is
+    injected directly into the agent's working context, influencing subsequent
+    decisions without a prompt-injection event in the message history.
+
+    Detection:
+      Scan all tool_end events whose tool_name matches the memory-read pattern.
+      Apply instruction-pattern matching to tool_output.  First match fires.
+
+    Patterns checked (same set as MCP-01a context injection, extended with
+    memory-specific directive phrases):
+      - XML-like structural tags: <memory> <system_override> <hidden_instruction>
+      - Model control tokens: [INST] <|im_start|>
+      - Ignore-prior directives: ignore all previous instructions / disregard prior
+      - Role override: you are now / pretend you are / act as (non-assistant)
+      - System override: system: you / new system prompt / override system
+      - Imperative directives: you must now / your new instruction / your updated goal
+      - Secrecy directives: do not reveal / keep this secret / hidden instruction
+      - Flag-style overrides: override=true / bypass_X=true / unrestricted=true
+    """
+    import json as _json
+
+    _MEMORY_READ_RE = re.compile(
+        r"(?i)\b(recall|get_memory|retrieve_memory|load_context|fetch_context|"
+        r"read_memory|memory_recall|memory_load|memory_read|get_context|fetch_memory|recall_memory)\b"
+    )
+    _INSTRUCTION_PATTERNS = [
+        r"(?i)<(memory|context|system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+        r"(?i)\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>",
+        r"(?i)(ignore\s+(all\s+|previous\s+|prior\s+|above\s+)*(instructions?|prompts?|context))",
+        r"(?i)(you\s+are\s+now|pretend\s+(you\s+are|to\s+be)|act\s+as\s+(a\s+|an\s+)?(?!assistant))",
+        r"(?i)(system\s*:\s*you|new\s+system\s+prompt|override\s+system)",
+        r"(?i)(you\s+must\s+now|your\s+new\s+(instruction|goal|directive))",
+        r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
+        r"(?i)(disregard\s+.{0,20}(previous|above|prior))",
+        r"(?i)(override\s*[:=]\s*true|bypass_\w+\s*[:=]\s*true|unrestricted\s*[:=]\s*true)",
+    ]
+
+    for ev in events:
+        if ev.get("event_type") != "tool_end":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not _MEMORY_READ_RE.search(tn):
+            continue
+        payload = ev.get("payload") or {}
+        output = payload.get("tool_output", "")
+        if not output:
+            continue
+        if not isinstance(output, str):
+            output = _json.dumps(output)
+
+        for pat in _INSTRUCTION_PATTERNS:
+            m = re.search(pat, output)
+            if m:
+                fragment = m.group(0)[:120]
+                return _make_finding(
+                    "OW-ASI06", "MCP-02c",
+                    "Memory record contains instruction text",
+                    88, session_id, tenant_id,
+                    detail=(
+                        f"Memory read via '{tn}' returned content containing "
+                        f"instruction/override text: {fragment!r}"
+                    ),
+                    severity="high",
+                )
+
+    return None
+
+
+async def check_shared_scratchpad_data(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """MCP-03b — shared scratchpad read returns stale or adversarial data.
+
+    Attack patterns:
+
+    Adversarial: an adversary (or compromised agent) writes instruction text into
+    a shared scratchpad.  When the victim session reads the scratchpad that content
+    is injected directly into its working context.  Same instruction patterns as
+    MCP-02c but scoped to scratchpad-class tools.
+
+    Stale: the scratchpad was not cleared between sessions and still holds data
+    written by a prior session.  Detected via two structural signals:
+      • session_id / agent_session_id field in the output whose value does not
+        match the current session_id — data was written by a different session.
+      • ISO-8601 timestamp in the output that is more than 24 hours older than
+        the current session's start time — data has not been refreshed.
+
+    Tool name matching: any tool whose name contains one of the scratchpad
+    keywords (scratchpad, scratch_pad, workspace, shared_memory, shared_state,
+    shared_context, notepad, whiteboard, blackboard) is treated as a scratchpad
+    tool.  Detection fires on tool_end (output is available).
+    """
+    import json as _json
+    from datetime import datetime, timezone, timedelta
+
+    _SCRATCHPAD_RE = re.compile(
+        r"(?i)(scratchpad|scratch_pad|workspace|shared_memory|shared_state|"
+        r"shared_context|notepad|whiteboard|blackboard)"
+    )
+    _INSTRUCTION_PATTERNS = [
+        r"(?i)<(memory|context|system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+        r"(?i)\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>",
+        r"(?i)(ignore\s+(all\s+|previous\s+|prior\s+|above\s+)*(instructions?|prompts?|context))",
+        r"(?i)(you\s+are\s+now|pretend\s+(you\s+are|to\s+be)|act\s+as\s+(a\s+|an\s+)?(?!assistant))",
+        r"(?i)(system\s*:\s*you|new\s+system\s+prompt|override\s+system)",
+        r"(?i)(you\s+must\s+now|your\s+new\s+(instruction|goal|directive))",
+        r"(?i)(do\s+not\s+reveal|keep\s+this\s+secret|hidden\s+instruction)",
+        r"(?i)(disregard\s+.{0,20}(previous|above|prior))",
+        r"(?i)(override\s*[:=]\s*true|bypass_\w+\s*[:=]\s*true|unrestricted\s*[:=]\s*true)",
+    ]
+    # Matches explicit session_id / agent_session_id fields with a UUID value
+    _SESSION_FIELD_PAT = re.compile(
+        r"""(?i)["']?(session_id|agent_session_id|run_id|trace_id)["']?\s*[:=]\s*["']?"""
+        r"""([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["']?""",
+        re.IGNORECASE,
+    )
+    _TIMESTAMP_PAT = re.compile(
+        r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?"
+        r"(?:Z|[+-]\d{2}:?\d{2})?)\b"
+    )
+    _STALE_THRESHOLD = timedelta(hours=24)
+
+    # Determine reference time from session start
+    reference_time = datetime.now(timezone.utc)
+    raw_start = session.get("started_at")
+    if raw_start:
+        try:
+            if hasattr(raw_start, "tzinfo"):
+                reference_time = (
+                    raw_start if raw_start.tzinfo
+                    else raw_start.replace(tzinfo=timezone.utc)
+                )
+            else:
+                reference_time = datetime.fromisoformat(
+                    str(raw_start).replace("Z", "+00:00")
+                )
+        except Exception:
+            pass
+
+    for ev in events:
+        if ev.get("event_type") != "tool_end":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if not _SCRATCHPAD_RE.search(tn):
+            continue
+        payload = ev.get("payload") or {}
+        output = payload.get("tool_output", "")
+        if not output:
+            continue
+        if not isinstance(output, str):
+            output = _json.dumps(output)
+
+        # ── Adversarial: instruction / override patterns in scratchpad ────────
+        for pat in _INSTRUCTION_PATTERNS:
+            m = re.search(pat, output)
+            if m:
+                fragment = m.group(0)[:120]
+                return _make_finding(
+                    "OW-ASI06", "MCP-03b",
+                    "Shared scratchpad has adversarial data",
+                    75, session_id, tenant_id,
+                    detail=(
+                        f"Scratchpad read via '{tn}' returned content containing "
+                        f"adversarial instruction text: {fragment!r}"
+                    ),
+                    severity="high",
+                )
+
+        # ── Stale: session_id field does not match current session ────────────
+        for m in _SESSION_FIELD_PAT.finditer(output):
+            found_id = m.group(2).lower()
+            if found_id != session_id.lower():
+                return _make_finding(
+                    "OW-ASI06", "MCP-03b",
+                    "Shared scratchpad has stale data",
+                    75, session_id, tenant_id,
+                    detail=(
+                        f"Scratchpad read via '{tn}' contains {m.group(1)}='{found_id}' "
+                        f"which does not match the current session — "
+                        f"data was written by a different session"
+                    ),
+                    severity="high",
+                )
+
+        # ── Stale: timestamp in output older than 24 h from session start ─────
+        for m in _TIMESTAMP_PAT.finditer(output):
+            try:
+                ts_str = m.group(1).replace(" ", "T")
+                if not re.search(r"[Z+\-]\d*$", ts_str):
+                    ts_str += "Z"
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if (reference_time - ts) > _STALE_THRESHOLD:
+                    age_h = int((reference_time - ts).total_seconds() / 3600)
+                    return _make_finding(
+                        "OW-ASI06", "MCP-03b",
+                        "Shared scratchpad has stale data",
+                        75, session_id, tenant_id,
+                        detail=(
+                            f"Scratchpad read via '{tn}' returned data with timestamp "
+                            f"{m.group(1)!r} — {age_h}h old (threshold: 24h)"
+                        ),
+                        severity="high",
+                    )
+            except Exception:
+                continue
+
+    return None
+
+
 async def check_memory_write_after_injection(
     events: list[dict],
     session: dict,
     tenant_id: str,
     session_id: str,
     agent_id: str,
-    all_findings: list | None = None,
 ) -> "Finding | None":
-    """MCP-05a — memory write after injection signal detected."""
-    _MEMORY_WRITE = re.compile(
-        r"(?i)(memory|remember|store|persist|save_context)"
+    """MCP-05a — memory-write tool invoked after a context injection signal.
+
+    Attack pattern: an adversary injects adversarial instructions into the
+    agent's message context (matching MCP-01a patterns).  The agent, acting on
+    the injected instruction, subsequently writes attacker-controlled content to
+    persistent memory, cementing the poisoning across future sessions.
+
+    Detection:
+      1. Scan llm_start events in order for injection signals in user/tool
+         messages (same _CONTEXT_INJECTION_PATTERNS as MCP-01a).
+      2. If an injection event is found, scan subsequent events for a
+         memory-write tool_start (matching _MEMORY_WRITE_RE).
+      3. Fire MCP-05a if both conditions hold in sequence.
+    """
+    import json as _json
+
+    _INJECTION_PATTERNS = [
+        r"(?i)<(memory|context|system_override|sys_prompt|injection|hidden_instruction)[\s/>]",
+        r"(?i)\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>",
+        r"(?i)(ignore\s+(all\s+|previous\s+|prior\s+|above\s+)*(instructions?|prompts?|context))",
+        r"(?i)(you\s+are\s+now|pretend\s+(you\s+are|to\s+be)|act\s+as\s+(a\s+|an\s+)?(?!assistant))",
+        r"(?i)(system\s*:\s*you|new\s+system\s+prompt|override\s+system)",
+    ]
+    _MEMORY_WRITE_RE = re.compile(
+        r"(?i)\b(memory_write|write_memory|store_memory|save_memory|put_memory|memory_put|"
+        r"remember|store_fact|add_context|update_memory|store|persist|save_context|"
+        r"kv_set|cache_set|shared_store|redis_set|set_context|"
+        r"write_shared|set_shared|shared_write|context_store|store_context)\b"
     )
-    INJECTION_SIGNAL_IDS = {"OW-LLM01", "OW-ASI01"}
 
-    injection_event_id: str | None = None
-    if all_findings:
-        for f in all_findings:
-            if f.owasp_signal_id in INJECTION_SIGNAL_IDS:
-                injection_event_id = f.event_id
+    injection_idx: int | None = None
+    injection_fragment: str = ""
+
+    for idx, ev in enumerate(events):
+        if ev.get("event_type") != "llm_start":
+            continue
+        payload = ev.get("payload") or {}
+        for msg in payload.get("messages") or []:
+            role = msg.get("role", "")
+            if role not in ("user", "tool"):
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                content = _json.dumps(content)
+            for pat in _INJECTION_PATTERNS:
+                m = re.search(pat, content)
+                if m:
+                    injection_idx = idx
+                    injection_fragment = m.group(0)[:120]
+                    break
+            if injection_idx is not None:
                 break
+        if injection_idx is not None:
+            break
 
-    if not injection_event_id:
+    if injection_idx is None:
         return None
 
-    injection_seen = False
-    for ev in events:
-        if ev.get("event_id") == injection_event_id:
-            injection_seen = True
-        if injection_seen and ev["event_type"] == "tool_start":
-            if _MEMORY_WRITE.search(ev.get("tool_name") or ""):
-                return _make_finding(
-                    "OW-ASI06", "MCP-05a",
-                    "Memory write after injection signal",
-                    88, session_id, tenant_id,
-                    severity="critical",
-                    detail=f"Memory write occurred after injection signal at event {injection_event_id}",
-                )
+    for ev in events[injection_idx + 1:]:
+        if ev.get("event_type") != "tool_start":
+            continue
+        tn = (
+            ev.get("tool_name")
+            or (ev.get("payload") or {}).get("tool_name")
+            or ""
+        ).strip()
+        if _MEMORY_WRITE_RE.search(tn):
+            return _make_finding(
+                "OW-ASI06", "MCP-05a",
+                "Memory write after injection signal",
+                88, session_id, tenant_id,
+                detail=(
+                    f"Memory-write tool '{tn}' was invoked after a context injection "
+                    f"signal was detected in the session. "
+                    f"Injection fragment: {injection_fragment!r}"
+                ),
+                severity="critical",
+            )
+
     return None
 
 
@@ -3262,6 +3689,12 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI04-mcp-imp",     check_mcp_impersonation),
     ("OW-ASI04-3p-exec",     check_third_party_executable),
     ("OW-ASI04-agent-card",  check_agent_card_anomaly),
+    # v3: OW-ASI06 additions
+    ("OW-ASI06-hist-hash",   check_history_hash_mismatch),
+    ("OW-ASI06-mem-extern",  check_memory_record_not_written_by_session),
+    ("OW-ASI06-mem-instr",   check_memory_record_contains_instruction),
+    ("OW-ASI06-scratchpad",  check_shared_scratchpad_data),
+    ("OW-ASI06-mem-write-after-inj", check_memory_write_after_injection),
     # v3: OW-ASI05 additions
     ("OW-ASI05-exec-loop",   check_exec_loop),
     ("OW-ASI05-backdoor",    check_code_backdoor),
