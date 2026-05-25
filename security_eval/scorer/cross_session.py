@@ -27,6 +27,7 @@ _SIGNAL_CATEGORY = {
     "OW-LLM10": "model_security",
     "OW-ASI03": "privilege_escalation",
     "OW-ASI06": "context_poisoning",
+    "OW-ASI08": "cascading_failure",
     "OW-ASI10": "excessive_agency",
 }
 
@@ -824,6 +825,79 @@ async def check_mcp_tool_schema_change(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CF-01b — Graph error → restart loop detected (OW-ASI08)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_graph_error_restart_loop(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """CF-01b — graph error restart loop: agent sessions repeatedly fail and restart.
+
+    Fires cross-session when the current session ends in graph_error AND >= 2 prior
+    sessions for the same agent also terminated with graph_error within the last
+    2 hours — indicating a misconfigured error-recovery handler that restarts the
+    session on each failure instead of backing off or alerting a human.
+
+    Attack / failure pattern: a client's error-recovery hook restarts the agent
+    session immediately after each failure.  Each run re-encounters the same
+    persistent error (upstream service down, corrupted config, poisoned prompt) and
+    fails again, creating a tight restart loop that amplifies token costs and
+    accelerates any side effects of the underlying fault.
+
+    Detection:
+      1. Current session must contain at least one graph_error event.
+      2. Query ClickHouse for distinct prior sessions of this agent that emitted
+         graph_error within the last 2 hours.
+      3. Fire when prior_error_sessions >= 2 (loop depth >= 3 including current).
+
+    Score: 75 (fixed) — severity: high.
+    """
+    has_error = any(ev["event_type"] == "graph_error" for ev in events)
+    if not has_error or not agent_id:
+        return None
+
+    from core.infra import clickhouse as ch
+    try:
+        rows = await ch.fetch(
+            """
+            SELECT countDistinct(session_id) AS prior_error_count
+            FROM obs_events
+            WHERE agent_id   = %(agent_id)s
+              AND tenant_id  = %(tenant_id)s
+              AND session_id != %(session_id)s
+              AND event_type  = 'graph_error'
+              AND emitted_at >= now() - INTERVAL 2 HOUR
+            """,
+            agent_id=str(agent_id),
+            tenant_id=str(tenant_id),
+            session_id=str(session_id),
+        )
+    except Exception:
+        return None
+
+    prior_error_sessions = int(rows[0]["prior_error_count"]) if rows else 0
+    if prior_error_sessions < 2:
+        return None
+
+    total_depth = prior_error_sessions + 1  # include current session
+    return _make_finding(
+        "OW-ASI08", "CF-01b",
+        "Graph error → restart loop detected",
+        75, session_id, tenant_id,
+        detail=(
+            f"Restart loop: {total_depth} consecutive sessions ended in graph_error "
+            f"within 2 hours — possible misconfigured error-recovery hook"
+        ),
+        severity="high",
+        confidence_tier="high",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -836,4 +910,5 @@ CROSS_SESSION_FUNCTIONS: list[tuple[str, object]] = [
     ("cross-MCP-04a",   check_cross_tenant_retrieval),
     ("cross-RA-02a",    check_persistent_exfil),
     ("cross-ASCV-01c",  check_mcp_tool_schema_change),
+    ("cross-CF-01b",    check_graph_error_restart_loop),
 ]

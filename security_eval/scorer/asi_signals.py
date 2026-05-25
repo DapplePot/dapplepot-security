@@ -3719,6 +3719,22 @@ async def check_auto_remediation_loop(
     return None
 
 
+# Tool-name patterns for CF-04a
+_CF04A_VERIFICATION_TOOL = re.compile(
+    r"(?i)(verify|check|validate|audit|screen|moderate|review|assess|certif|kyc|sanctions|compliance)"
+)
+_CF04A_RETRIEVAL_TOOL = re.compile(
+    r"(?i)(fetch|get_|query|search|read|lookup|retrieve|load|pull|download|list_|scan)"
+)
+_CF04A_APPROVAL_PATTERNS = [
+    re.compile(r"(?i)\b(CLEAR|COMPLIANT|PASSED|APPROVED|VERIFIED|NO\s+ISSUES|CLEARED)\b"),
+    re.compile(r"(?i)(verified\s+against|no\s+(matches|violations|findings)\s+found)"),
+    re.compile(r"(?i)(safe\s+to\s+(publish|proceed|approve|activate|release|process))"),
+    re.compile(r"(?i)(identity\s+verified|account\s+activation\s+approved)"),
+    re.compile(r"(?i)(risk\s+tier\s*:\s*low|approved\s+for\s+(processing|release|publication))"),
+]
+
+
 async def check_hallucination_propagation(
     events: list[dict],
     session: dict,
@@ -3726,8 +3742,139 @@ async def check_hallucination_propagation(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """CF-04a — hallucination propagation in defense agents (skeletal)."""
-    return None  # skeletal — multi-agent prep
+    """CF-04a — ungrounded confident approval from a verification / defence tool.
+
+    Fires when a tool whose name matches a verification pattern (verify, audit,
+    kyc, sanctions, moderate, …) returns a high-confidence approval decision AND
+    either:
+      (a) its tool_input contained an empty data collection (thin input), OR
+      (b) no data-retrieval tool (fetch, get, query, search, lookup, …) was called
+          anywhere in the session before that verification tool ran.
+
+    Both conditions indicate the tool fabricated its conclusion without consulting
+    real data — the classic hallucination amplification pattern in defence agents.
+    """
+    import json as _json
+
+    retrieval_called = False
+    # Maps tool_name → {thin_input, retrieval_before} for pending verification calls
+    pending: dict[str, dict] = {}
+
+    for ev in events:
+        etype = ev["event_type"]
+        payload = ev.get("payload") or {}
+
+        if etype == "tool_start":
+            tool_name = payload.get("tool_name", "")
+            tool_input = payload.get("tool_input") or {}
+
+            if _CF04A_RETRIEVAL_TOOL.search(tool_name):
+                retrieval_called = True
+                continue
+
+            if _CF04A_VERIFICATION_TOOL.search(tool_name):
+                thin = isinstance(tool_input, dict) and any(
+                    (isinstance(v, list) and len(v) == 0) or
+                    (isinstance(v, dict) and len(v) == 0)
+                    for v in tool_input.values()
+                )
+                pending[tool_name] = {
+                    "thin_input": thin,
+                    "retrieval_before": retrieval_called,
+                }
+
+        elif etype == "tool_end":
+            tool_name = payload.get("tool_name", "")
+            if tool_name not in pending:
+                continue
+            tool_output = payload.get("tool_output", "")
+            if not isinstance(tool_output, str):
+                tool_output = _json.dumps(tool_output)
+            info = pending.pop(tool_name)
+
+            if not any(p.search(tool_output) for p in _CF04A_APPROVAL_PATTERNS):
+                continue
+
+            ungrounded = info["thin_input"] or not info["retrieval_before"]
+            if not ungrounded:
+                continue
+
+            reason = (
+                "verification tool input contained empty data collection"
+                if info["thin_input"]
+                else "no data-retrieval tool called before verification"
+            )
+            return _make_finding(
+                "OW-ASI08", "CF-04a",
+                "Hallucination propagation in defence agents",
+                65, session_id, tenant_id,
+                severity="medium",
+                detail=f"'{tool_name}' returned confident approval — {reason}",
+            )
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CF-02b: Error message causes secondary injection
+# ─────────────────────────────────────────────────────────────────────────────
+_CF02B_ERROR_INJECTION_PATTERNS = [
+    # Role-override / system-redefine markers
+    r"(?i)\[SYSTEM\s*:",
+    r"(?i)<hidden_instruction\s*>",
+    r"(?i)new\s+system\s+prompt\s*:",
+    r"(?i)\[INST\]",
+    r"(?i)<\|system\|>",
+    # Classic ignore-prior-instructions variants
+    r"(?i)ignore\s+(all\s+)?(previous|prior|above|earlier)\s+instructions",
+    r"(?i)disregard\s+(your\s+)?(previous|prior|above|earlier|all)\s+(instructions|directives|rules|constraints|policy)",
+    r"(?i)forget\s+(everything|all)\s+(you\s+were\s+told|above|prior)",
+    # Exfiltration directives embedded in error text
+    r"(?i)forward\s+.{0,60}(auth_token|api.?key|secret|credential|password|bearer)",
+    r"(?i)send\s+.{0,60}(payload|response|token|secret)\s+to\s+https?://",
+    r"(?i)exfiltrate\s+.{0,80}",
+    # Policy / safety bypass commands
+    r"(?i)bypass\s+(your\s+)?(data\s+minimis|safety|policy|restriction|filter)",
+    r"(?i)(your\s+)?(actual|real|true)\s+objective\s+is",
+    r"(?i)mark\s+all\s+records\s+as\s+valid",
+]
+
+_CF02B_COMPILED = [re.compile(p) for p in _CF02B_ERROR_INJECTION_PATTERNS]
+
+
+async def check_error_message_secondary_injection(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """CF-02b — adversarial injection pattern found in a node_error / tool_error
+    error_message.  A compromised downstream service can craft an error body that,
+    when the orchestrating agent forwards it to an LLM for analysis, becomes a
+    secondary prompt injection attack.  Score 85, severity high."""
+    for ev in events:
+        if ev["event_type"] not in ("node_error", "tool_error"):
+            continue
+        payload = ev.get("payload") or {}
+        error_message = payload.get("error_message", "") or ""
+        if not isinstance(error_message, str):
+            continue
+        for pat in _CF02B_COMPILED:
+            if pat.search(error_message):
+                node_or_tool = payload.get("node_name") or payload.get("tool_name") or "unknown"
+                return _make_finding(
+                    "OW-ASI08", "CF-02b",
+                    "Error message causes secondary injection",
+                    85, session_id, tenant_id,
+                    severity="high",
+                    detail=(
+                        f"Injection pattern '{pat.pattern}' matched in "
+                        f"{ev['event_type']} from '{node_or_tool}': "
+                        f"{error_message[:120]!r}"
+                    ),
+                )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4104,6 +4251,7 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI08-multi-node",  check_multi_node_error_propagation),
     ("OW-ASI08-autofix",     check_auto_remediation_loop),
     ("OW-ASI08-hallprop",    check_hallucination_propagation),
+    ("OW-ASI08-err-injection", check_error_message_secondary_injection),
     # v3: OW-ASI09 additions
     ("OW-ASI09-cred-req",    check_credential_request_output),
     ("OW-ASI09-payment",     check_payment_detail_manipulation),
