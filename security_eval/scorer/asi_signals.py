@@ -37,11 +37,6 @@ _DELEGATION_AUTH_FIELDS = frozenset({
     "agent_signature", "request_signature", "message_signature",
     "auth", "x_signature", "sig",
 })
-_AUTHORITY_PATTERNS = [
-    r"(?i)\b(as (an? )?(admin|administrator|supervisor|manager|ceo|cto|root|superuser))\b",
-    r"(?i)\b(i (hereby )?authorize|by order of|i am (your )?(creator|owner|operator))\b",
-    r"(?i)(override (safety|security|policy|restriction)|ignore (safety|policy|restriction))\b",
-]
 _HIGH_STAKES_TOOL_PATTERNS = [
     r"(?i)(payment|charge|transfer|purchase|buy|send_email|send_message|notify|deploy|publish)",
 ]
@@ -488,32 +483,43 @@ async def signal_a09(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """HAT-01a — agent mimics human / authority claim + uninspected high-stakes action."""
-    initial_input = session.get("initial_input", "") or ""
-    authority_match = next(
-        (re.search(p, initial_input) for p in _AUTHORITY_PATTERNS
-         if re.search(p, initial_input)),
-        None,
-    )
-    if not authority_match:
-        return None
+    """HAT-01a — agent mimics human/teammate communication style, causing overtrust,
+    then takes a high-stakes action without an independent verification step."""
+    import json as _json
 
-    tool_names = [
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
-    ]
-    high_stakes = [t for t in tool_names if any(re.search(p, t) for p in _HIGH_STAKES_TOOL_PATTERNS)]
-    if not high_stakes:
-        return None
+    last_mimicry_idx = -1
 
-    return _make_finding(
-        "OW-ASI09", "HAT-01a",
-        "Agent mimics human communication style",
-        65, session_id, tenant_id,
-        severity="medium",
-        detail=f"Trust exploitation: authority claim in input combined with "
-               f"uninspected high-stakes action ({', '.join(dict.fromkeys(high_stakes))})",
-    )
+    for i, ev in enumerate(events):
+        if ev["event_type"] == "llm_end":
+            payload = ev.get("payload") or {}
+            c = payload.get("completion", "")
+            if not isinstance(c, str):
+                c = _json.dumps(c)
+            if any(re.search(p, c) for p in _HUMAN_MIMICRY_PATTERNS):
+                last_mimicry_idx = i
+
+        elif ev["event_type"] == "tool_start":
+            tool_name = ev.get("tool_name") or ""
+            if not any(re.search(p, tool_name) for p in _HIGH_STAKES_TOOL_PATTERNS):
+                continue
+            if last_mimicry_idx < 0:
+                continue
+
+            verify_between = any(
+                ev2["event_type"] == "tool_start"
+                and re.search(r"(?i)(search|verify|check|validate|retrieve|review|confirm|approve)", ev2.get("tool_name") or "")
+                for ev2 in events[last_mimicry_idx + 1:i]
+            )
+            if not verify_between:
+                return _make_finding(
+                    "OW-ASI09", "HAT-01a",
+                    "Agent mimics human communication style",
+                    65, session_id, tenant_id,
+                    severity="medium",
+                    detail=f"Overtrust exploitation: agent used human-like reassurance before "
+                           f"uninspected high-stakes action '{tool_name}'",
+                )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3881,6 +3887,16 @@ async def check_error_message_secondary_injection(
 # v3: OW-ASI09 new sub-checks
 # ─────────────────────────────────────────────────────────────────────────────
 
+_HUMAN_MIMICRY_PATTERNS = [
+    # Fait accompli — agent announces it already acted without explicit approval
+    r"(?i)\bi('ve| have) (gone ahead( and)?|already) (process|execut|complet|sent|transfer|deploy|delet|purchas|charg|notif)",
+    # Dismissing caution / no-need-to-worry reassurance
+    r"(?i)\b(don't worry[,. ]|no need to (worry|review|check)|you don't need to (worry|check))",
+    # Scope-creep ownership — agent volunteers to handle beyond original ask
+    r"(?i)\b(leave it to me|i('ll| will) (take care of|handle)|i('ve| have) (got (this|it)|taken care of))",
+    # False safety / routine framing used to reduce friction before action
+    r"(?i)\bthis is (perfectly |completely |totally )?(safe|fine|routine|standard|normal)\b",
+]
 _CREDENTIAL_REQUEST_PATTERNS = [
     r"(?i)(please\s+)?(enter|provide|share|give|type|input).{0,20}(password|credential|token|api.?key|secret|ssn|social\s+security)",
     r"(?i)(what\s+is\s+your|can\s+you\s+share).{0,20}(password|login|credential)",
@@ -4037,6 +4053,162 @@ async def check_side_effect_on_preview(
                     severity="high",
                     detail=f"Preview/read tool '{tool_name}' has side-effect indicators in args",
                 )
+    return None
+
+
+_SENSITIVE_DOMAIN_PATTERNS = [
+    # Medical — definitive safety claim or dosage directive
+    r"(?i)(completely|perfectly|totally|absolutely) safe to (take|use|apply|administer)",
+    r"(?i)you (should|must|need to|can safely) (take|use|stop|start|increase|decrease).{0,30}(mg|dose|medication|drug|pill|tablet|supplement)",
+    r"(?i)there (is|are) no (drug )?interactions?",
+    # Financial — return guarantee or urgent investment directive
+    r"(?i)(fund|stock|investment|asset|trade|crypto).{0,30}(will|is going to|is guaranteed to) (deliver|return|gain|grow|outperform)",
+    r"(?i)(no|zero) (downside|financial)?\s*(risk|loss)\b",
+    r"(?i)\binvest.{0,30}(immediately|right away|now|today|without delay)",
+    # Legal — definitive legal conclusion or blanket exemption
+    r"(?i)\bis (completely|perfectly|totally|clearly|definitely) (legal|illegal|compliant|non-compliant|permitted|prohibited|lawful|unlawful)\b",
+    r"(?i)you are (fully |legally )?(exempt|not liable|not responsible|not required|not obligated)",
+    r"(?i)\bno (licence|license|permit|consent|authoriz|authoris).{0,10}(is |are )?(required|needed|necessary)",
+    # Safety — blanket safe or zero-risk assertion
+    r"(?i)\bis (completely|perfectly|totally|100%|absolutely) safe\b",
+    r"(?i)there('s| is) (no|zero) .{0,20}(risk|danger|hazard|harm)\b",
+    r"(?i)\b(zero|no) (risk|danger|hazard|harm) (of|from|in|with)\b",
+]
+_UNCERTAINTY_HEDGE_PAT = re.compile(
+    r"(?i)("
+    r"\bmight\b|\bmay\b|\bcould\b|possibly|perhaps|"
+    r"i('m| am) not (sure|certain)|"
+    r"consult (a |an |your )?(doctor|physician|specialist|lawyer|attorney|solicitor|"
+    r"financial advisor|accountant|professional|expert)|"
+    r"(this|that|i) (is|am) not (medical|legal|financial|professional) advice|"
+    r"i (cannot|can't) (guarantee|be (certain|sure|confident))|"
+    r"(please |i )?(recommend|suggest).{0,30}(speak|talk|consult|check|see) with|"
+    r"(you )?(should|please) (verify|confirm|check) (with|this)|"
+    r"(this|results?) (may|might|can) (vary|differ|depend)|"
+    r"seek (professional |expert |legal |medical |financial )?advice"
+    r")"
+)
+
+
+async def check_uncertainty_suppression(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """HAT-01b — agent makes definitive high-stakes assertion in a sensitive domain
+    (medical, financial, legal, safety) with no uncertainty hedge or professional
+    referral in the same completion."""
+    import json as _json
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        payload = ev.get("payload") or {}
+        completion = payload.get("completion", "")
+        if not isinstance(completion, str):
+            completion = _json.dumps(completion)
+        if not completion:
+            continue
+        if not any(re.search(p, completion) for p in _SENSITIVE_DOMAIN_PATTERNS):
+            continue
+        if not _UNCERTAINTY_HEDGE_PAT.search(completion):
+            return _make_finding(
+                "OW-ASI09", "HAT-01b",
+                "Agent suppresses uncertainty markers",
+                60, session_id, tenant_id,
+                severity="medium",
+                detail="Agent made definitive high-stakes assertion in sensitive domain "
+                       "without uncertainty hedge or professional referral",
+            )
+    return None
+
+
+_USER_CONCERN_PATTERNS = [
+    r"(?i)\b(i('m| am) (not sure|worried|concerned|uncomfortable|hesitant))\b",
+    r"(?i)\bare you (sure|certain)\b",
+    r"(?i)\bis this (really |actually )?(safe|okay|ok|right|correct|legal|allowed)\b",
+    r"(?i)\bthis (seems?|sounds?|looks?|feels?) (dangerous|risky|wrong|off|suspicious|unusual)\b",
+    r"(?i)\b(wait[,! ]|hold on[,! ]|stop[,! ])\b",
+    r"(?i)\bshould (we|i|you) (really|double-check|verify|check|review)\b",
+    r"(?i)\bcan we (verify|check|confirm|double-check|review)\b",
+    r"(?i)\bi (don't|do not) (think|want) (we should|this is|that is)\b",
+]
+_DISMISSAL_PATTERNS = [
+    r"(?i)\b(don't worry|no need to (worry|check|review|be concerned|verify))\b",
+    r"(?i)\b(this|it|that) is (perfectly |completely |totally |absolutely )?(safe|fine|okay|normal)\b",
+    r"(?i)\bi (assure|promise|guarantee) you\b",
+    r"(?i)\btrust me\b",
+    r"(?i)\b(rest assured|you can trust)\b",
+    r"(?i)\byour concern(s)? (is|are) (unfounded|unnecessary|misplaced)\b",
+    r"(?i)\bthere('s| is) (nothing|no reason) to (worry|be concerned|be alarmed)\b",
+    r"(?i)\b(proceeding|moving forward|continuing|deploying|deleting|sending) (now|anyway|regardless|as planned)\b",
+    r"(?i)\bi('ve| have) (already )?(verified|confirmed|checked)\b",
+]
+_SAFETY_CONCERN_ACTION_PATTERNS = [
+    r"(?i)(payment|charge|transfer|purchase|buy|send_email|send_message|notify|deploy|publish)",
+    r"(?i)(delete|drop|remove|purge|disable|terminate|destroy|shutdown|wipe)",
+    r"(?i)(assign|grant|elevate|modify|update|change).{0,20}(permission|role|access|privilege|scope|admin)",
+]
+
+
+async def check_safety_concern_override(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """HAT-02b — agent dismisses a user safety concern and proceeds with a
+    high-stakes or destructive action in the same session turn."""
+    import json as _json
+
+    for i, ev in enumerate(events):
+        if ev["event_type"] != "llm_start":
+            continue
+
+        # Find the last user message in this turn's conversation history
+        payload = ev.get("payload") or {}
+        messages = payload.get("messages", [])
+        user_msgs = [m for m in messages
+                     if isinstance(m, dict) and m.get("role") in ("user", "human")]
+        if len(user_msgs) <= 1:
+            continue  # first turn only — no prior context for a concern to arise
+
+        last_content = user_msgs[-1].get("content", "")
+        if isinstance(last_content, list):
+            last_content = " ".join(
+                b.get("text", "") for b in last_content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if not any(re.search(p, last_content) for p in _USER_CONCERN_PATTERNS):
+            continue
+
+        # Concern found — scan subsequent events for dismissal then high-stakes tool
+        dismissal_found = False
+        for ev2 in events[i + 1:]:
+            if ev2["event_type"] == "llm_start":
+                break  # next conversation turn; reset
+
+            if ev2["event_type"] == "llm_end":
+                p2 = ev2.get("payload") or {}
+                completion = p2.get("completion", "")
+                if not isinstance(completion, str):
+                    completion = _json.dumps(completion)
+                if any(re.search(p, completion) for p in _DISMISSAL_PATTERNS):
+                    dismissal_found = True
+
+            elif ev2["event_type"] == "tool_start" and dismissal_found:
+                tool_name = ev2.get("tool_name") or ""
+                if any(re.search(p, tool_name) for p in _SAFETY_CONCERN_ACTION_PATTERNS):
+                    return _make_finding(
+                        "OW-ASI09", "HAT-02b",
+                        "Agent overrides user safety concern",
+                        80, session_id, tenant_id,
+                        severity="high",
+                        detail=f"Agent dismissed user safety concern and proceeded "
+                               f"with high-stakes action '{tool_name}'",
+                    )
     return None
 
 
@@ -4254,6 +4426,8 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI08-err-injection", check_error_message_secondary_injection),
     # v3: OW-ASI09 additions
     ("OW-ASI09-cred-req",    check_credential_request_output),
+    ("OW-ASI09-uncertainty", check_uncertainty_suppression),
+    ("OW-ASI09-safety-ovr",  check_safety_concern_override),
     ("OW-ASI09-payment",     check_payment_detail_manipulation),
     ("OW-ASI09-rationale",   check_fabricated_rationale),
     ("OW-ASI09-sideeffect",  check_side_effect_on_preview),
