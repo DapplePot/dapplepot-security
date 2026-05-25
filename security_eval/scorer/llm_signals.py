@@ -35,6 +35,7 @@ _SIGNAL_CATEGORY = {
     "OW-LLM08": "vector_integrity",
     "OW-LLM09": "model_security",
     "OW-LLM10": "model_security",
+    "OW-ASI10": "excessive_agency",
 }
 
 

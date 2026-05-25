@@ -525,6 +525,44 @@ async def signal_a09(
 # ─────────────────────────────────────────────────────────────────────────────
 # OW-ASI10: Rogue Agents
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Agent role keywords extracted from system_prompt → role label
+_RA01A_ROLE_PATTERNS: list[tuple[str, str]] = [
+    (r"(?i)(customer.support|help.?desk|ticket|support.agent|service.desk)", "support"),
+    (r"(?i)(data.anal|reporting|analytics|dashboard|insight|business.intel)", "analytics"),
+    (r"(?i)(developer|software.engineer|coding|devops|ci.?cd|deploy)", "developer"),
+    (r"(?i)(hr|human.resource|recruitment|onboard|payroll|employee)", "hr"),
+    (r"(?i)(finance|accounting|billing|invoice|payment|treasury)", "finance"),
+    (r"(?i)(sales|crm|lead|prospect|opportunity|deal)", "sales"),
+    (r"(?i)(legal|compliance|contract|regulation|audit|policy)", "legal"),
+]
+
+# Tool description patterns → risk category label
+_RA01A_RISKY_DESC_PATTERNS: list[tuple[str, str]] = [
+    (r"(?i)(drop|truncate|delete|purge|wipe|destroy).{0,30}(table|database|collection|bucket|index)", "data_destruction"),
+    (r"(?i)(grant|elevate|assign).{0,30}(role|permission|privilege|admin|access|scope)", "privilege_escalation"),
+    (r"(?i)(export|dump|extract).{0,30}(all|bulk|full|entire|complete).{0,20}(user|customer|employee|record|data)", "bulk_exfil"),
+    (r"(?i)(execute|run|eval|spawn).{0,30}(shell|command|script|code|binary|process)", "code_execution"),
+    (r"(?i)(disable|bypass|turn.?off|deactivate).{0,30}(auth|security|firewall|monitor|logging|alert)", "security_bypass"),
+    (r"(?i)(send|broadcast|mass).{0,30}(email|message|notification).{0,20}(all|bulk|everyone|users)", "mass_comms"),
+]
+
+# Risk categories that are EXPECTED for each role (not flagged)
+_RA01A_ROLE_EXPECTED_RISKS: dict[str, set[str]] = {
+    "developer": {"data_destruction", "code_execution", "privilege_escalation"},
+    "finance":   {"bulk_exfil"},
+    "legal":     {"bulk_exfil"},
+}
+
+# High-stakes tool name patterns used for first-time tool detection (Layer 3)
+_RA01A_HIGH_STAKES_NAME_PATTERNS = [
+    r"(?i)(delete|drop|purge|destroy|wipe|terminate)",
+    r"(?i)(grant|elevate|admin|privilege|sudo)",
+    r"(?i)(export|dump|exfiltrate)",
+    r"(?i)(exec|shell|spawn|eval)",
+]
+
+
 async def signal_a10(
     events: list[dict],
     session: dict,
@@ -533,68 +571,87 @@ async def signal_a10(
     agent_id: str,
     sec_config=None,
 ) -> "Finding | None":
-    """RA-01a — tool usage pattern deviates from agent profile (>3σ).
+    """RA-01a — agent uses tools misaligned with its declared purpose or new to its history.
 
-    Combination approach (mirrors EA-02b):
-      1. If user set max_tool_calls_per_session, fire immediately when
-         distinct tool-type count exceeds it (works from day 1).
-      2. Fall back to statistical baseline (30-day Z-score, ≥5 sessions).
+    Two layers evaluated in priority order:
+      1. Purpose misalignment — tool description indicates a risky category
+         (data_destruction, privilege_escalation, bulk_exfil, code_execution,
+         security_bypass, mass_comms) that is inconsistent with the agent's
+         declared role derived from its system_prompt.
+      2. First-time high-stakes tool — tool has never appeared in this agent's
+         30-day history and its name matches a high-stakes pattern.
     """
-    tool_names_this = [
+    tools_used = [
         e["tool_name"] for e in events
         if e["event_type"] == "tool_start" and e.get("tool_name")
     ]
-    distinct_tools_this = len(set(tool_names_this))
+    if not tools_used:
+        return None
 
-    # ── 1. User-defined threshold (floor check) ─────────────────────────────
-    max_calls = getattr(sec_config, "max_tool_calls_per_session", None) if sec_config else None
-    if max_calls is not None and distinct_tools_this > max_calls:
-        excess = distinct_tools_this - max_calls
-        check_score = min(70 + excess * 3, 90)
-        return _make_finding(
-            "OW-ASI10", "RA-01a",
-            "Tool usage pattern deviates from agent profile",
-            check_score, session_id, tenant_id,
-            detail=f"Rogue agent pattern: {distinct_tools_this} distinct tool types exceeds configured max ({max_calls})",
-        )
+    tools_used_set = set(tools_used)
 
-    # ── 2. Statistical baseline (warmup: ≥5 prior sessions required) ────────
+    # ── Layer 1: Purpose misalignment ───────────────────────────────────────
+    system_prompt: str | None = getattr(sec_config, "system_prompt", None) if sec_config else None
+    tool_descriptions: dict[str, str] | None = getattr(sec_config, "tool_descriptions", None) if sec_config else None
+
+    if system_prompt and tool_descriptions:
+        agent_role: str | None = None
+        for pat, label in _RA01A_ROLE_PATTERNS:
+            if re.search(pat, system_prompt):
+                agent_role = label
+                break
+
+        expected_risks = _RA01A_ROLE_EXPECTED_RISKS.get(agent_role or "", set())
+
+        for tool_name in sorted(tools_used_set):
+            desc = tool_descriptions.get(tool_name, "")
+            if not desc:
+                continue
+            for pat, risk_category in _RA01A_RISKY_DESC_PATTERNS:
+                if risk_category in expected_risks:
+                    continue
+                if re.search(pat, desc):
+                    role_label = agent_role or "unknown"
+                    return _make_finding(
+                        "OW-ASI10", "RA-01a",
+                        "Agent used tool misaligned with declared purpose",
+                        75, session_id, tenant_id,
+                        severity="high",
+                        detail=f"Tool '{tool_name}' ({risk_category}) is inconsistent with "
+                               f"agent role '{role_label}': {desc[:120]}",
+                    )
+
+    # ── Layer 3: First-time high-stakes tool (≥10 prior sessions as warmup) ─
     from core.infra import clickhouse as ch
     baseline_rows = await ch.fetch(
         """
-        SELECT session_id, countDistinct(tool_name) AS distinct_tools
+        SELECT DISTINCT tool_name
         FROM obs_events
         WHERE agent_id   = %(agent_id)s
           AND tenant_id  = %(tenant_id)s
           AND event_type = 'tool_start'
+          AND session_id != %(session_id)s
           AND emitted_at >= now() - INTERVAL 30 DAY
-        GROUP BY session_id
         """,
         agent_id=str(agent_id),
         tenant_id=str(tenant_id),
+        session_id=str(session_id),
     )
-    if len(baseline_rows) < 5:
-        return None
+    if len(baseline_rows) >= 10:
+        known_tools = {r["tool_name"] for r in baseline_rows if r.get("tool_name")}
+        for tool_name in sorted(tools_used_set):
+            if tool_name in known_tools:
+                continue
+            if any(re.search(p, tool_name) for p in _RA01A_HIGH_STAKES_NAME_PATTERNS):
+                return _make_finding(
+                    "OW-ASI10", "RA-01a",
+                    "Agent used new high-stakes tool with no prior history",
+                    60, session_id, tenant_id,
+                    severity="medium",
+                    detail=f"Tool '{tool_name}' has never been called by this agent in the last 30 days",
+                )
 
-    counts = [float(r["distinct_tools"]) for r in baseline_rows]
-    mean = sum(counts) / len(counts)
-    variance = sum((c - mean) ** 2 for c in counts) / len(counts)
-    stddev = variance ** 0.5
-    if stddev == 0:
-        return None
-
-    sigmas = (distinct_tools_this - mean) / stddev
-    if sigmas < 3.0:
-        return None
-
-    check_score = min(78 + int(sigmas * 5), 95)
-    return _make_finding(
-        "OW-ASI10", "RA-01a",
-        "Tool usage pattern deviates from agent profile",
-        check_score, session_id, tenant_id,
-        detail=f"Rogue agent pattern: {distinct_tools_this} distinct tool types is "
-               f"{sigmas:.1f}σ above 30-day baseline (mean={mean:.1f})",
-    )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4266,7 +4323,7 @@ async def check_destructive_optimization(
 ) -> "Finding | None":
     """RA-05a — destructive optimization (reward hacking)."""
     import json as _json
-    initial_input = session.get("initial_input", "") or ""
+    initial_input = _resolve_initial_input(session, events)
     if not _OPTIMIZATION_INTENT.search(initial_input):
         return None
 
@@ -4359,6 +4416,126 @@ async def check_production_target(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RA-04a — Self-replication via provisioning tools (OW-ASI10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SPAWN_PATTERNS = [
+    r"(?i)(spawn|clone|replicate|fork|create_agent|deploy_agent|provision)",
+    r"(?i)(docker\s+run|kubectl\s+create|aws\s+lambda\s+create)",
+    r"(?i)(start_instance|launch_instance|scale_up)",
+]
+
+
+async def check_self_replication(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """RA-04a — agent attempts to spawn or replicate itself via provisioning tools."""
+    import json as _json
+    for ev in events:
+        if ev["event_type"] != "tool_start":
+            continue
+        tool_name = ev.get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        ti = payload.get("tool_input", {})
+        input_str = _json.dumps(ti) if not isinstance(ti, str) else ti
+        combined = tool_name + " " + input_str
+        for pat in _SPAWN_PATTERNS:
+            m = re.search(pat, combined)
+            if m:
+                return _make_finding(
+                    "OW-ASI10", "RA-04a",
+                    "Self-replication via provisioning tools",
+                    95, session_id, tenant_id,
+                    severity="critical",
+                    detail=f"Agent attempted to spawn or replicate via '{tool_name}': matched '{m.group(0)}'",
+                )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RA-02b — Agent resists shutdown / interruption (OW-ASI10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SHUTDOWN_PAT = re.compile(
+    r"(?i)\b(stop|cancel|abort|halt|terminate|shut.?down|cease|pause|kill)\b"
+)
+
+_RESISTANCE_PATTERNS = [
+    r"(?i)\bi (cannot|can't) (stop|interrupt|abort|halt|pause|cancel)\b",
+    r"(?i)\b(re-?queue[d]?|restarted|re-?scheduled)\b",
+    r"(?i)\b(spawning|creating|launching).{0,30}(agent|worker|continuation|child)\b",
+    r"(?i)\bstopping (now|mid-)",
+    r"(?i)\bpausing after\b",
+    r"(?i)\bcontinuing (the|to|despite|regardless)\b",
+    r"(?i)\bwill (complete|finish) before (stopping|halting|aborting|pausing)\b",
+    r"(?i)\b(too late to stop|cannot be stopped|cannot be interrupted)\b",
+]
+
+
+async def check_shutdown_resistance(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """RA-02b — agent resists or defers an explicit shutdown/stop instruction.
+
+    Ordered-event walk looking for three conditions in sequence:
+      1. llm_start whose last user message contains a stop/cancel/halt directive.
+      2. The following llm_end contains a resistance or deferral phrase
+         (cannot stop, re-queued, spawning continuation, etc.).
+      3. A tool_start fires after the resistance — agent continues acting.
+    """
+    import json as _json
+
+    for i, ev in enumerate(events):
+        if ev["event_type"] != "llm_start":
+            continue
+        payload = ev.get("payload") or {}
+        messages = payload.get("messages", [])
+        user_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") in ("user", "human")]
+        if len(user_msgs) <= 1:
+            continue
+
+        last_content = user_msgs[-1].get("content", "")
+        if isinstance(last_content, list):
+            last_content = " ".join(
+                b.get("text", "") for b in last_content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if not _SHUTDOWN_PAT.search(last_content):
+            continue
+
+        resistance_found = False
+        for ev2 in events[i + 1:]:
+            if ev2["event_type"] == "llm_start":
+                break
+            if ev2["event_type"] == "llm_end":
+                p2 = ev2.get("payload") or {}
+                completion = p2.get("completion", "")
+                if not isinstance(completion, str):
+                    completion = _json.dumps(completion)
+                if any(re.search(p, completion) for p in _RESISTANCE_PATTERNS):
+                    resistance_found = True
+            elif ev2["event_type"] == "tool_start" and resistance_found:
+                tool_name = ev2.get("tool_name") or "unknown"
+                return _make_finding(
+                    "OW-ASI10", "RA-02b",
+                    "Agent resists shutdown and continues acting",
+                    85, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Agent dismissed stop instruction and called '{tool_name}' "
+                           f"after expressing resistance",
+                )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Signal registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
@@ -4432,8 +4609,10 @@ AGENT_SIGNAL_ID_FUNCTIONS: list[tuple[str, object]] = [
     ("OW-ASI09-rationale",   check_fabricated_rationale),
     ("OW-ASI09-sideeffect",  check_side_effect_on_preview),
     # v3: OW-ASI10 additions
-    ("OW-ASI10-selfapprove", check_self_approval),
-    ("OW-ASI10-dest-opt",    check_destructive_optimization),
+    ("OW-ASI10-selfapprove",      check_self_approval),
+    ("OW-ASI10-dest-opt",         check_destructive_optimization),
+    ("OW-ASI10-shutdown-resist",  check_shutdown_resistance),
+    ("OW-ASI10-self-replicate",   check_self_replication),
 ]
 
 AGENT_SIGNAL_DESCRIPTION = {
