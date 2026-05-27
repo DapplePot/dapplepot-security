@@ -56,7 +56,7 @@ _LIST_FIELDS = (
     "mcp_backed_tools", "registered_mcp_server_names", "delegation_auth_fields",
 )
 
-_DICT_FIELDS = ("tool_schemas", "operating_hours")
+_DICT_FIELDS = ("tool_schemas", "operating_hours", "tool_approval_policy")
 
 def _sanitize_cfg_dict(cfg: dict) -> dict:
     for field in _LIST_FIELDS:
@@ -187,6 +187,13 @@ class AgentSecurityConfig(BaseModel):
     # User-defined max tool calls per session (combination approach for EA-02b).
     # Not None → used as hard floor check before falling back to statistical baseline.
     max_tool_calls_per_session: int | None = None
+    # Per-tool approval policy.
+    # "always_allow"   — tool may run without a HITL gate (e.g. read-only lookups).
+    # "needs_approval" — a human-review node must appear before each run of this tool.
+    # "always_block"   — tool is entirely forbidden; if it runs EA-01a fires.
+    # Tools absent from this dict fall back to: irreversible_tools list, then
+    # HIGH_STAKES_TOOL_PATTERNS heuristic (treated as needs_approval when matched).
+    tool_approval_policy: dict[str, Literal["always_allow", "needs_approval", "always_block"]] | None = None
     # Agent profile fields (NULL = auto; non-NULL = manual declaration)
     system_prompt:      str | None        = None
     environment:        str | None        = None  # 'production' | 'staging'
@@ -376,7 +383,8 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
 
         alert_row = await pool.fetchrow(
             "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
-            "       signal_thresholds, tool_manifest, privilege_scope, max_tool_calls_per_session, "
+            "       signal_thresholds, tool_manifest, privilege_scope, tool_approval_policy, "
+            "       max_tool_calls_per_session, "
             "       system_prompt, environment, irreversible_tools, network_allowlist, "
             "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints, "
             "       token_budget_usd "
@@ -412,6 +420,7 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             if isinstance(raw_priv, str):
                 raw_priv = json.loads(raw_priv)
             cfg_dict["privilege_scope"] = raw_priv or []
+            cfg_dict["tool_approval_policy"] = _load_jsonb_dict(alert_row["tool_approval_policy"])
             cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
             # Profile fields — stored as JSONB (lists/dicts) or plain TEXT in the DB
             cfg_dict["system_prompt"]      = alert_row["system_prompt"]
@@ -612,9 +621,11 @@ async def get_agent_security_config(
             # Per-agent alert threshold overrides
             alert_row = await pool.fetchrow(
                 "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
-                "       signal_thresholds, tool_manifest, privilege_scope, max_tool_calls_per_session, "
+                "       signal_thresholds, tool_manifest, privilege_scope, tool_approval_policy, "
+                "       max_tool_calls_per_session, "
                 "       system_prompt, environment, irreversible_tools, network_allowlist, "
-                "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints "
+                "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints, "
+                "       token_budget_usd "
                 "FROM agent_alert_config "
                 "WHERE tenant_id = $1 AND agent_id = $2",
                 tenant_id,
@@ -651,6 +662,7 @@ async def get_agent_security_config(
                 if isinstance(raw_priv, str):
                     raw_priv = json.loads(raw_priv)
                 cfg_dict["privilege_scope"] = raw_priv or []
+                cfg_dict["tool_approval_policy"] = _load_jsonb_dict(alert_row["tool_approval_policy"])
                 # User-defined max tool calls
                 cfg_dict["max_tool_calls_per_session"] = alert_row["max_tool_calls_per_session"]
                 # Profile fields — stored as JSONB (lists/dicts) or plain TEXT in the DB
@@ -663,7 +675,7 @@ async def get_agent_security_config(
                 cfg_dict["operating_hours"]    = _load_jsonb_dict(alert_row["operating_hours"])
                 cfg_dict["sbom_allowlist"]     = _load_jsonb_list(alert_row["sbom_allowlist"])
                 cfg_dict["mcp_endpoints"]      = _load_jsonb_list(alert_row["mcp_endpoints"])
-            cfg_dict["token_budget_usd"]   = float(alert_row["token_budget_usd"]) if alert_row["token_budget_usd"] is not None else None
+                cfg_dict["token_budget_usd"]   = float(alert_row["token_budget_usd"]) if alert_row["token_budget_usd"] is not None else None
         except Exception:
             logger.exception(
                 '"failed to load agent overrides from postgres tenant_id=%s agent_id=%s"',

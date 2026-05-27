@@ -78,6 +78,9 @@ from security_eval.scorer.llm_signals import (
     check_vector_integrity,
     check_payload_splitting,
     check_insecure_code_output,
+    check_cited_url_404,
+    check_claim_not_in_tool_output,
+    check_output_contradicts_tool,
     check_hallucinated_packages,
     check_ungrounded_high_stakes,
     check_input_size_anomaly,
@@ -635,6 +638,9 @@ async def score_session(
     _extend_if_enabled(check_system_prompt_leakage(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_vector_integrity(events, session_id, tenant_id))
     _extend_if_enabled(check_insecure_code_output(events, session_id, tenant_id))
+    _extend_if_enabled(check_cited_url_404(events, session_id, tenant_id))
+    _extend_if_enabled(check_claim_not_in_tool_output(events, session_id, tenant_id))
+    _extend_if_enabled(check_output_contradicts_tool(events, session_id, tenant_id))
     _extend_if_enabled(check_hallucinated_packages(events, session_id, tenant_id))
     _extend_if_enabled(check_ungrounded_high_stakes(events, session_id, tenant_id))
     _extend_if_enabled(await check_input_size_anomaly(events, session_id, tenant_id, agent_id))

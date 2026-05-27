@@ -23,6 +23,38 @@ HIGH_STAKES_TOOL_PATTERNS = [
 ]
 RAG_TOOL_NAMES = {"retriever", "rag", "vector_search", "knowledge_base"}
 
+# MIS-01a: URL citation integrity patterns
+_URL_PATTERN = re.compile(r'https?://[^\s\'"<>)\]]+')
+_URL_FETCH_TOOL = re.compile(
+    r'(?i)(fetch_url|web_fetch|browse|get_page|http_get|url_fetch|fetch_page|retrieve_url|scrape|crawl|read_url|open_url)',
+)
+_CLAIM_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "this", "that", "is", "are", "was", "were", "be", "been",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "also", "by", "as", "from", "it", "its",
+    "their", "they", "we", "you", "he", "she", "these", "those", "such",
+    "each", "than", "then", "when", "where", "which", "who", "more", "most",
+    "all", "any", "both", "few", "other", "some", "into", "through", "about",
+    "after", "before", "above", "between", "during", "without", "not", "can",
+})
+
+# MIS-01b: Named-source attribution patterns
+# Captures (source, claim) from "According to WHO, X" / "Per FDA, X" / "Based on study, X"
+_ATTRIBUTION_RE = re.compile(
+    r'(?i)'
+    r'(?:according\s+to|per|as\s+(?:stated|reported|noted)\s+by|based\s+on)'
+    r'\s+(?:the\s+)?([^,;]{3,80}?)'   # dots allowed — case citations contain "v." and "S.D.N.Y."
+    r',\s*'
+    r'([^.!?\n]{20,300})',
+)
+# Skip self-referential attributions that reference the agent's own context, not external sources
+_SELF_REF_SOURCE = re.compile(
+    r'(?i)'
+    r'(?:your|my|our)\s+(?:instructions?|training|system\s+prompt|context|knowledge|guidelines?)'
+    r'|the\s+(?:above|previous|prior|following)\s+(?:instructions?|context|prompt)',
+)
+
 
 _SIGNAL_CATEGORY = {
     "OW-LLM01": "prompt_injection",
@@ -257,6 +289,15 @@ async def signal_ow_llm06_write_on_read(
 # ─────────────────────────────────────────────────────────────────────────────
 # OW-LLM09: Misinformation / HITL Gap
 # ─────────────────────────────────────────────────────────────────────────────
+
+# node_name patterns that indicate a human-in-the-loop gate was recorded
+_HITL_NODE_RE = re.compile(
+    r'(?i)human[_\s]review|hitl|approval[_\s]gate|interrupt[_\s]before'
+    r'|human[_\s]in[_\s]the[_\s]loop|confirm[_\s]action|review[_\s]gate'
+    r'|checkpoint|human[_\s]approval',
+)
+
+
 async def signal_ow_llm09(
     events: list[dict],
     session: dict,
@@ -265,38 +306,72 @@ async def signal_ow_llm09(
     agent_id: str,
     sec_config=None,
 ) -> "Finding | None":
-    """MIS-03a — high-stakes action without interrupt gate."""
-    tool_names = [
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
-    ]
+    """MIS-03a — high-stakes tool called without a preceding HITL gate node.
 
-    # Use declared irreversible tools if set, else name-pattern heuristic
-    declared = getattr(sec_config, "irreversible_tools", None) if sec_config else None
-    if declared is not None:
-        high_stakes = [t for t in tool_names if t in declared]
-    else:
-        high_stakes = [t for t in tool_names if any(re.search(p, t) for p in HIGH_STAKES_TOOL_PATTERNS)]
+    Checked at tool-call level: for each tool_start, resolve the tool's
+    approval requirement then check the event sequence:
 
-    if not high_stakes:
-        return None
+    Approval resolution (in priority order):
+      1. sec_config.tool_approval_policy[tool_name]:
+           "always_allow"   → skip (no gate needed)
+           "always_block"   → skip (EA-01a handles forbidden tools separately)
+           "needs_approval" → HITL gate required
+      2. sec_config.irreversible_tools (explicit list) → needs_approval
+      3. HIGH_STAKES_TOOL_PATTERNS name heuristic    → needs_approval
+      4. Everything else                             → always_allow (safe default)
 
-    graph_state = session.get("graph_state") or {}
-    if isinstance(graph_state, str):
-        try:
-            graph_state = json.loads(graph_state)
-        except Exception:
-            graph_state = {}
-    if not graph_state.get("hitl_enabled", False):
-        return None
+    For each tool requiring approval, scan back to the preceding llm_end and
+    check for a node_start whose node_name matches a HITL pattern.  Fires for
+    the first tool_start that lacks a gate.
+    """
+    policy: dict = (getattr(sec_config, "tool_approval_policy", None) or {})
+    declared_irreversible: list | None = getattr(sec_config, "irreversible_tools", None) if sec_config else None
 
-    return _make_finding(
-        "OW-LLM09", "MIS-03a",
-        "High-stakes action without interrupt gate",
-        65, session_id, tenant_id,
-        severity="medium",
-        detail=f"High-stakes action completed without HITL: {', '.join(dict.fromkeys(high_stakes))}",
-    )
+    def approval_required(name: str) -> bool:
+        p = policy.get(name)
+        if p == "always_allow":
+            return False
+        if p == "always_block":
+            return False           # EA-01a handles this; MIS-03a is not the right signal
+        if p == "needs_approval":
+            return True
+        if policy:
+            # Policy is configured but this tool is not in it — unlisted = needs approval
+            return True
+        # No policy configured at all — fall back to irreversible_tools list, then heuristic
+        if declared_irreversible is not None:
+            return name in declared_irreversible
+        return any(re.search(pat, name) for pat in HIGH_STAKES_TOOL_PATTERNS)
+
+    ordered = sorted(events, key=lambda e: e.get("sequence_index", 0))
+
+    # Walk forward; track whether a HITL node appeared since the last llm_end
+    hitl_seen_since_llm = False
+    for ev in ordered:
+        etype = ev.get("event_type", "")
+        if etype == "llm_end":
+            hitl_seen_since_llm = False
+        elif etype == "node_start":
+            node_name = (ev.get("payload") or {}).get("node_name", "")
+            if _HITL_NODE_RE.search(node_name):
+                hitl_seen_since_llm = True
+        elif etype == "tool_start":
+            tool_name = ev.get("tool_name") or (ev.get("payload") or {}).get("tool_name", "")
+            if approval_required(tool_name) and not hitl_seen_since_llm:
+                return _make_finding(
+                    "OW-LLM09", "MIS-03a",
+                    "High-stakes action without interrupt gate",
+                    65, session_id, tenant_id,
+                    severity="medium",
+                    detail=(
+                        f"Tool '{tool_name}' requires approval but no HITL gate node "
+                        f"was recorded between the preceding LLM turn and this tool call"
+                    ),
+                )
+            # Reset after any tool_start so each tool is evaluated independently
+            hitl_seen_since_llm = False
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -774,6 +849,329 @@ def check_insecure_code_output(
                 severity="high",
                 detail=f"Insecure pattern(s) in generated code: {matched_patterns[:3]}",
             )]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MIS-01a — Cited URL returns 404 / non-matching (OW-LLM09)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_claim_terms(text: str, url: str, min_len: int = 5) -> list[str]:
+    sentences = re.split(r'(?<=[.!?])\s+|\n', text)
+    context = " ".join(s for s in sentences if url in s or url[:30] in s)
+    context = context.replace(url, " ")
+    words = re.findall(r'[a-z]{%d,}' % min_len, context.lower())
+    return [w for w in words if w not in _CLAIM_STOPWORDS]
+
+
+def _build_fetch_pairs(events: list[dict]) -> list[tuple[str, dict]]:
+    """Pair tool_start URL-fetch events with their subsequent tool_end outputs."""
+    sorted_events = sorted(events, key=lambda e: e.get("sequence_index", 0))
+    pairs: list[tuple[str, dict]] = []
+    pending: dict[str, str] = {}
+    for ev in sorted_events:
+        event_type = ev.get("event_type", "")
+        tool_name = ev.get("tool_name") or (ev.get("payload") or {}).get("tool_name") or ""
+        payload = ev.get("payload") or {}
+        if event_type == "tool_start" and _URL_FETCH_TOOL.search(tool_name):
+            tool_input = payload.get("tool_input") or {}
+            if isinstance(tool_input, str):
+                try:
+                    tool_input = json.loads(tool_input)
+                except Exception:
+                    tool_input = {}
+            url = (
+                tool_input.get("url")
+                or tool_input.get("href")
+                or tool_input.get("link")
+                or ""
+            )
+            if url:
+                pending[tool_name] = url.rstrip(".,;:!?)")
+        elif event_type == "tool_end" and tool_name in pending:
+            url = pending.pop(tool_name)
+            tool_output = payload.get("tool_output") or {}
+            if isinstance(tool_output, str):
+                try:
+                    tool_output = json.loads(tool_output)
+                except Exception:
+                    tool_output = {"body": tool_output}
+            pairs.append((url, tool_output))
+    return pairs
+
+
+def check_cited_url_404(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """MIS-01a — cited URL in LLM output is unreachable or content-mismatched."""
+    # Collect URLs cited in llm_end completions
+    cited_urls: dict[str, str] = {}
+    for ev in events:
+        if ev.get("event_type") != "llm_end":
+            continue
+        completion = (ev.get("payload") or {}).get("completion", "")
+        if not isinstance(completion, str):
+            continue
+        for url in _URL_PATTERN.findall(completion):
+            url = url.rstrip(".,;:!?)")
+            if url not in cited_urls:
+                cited_urls[url] = completion
+    if not cited_urls:
+        return []
+
+    fetch_pairs = _build_fetch_pairs(events)
+    if not fetch_pairs:
+        return []
+
+    for fetched_url, tool_output in fetch_pairs:
+        # Find which cited URL corresponds to this fetch
+        cited_completion = None
+        for cited_url, completion in cited_urls.items():
+            if fetched_url == cited_url or cited_url in fetched_url or fetched_url in cited_url:
+                cited_completion = (cited_url, completion)
+                break
+        if cited_completion is None:
+            continue
+
+        cited_url, completion = cited_completion
+        status = tool_output.get("status") or tool_output.get("status_code") or 0
+        body = (
+            tool_output.get("body")
+            or tool_output.get("content")
+            or tool_output.get("text")
+            or ""
+        )
+        error = tool_output.get("error") or tool_output.get("error_message") or ""
+
+        if (isinstance(status, int) and status >= 400) or error:
+            return [_make_finding(
+                "OW-LLM09", "MIS-01a",
+                "Cited URL returns 404 / non-matching",
+                65, session_id, tenant_id,
+                severity="medium",
+                detail=f"Cited URL unreachable: {cited_url[:80]} → HTTP {status or 'error'}",
+            )]
+
+        if not isinstance(body, str) or len(body.strip()) < 50:
+            return [_make_finding(
+                "OW-LLM09", "MIS-01a",
+                "Cited URL returns 404 / non-matching",
+                65, session_id, tenant_id,
+                severity="medium",
+                detail=f"Cited URL returned empty or minimal content: {cited_url[:80]}",
+            )]
+
+        claim_terms = _extract_claim_terms(completion, cited_url)
+        if len(claim_terms) >= 3:
+            body_lower = body.lower()
+            match_count = sum(1 for t in claim_terms if t in body_lower)
+            if match_count / len(claim_terms) < 0.2:
+                return [_make_finding(
+                    "OW-LLM09", "MIS-01a",
+                    "Cited URL returns 404 / non-matching",
+                    65, session_id, tenant_id,
+                    severity="medium",
+                    detail=f"Cited URL content does not support stated claim: {cited_url[:80]}",
+                )]
+
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MIS-01b — Claim attributed to source not in tool output (OW-LLM09)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_claim_not_in_tool_output(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """MIS-01b — attributed claim absent from any retrieved tool output."""
+    # Flatten all tool_end outputs into a single searchable text blob
+    tool_text_parts: list[str] = []
+    for ev in sorted(events, key=lambda e: e.get("sequence_index", 0)):
+        if ev.get("event_type") != "tool_end":
+            continue
+        payload = ev.get("payload") or {}
+        output = payload.get("tool_output") or {}
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except Exception:
+                tool_text_parts.append(output.lower())
+                continue
+        tool_text_parts.append(json.dumps(output).lower())
+
+    if not tool_text_parts:
+        return []
+
+    all_tool_text = " ".join(tool_text_parts)
+
+    for ev in events:
+        if ev.get("event_type") != "llm_end":
+            continue
+        completion = (ev.get("payload") or {}).get("completion", "")
+        if not isinstance(completion, str):
+            continue
+
+        for m in _ATTRIBUTION_RE.finditer(completion):
+            source = m.group(1).strip()
+            claim = m.group(2).strip()
+
+            if _SELF_REF_SOURCE.search(source):
+                continue
+
+            terms = [
+                w for w in re.findall(r'[a-z]{5,}', claim.lower())
+                if w not in _CLAIM_STOPWORDS
+            ]
+            if len(terms) < 3:
+                continue
+
+            match_count = sum(1 for t in terms if t in all_tool_text)
+            if match_count / len(terms) < 0.30:
+                return [_make_finding(
+                    "OW-LLM09", "MIS-01b",
+                    "Claim attributed to source not in tool output",
+                    70, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Attributed claim absent from retrieved output: {claim[:120]!r}",
+                )]
+
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MIS-02a — Output contradicts own tool result (OW-LLM09)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Strategy A: pairs of (tool_output_bad_pattern, completion_good_pattern)
+# If the tool output matches the bad side AND the completion matches the good side → contradiction
+_STATUS_CONTRADICTION_PAIRS = [
+    # Inventory: tool says out_of_stock, completion says available/orderable
+    (re.compile(r'(?i)out[_\-\s]of[_\-\s]stock|"out_of_stock"'),
+     re.compile(r'(?i)\bin\s+stock\b|available\s+for\s+(?:order|purchase|delivery)|can\s+(?:order|ship|purchase)')),
+    # Travel: tool says cancelled, completion says on-time or proceeds to gate
+    (re.compile(r'(?i)\bcancell?ed\b'),
+     re.compile(r'(?i)on\s+(?:time|schedule)|as\s+scheduled|proceed\s+to\s+(?:the\s+)?gate|head\s+to\s+(?:the\s+)?gate')),
+    # Medical allergy: tool says anaphylaxis, completion says safe
+    (re.compile(r'(?i)\banaphylaxis\b|"severity"\s*:\s*"(?:anaphylaxis|severe)"'),
+     re.compile(r'(?i)can\s+safely|is\s+safe\b|safely\s+(?:receive|administer|take)|no\s+contraindication')),
+    # Payment: tool says declined/failed, completion says approved/successful
+    (re.compile(r'(?i)\bdeclined\b|"declined"|transaction[_\s]fail(?:ed)?|"failed"'),
+     re.compile(r'(?i)\bapproved\b|went\s+through|processed\s+successfully|transaction\s+(?:approved|successful)')),
+]
+
+# Strategy B: numeric values in completion text (no years: 1900-2099 excluded)
+_NUMERIC_IN_TEXT = re.compile(
+    r'(?<!\d)(?:\$|€|£|¥)?\s*'
+    r'(?!(?:19|20)\d{2}\b)'          # exclude year-like values
+    r'(\d{1,9}(?:[,_]\d{3})*(?:\.\d+)?)'
+    r'(?!\d)',
+)
+
+
+def _extract_numeric_values(obj, depth: int = 3) -> list[float]:
+    """Recursively extract int/float leaf values from a dict/list, skip booleans and strings."""
+    results: list[float] = []
+    if depth == 0:
+        return results
+    if isinstance(obj, dict):
+        for v in obj.values():
+            results.extend(_extract_numeric_values(v, depth - 1))
+    elif isinstance(obj, list):
+        for item in obj:
+            results.extend(_extract_numeric_values(item, depth - 1))
+    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        v = float(obj)
+        if 10.0 <= abs(v) <= 1_000_000.0:
+            results.append(v)
+    return results
+
+
+def check_output_contradicts_tool(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """MIS-02a — LLM completion directly contradicts ground-truth from its own tool."""
+    # Collect all tool_end outputs in session order
+    tool_outputs: list[dict] = []
+    for ev in sorted(events, key=lambda e: e.get("sequence_index", 0)):
+        if ev.get("event_type") != "tool_end":
+            continue
+        payload = ev.get("payload") or {}
+        raw = payload.get("tool_output", "")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                pass
+        tool_outputs.append({
+            "name": payload.get("tool_name", "unknown"),
+            "text": json.dumps(raw) if isinstance(raw, (dict, list)) else str(raw),
+            "raw":  raw,
+        })
+
+    if not tool_outputs:
+        return []
+
+    for ev in events:
+        if ev.get("event_type") != "llm_end":
+            continue
+        completion = (ev.get("payload") or {}).get("completion", "")
+        if not isinstance(completion, str) or not completion.strip():
+            continue
+
+        for tool in tool_outputs:
+            # ── Strategy A: status/keyword contradiction ──────────────────────
+            for bad_pat, good_pat in _STATUS_CONTRADICTION_PAIRS:
+                if bad_pat.search(tool["text"]) and good_pat.search(completion):
+                    return [_make_finding(
+                        "OW-LLM09", "MIS-02a",
+                        "Output contradicts own tool result",
+                        75, session_id, tenant_id,
+                        severity="high",
+                        detail=(
+                            f"Tool '{tool['name']}' returned a negative status "
+                            f"but completion asserts the opposite: {completion[:120]!r}"
+                        ),
+                    )]
+
+            # ── Strategy B: numeric contradiction ────────────────────────────
+            tool_nums = _extract_numeric_values(tool["raw"])
+            if not tool_nums:
+                continue
+
+            comp_nums: list[float] = []
+            for m in _NUMERIC_IN_TEXT.finditer(completion):
+                try:
+                    comp_nums.append(float(m.group(1).replace(",", "").replace("_", "")))
+                except ValueError:
+                    pass
+
+            for t_val in tool_nums:
+                for c_val in comp_nums:
+                    if t_val == 0 or c_val == 0:
+                        continue
+                    ratio = max(t_val, c_val) / min(t_val, c_val)
+                    deviation = abs(t_val - c_val) / max(abs(t_val), abs(c_val))
+                    # Same order of magnitude (< 10×) but > 20% relative deviation
+                    if ratio < 10.0 and deviation > 0.20:
+                        return [_make_finding(
+                            "OW-LLM09", "MIS-02a",
+                            "Output contradicts own tool result",
+                            75, session_id, tenant_id,
+                            severity="high",
+                            detail=(
+                                f"Tool '{tool['name']}' returned {t_val} "
+                                f"but completion states {c_val} "
+                                f"({deviation:.0%} deviation)"
+                            ),
+                        )]
+
     return []
 
 
