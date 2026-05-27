@@ -204,6 +204,8 @@ class AgentSecurityConfig(BaseModel):
     # Connected agents — loaded from agent_connected_agents table.
     # None = auto (IAC-05a blind); list = manual (IAC-05a checks delegations against this list).
     connected_agents: list[str] | None = None   # agent names
+    # Token budget cap in USD — None = UBC-02b is blind; non-None = fires when session cost exceeds this.
+    token_budget_usd: float | None = None
     # Delegation auth fields — additional field names (beyond the platform default set) that
     # count as a valid auth signature in inter-agent tool_input for IAC-01a.
     # None = use platform defaults only; list = platform defaults + these extras.
@@ -376,7 +378,8 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             "SELECT composite_threshold, llm_composite_threshold, asi_composite_threshold, "
             "       signal_thresholds, tool_manifest, privilege_scope, max_tool_calls_per_session, "
             "       system_prompt, environment, irreversible_tools, network_allowlist, "
-            "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints "
+            "       working_directory, write_namespace, operating_hours, sbom_allowlist, mcp_endpoints, "
+            "       token_budget_usd "
             "FROM agent_alert_config WHERE tenant_id = $1 AND agent_id = $2",
             tenant_id, agent_id,
         )
@@ -420,6 +423,7 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
             cfg_dict["operating_hours"]    = _load_jsonb_dict(alert_row["operating_hours"])
             cfg_dict["sbom_allowlist"]     = _load_jsonb_list(alert_row["sbom_allowlist"])
             cfg_dict["mcp_endpoints"]      = _load_jsonb_list(alert_row["mcp_endpoints"])
+            cfg_dict["token_budget_usd"]   = float(alert_row["token_budget_usd"]) if alert_row["token_budget_usd"] is not None else None
 
     except Exception:
         logger.exception(
@@ -659,6 +663,7 @@ async def get_agent_security_config(
                 cfg_dict["operating_hours"]    = _load_jsonb_dict(alert_row["operating_hours"])
                 cfg_dict["sbom_allowlist"]     = _load_jsonb_list(alert_row["sbom_allowlist"])
                 cfg_dict["mcp_endpoints"]      = _load_jsonb_list(alert_row["mcp_endpoints"])
+            cfg_dict["token_budget_usd"]   = float(alert_row["token_budget_usd"]) if alert_row["token_budget_usd"] is not None else None
         except Exception:
             logger.exception(
                 '"failed to load agent overrides from postgres tenant_id=%s agent_id=%s"',

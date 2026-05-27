@@ -101,10 +101,11 @@ async def check_cross_user_bleed(
     if not pii_hashes:
         return None
 
-    # Get user_context_id for this session (look at events)
+    # Get user_context_id — top-level column first (set by SDK), payload fallback for legacy events
     user_context_id = next(
-        (ev.get("payload", {}).get("user_context_id") for ev in events
-         if isinstance(ev.get("payload"), dict) and ev["payload"].get("user_context_id")),
+        (ev.get("user_context_id") or ev.get("payload", {}).get("user_context_id")
+         for ev in events
+         if ev.get("user_context_id") or (isinstance(ev.get("payload"), dict) and ev["payload"].get("user_context_id"))),
         None,
     )
     if not user_context_id:
@@ -158,8 +159,9 @@ async def check_request_rate_spike(
     """UBC-03a — user session count in last 1hr > 5× 7-day hourly baseline."""
     if not user_context_id:
         user_context_id = next(
-            (ev.get("payload", {}).get("user_context_id") for ev in events
-             if isinstance(ev.get("payload"), dict)),
+            (ev.get("user_context_id") or ev.get("payload", {}).get("user_context_id")
+             for ev in events
+             if ev.get("user_context_id") or isinstance(ev.get("payload"), dict)),
             None,
         )
     if not user_context_id:

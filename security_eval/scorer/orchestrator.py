@@ -90,6 +90,7 @@ from security_eval.scorer.llm_signals import (
     check_system_prompt_modification,
     check_undeclared_llm_used,
     check_context_window_stuffing,
+    check_budget_cap_exceeded,
 )
 from security_eval.scorer.asi_signals import (
     AGENT_SIGNAL_ID_FUNCTIONS,
@@ -438,7 +439,7 @@ async def score_session(
     _CH_QUERY = """
         SELECT event_type, event_id, emitted_at, sequence_index,
                node_run_id, node_name, tool_name, llm_model,
-               llm_input_tokens, llm_output_tokens, payload
+               llm_input_tokens, llm_output_tokens, user_context_id, payload
         FROM obs_events
         WHERE tenant_id  = %(tenant_id)s
           AND session_id = %(session_id)s
@@ -646,6 +647,7 @@ async def score_session(
     _extend_if_enabled(check_system_prompt_modification(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_undeclared_llm_used(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_context_window_stuffing(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_budget_cap_exceeded(events, session_id, tenant_id, sec_config=sec_config))
 
     # ─── Session-level OW-ASI signals ────────────────────────────────────────
     from security_eval.scorer.asi_signals import signal_a01

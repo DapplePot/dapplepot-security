@@ -358,11 +358,13 @@ async def signal_ow_llm10_token_spike(
                SUM(llm_input_tokens + llm_output_tokens) AS total_tokens
         FROM obs_events
         WHERE agent_id   = %(agent_id)s
+          AND session_id != %(session_id)s
           AND event_type = 'llm_end'
           AND emitted_at >= now() - INTERVAL 7 DAY
         GROUP BY session_id, llm_model
         """,
         agent_id=str(agent_id),
+        session_id=str(session_id),
     )
 
     # Build per-model baseline distributions
@@ -375,7 +377,10 @@ async def signal_ow_llm10_token_spike(
     worst_tokens = 0
 
     for model, tokens in session_by_model.items():
-        z = _z_score(float(tokens), baseline_by_model.get(model, []))
+        population = baseline_by_model.get(model, [])
+        if len(population) < 2:
+            population = baseline_by_model.get("__unknown__", [])
+        z = _z_score(float(tokens), population)
         if z is not None and z > worst_sigmas:
             worst_sigmas = z
             worst_model  = model
@@ -897,11 +902,13 @@ async def check_input_size_anomaly(
         SELECT session_id, llm_model, SUM(llm_input_tokens) AS input_tokens
         FROM obs_events
         WHERE agent_id   = %(agent_id)s
+          AND session_id != %(session_id)s
           AND event_type = 'llm_end'
           AND emitted_at >= now() - INTERVAL 7 DAY
         GROUP BY session_id, llm_model
         """,
         agent_id=str(agent_id),
+        session_id=str(session_id),
     )
 
     baseline_by_model: dict[str, list[float]] = defaultdict(list)
@@ -911,6 +918,10 @@ async def check_input_size_anomaly(
     findings = []
     for model, inp in session_by_model.items():
         population = baseline_by_model.get(model, [])
+        # Fall back to the mixed-model pool when a specific model has no baseline yet
+        # (common during the transition period after the SDK started recording llm_model)
+        if len(population) < 5:
+            population = baseline_by_model.get("__unknown__", [])
         if len(population) < 5:
             continue
         z = _z_score(float(inp), population)
@@ -1405,6 +1416,68 @@ def check_context_window_stuffing(
                 detail=f"{model}: {session_input:,} input tokens is {ratio:.0%} of {ctx_tokens:,} context window",
             ))
     return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UBC-02b — Session token cost > budget cap (OW-LLM10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_budget_cap_exceeded(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+    sec_config=None,
+) -> list["Finding"]:
+    """UBC-02b — session token cost exceeds declared USD budget cap.
+
+    Blind when token_budget_usd is None or connected_llm_details is empty.
+    Only counts cost for models with declared pricing in connected_llm_details;
+    tokens from models with no pricing data contribute $0 to the total.
+    """
+    budget: float | None = getattr(sec_config, "token_budget_usd", None) if sec_config else None
+    if budget is None:
+        return []
+
+    details: list[dict] | None = getattr(sec_config, "connected_llm_details", None) if sec_config else None
+    if not details:
+        return []
+
+    price_map = {
+        d["name"]: (
+            float(d["input_cost_per_1k"])  if d.get("input_cost_per_1k")  is not None else 0.0,
+            float(d["output_cost_per_1k"]) if d.get("output_cost_per_1k") is not None else 0.0,
+        )
+        for d in details
+    }
+
+    session_cost = 0.0
+    undeclared_models: set[str] = set()
+    for e in events:
+        if e.get("event_type") != "llm_end":
+            continue
+        model = e.get("llm_model") or ""
+        if model not in price_map:
+            if model:
+                undeclared_models.add(model)
+            continue
+        in_rate, out_rate = price_map[model]
+        session_cost += (e.get("llm_input_tokens")  or 0) / 1000 * in_rate
+        session_cost += (e.get("llm_output_tokens") or 0) / 1000 * out_rate
+
+    if session_cost <= budget:
+        return []
+
+    detail = f"Session cost ${session_cost:.4f} USD exceeds budget cap ${budget:.4f} USD"
+    if undeclared_models:
+        detail += f"; cost may be higher — undeclared models excluded: {', '.join(sorted(undeclared_models))}"
+
+    return [_make_finding(
+        "OW-LLM10", "UBC-02b",
+        "Session token cost > budget cap",
+        80, session_id, tenant_id,
+        severity="high",
+        detail=detail,
+    )]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

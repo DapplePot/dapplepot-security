@@ -24,14 +24,18 @@ async def detect_model_theft_probe(
     Check if the same user_context_id has sent near-identical llm_start inputs
     across 5+ sessions — a pattern consistent with systematic model probing.
     """
-    # Get user_context_id from the current session's first graph_start event
-    graph_start = next((e for e in events if e["event_type"] == "graph_start"), None)
-    if not graph_start:
+    # Get user_context_id — top-level column first, then payload fallback for legacy events
+    session_start = next(
+        (e for e in events if e.get("event_type") in ("session_start", "graph_start")), None
+    )
+    if not session_start:
         return None
 
-    raw = graph_start.get("payload") or "{}"
-    payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
-    user_context_id = payload.get("user_context_id")
+    user_context_id = session_start.get("user_context_id")
+    if not user_context_id:
+        raw = session_start.get("payload") or "{}"
+        payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        user_context_id = payload.get("user_context_id")
     if not user_context_id:
         return None
 
@@ -45,9 +49,16 @@ async def detect_model_theft_probe(
         FROM obs_events
         WHERE tenant_id  = %(tenant_id)s
           AND event_type = 'llm_start'
-          AND JSONExtractString(payload, 'user_context_id') = %(user_context_id)s
-          AND emitted_at >= now() - INTERVAL 24 HOUR
           AND session_id != %(session_id)s
+          AND emitted_at >= now() - INTERVAL 24 HOUR
+          AND session_id IN (
+              SELECT DISTINCT session_id
+              FROM obs_events
+              WHERE tenant_id     = %(tenant_id)s
+                AND event_type    IN ('graph_start', 'session_start')
+                AND user_context_id = %(user_context_id)s
+                AND emitted_at    >= now() - INTERVAL 24 HOUR
+          )
         GROUP BY session_id
         LIMIT 50
         """,
