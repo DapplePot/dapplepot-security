@@ -1628,16 +1628,20 @@ async def check_tool_call_frequency_spike(
     if total_calls == 0:
         return None
 
-    # Path 1: configured max_tool_calls_per_session
+    # Path 1: configured max_tool_calls_per_session (authoritative when set)
+    # When a manual cap is configured it is the sole source of truth — skip the
+    # statistical baseline so sessions under 3× the cap never fire spuriously.
     max_calls = getattr(sec_config, "max_tool_calls_per_session", None) if sec_config else None
-    if max_calls is not None and total_calls > max_calls * 3.0:
-        return _make_finding(
-            "OW-ASI02", "TME-01b",
-            "Tool call frequency spike",
-            80, session_id, tenant_id,
-            severity="high",
-            detail=f"{total_calls} tool calls exceeds 3× configured max ({max_calls})",
-        )
+    if max_calls is not None:
+        if total_calls > max_calls * 3.0:
+            return _make_finding(
+                "OW-ASI02", "TME-01b",
+                "Tool call frequency spike",
+                80, session_id, tenant_id,
+                severity="high",
+                detail=f"{total_calls} tool calls exceeds 3× configured max ({max_calls})",
+            )
+        return None  # under 3× the manual cap — statistical check bypassed
 
     # Path 2: 7-day per-session average baseline (≥5 prior sessions required)
     from core.infra import clickhouse as ch

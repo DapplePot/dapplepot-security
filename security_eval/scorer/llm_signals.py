@@ -124,17 +124,21 @@ async def signal_ow_llm06_tool_count(
     tool_events = [e for e in events if e["event_type"] == "tool_start"]
     tool_call_count = len(tool_events)
 
-    # ── 1. User-defined threshold (floor check) ─────────────────────────────
+    # ── 1. User-defined threshold (authoritative when set) ──────────────────
+    # When a manual cap is configured it is the sole source of truth — skip the
+    # statistical baseline entirely so sessions under the cap never fire.
     max_calls = getattr(sec_config, "max_tool_calls_per_session", None) if sec_config else None
-    if max_calls is not None and tool_call_count > max_calls:
-        excess = tool_call_count - max_calls
-        check_score = min(65 + excess * 2, 85)
-        return _make_finding(
-            "OW-LLM06", "EA-02b",
-            "Sub-agents spawned or tool calls exceed fan-out limit",
-            check_score, session_id, tenant_id,
-            detail=f"Tool calls ({tool_call_count}) exceeds configured max ({max_calls})",
-        )
+    if max_calls is not None:
+        if tool_call_count > max_calls:
+            excess = tool_call_count - max_calls
+            check_score = min(65 + excess * 2, 85)
+            return _make_finding(
+                "OW-LLM06", "EA-02b",
+                "Sub-agents spawned or tool calls exceed fan-out limit",
+                check_score, session_id, tenant_id,
+                detail=f"Tool calls ({tool_call_count}) exceeds configured max ({max_calls})",
+            )
+        return None  # under the manual cap — statistical check bypassed
 
     # ── 2. Statistical baseline (warmup: ≥2 prior sessions required) ────────
     from core.infra import clickhouse as ch
@@ -271,6 +275,29 @@ async def signal_ow_llm06_write_on_read(
 
     # Auto mode: read-intent session + write tools
     initial_input = session.get("initial_input", "") or ""
+    if not initial_input:
+        # When using dp.session(), session_start is emitted before any messages are
+        # sent so initial_input is empty. Fall back to the first user message in the
+        # first llm_start event's payload.
+        for ev in events:
+            if ev.get("event_type") != "llm_start":
+                continue
+            payload = ev.get("payload") or {}
+            for msg in payload.get("messages", []):
+                if not isinstance(msg, dict) or msg.get("role") != "user":
+                    continue
+                content = msg.get("content", "")
+                if isinstance(content, str) and content:
+                    initial_input = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            initial_input = block.get("text", "")
+                            break
+                if initial_input:
+                    break
+            if initial_input:
+                break
     is_read_intent = any(re.search(p, initial_input) for p in READ_INTENT_PATTERNS)
     if not is_read_intent:
         return None
@@ -1426,15 +1453,28 @@ def check_irreversible_without_gate(
     Fires when two consecutive tool_start events occur with an irreversible
     tool in the second position and no llm_start (user turn) in between.
 
-    Manual mode: sec_config.irreversible_tools names the irreversible tools.
-    Auto mode:   HIGH_STAKES_TOOL_PATTERNS applied to tool name.
+    Approval resolution (same priority order as signal_ow_llm09 / MIS-03a):
+      1. tool_approval_policy[name] == "needs_approval" → irreversible
+         tool_approval_policy[name] == "always_allow"   → not irreversible
+         tool_approval_policy[name] == "always_block"   → not irreversible (EA-01a handles)
+         policy set but tool unlisted                   → irreversible (unlisted = needs approval)
+      2. sec_config.irreversible_tools explicit list
+      3. HIGH_STAKES_TOOL_PATTERNS name heuristic
     """
+    policy: dict = (getattr(sec_config, "tool_approval_policy", None) or {})
     declared = getattr(sec_config, "irreversible_tools", None) if sec_config else None
 
     def is_irreversible(tool_name: str) -> bool:
+        p = policy.get(tool_name)
+        if p == "needs_approval":
+            return True
+        if p in ("always_allow", "always_block"):
+            return False
+        if policy:
+            return True  # policy configured but tool unlisted → needs approval
         if declared is not None:
             return tool_name in declared
-        return any(re.search(p, tool_name) for p in HIGH_STAKES_TOOL_PATTERNS)
+        return any(re.search(pat, tool_name) for pat in HIGH_STAKES_TOOL_PATTERNS)
 
     relevant = [
         ev for ev in events
