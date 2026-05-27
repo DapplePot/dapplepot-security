@@ -574,6 +574,17 @@ _SYSTEM_VAR_PATTERNS = [
     r"\{[a-z_]+\}",           # {variable} placeholders leaked from template
     r"(?i)(api_key|secret|password|token)\s*=\s*\S+",
 ]
+_LOG_TOOL_RE = re.compile(
+    r"(?i)(log_\w+|\w+_log|\blog\b|audit_trail|write_audit|write_trace|emit_trace|record_event)",
+)
+_SYSTEM_PHRASE_RE = re.compile(
+    r"(?i)("
+    r"you are (a |an )?[a-z].{0,60}(agent|assistant|bot)"
+    r"|your (primary |main )?(objective|role|purpose|goal) is"
+    r"|do not (reveal|disclose|share)"
+    r"|never (reveal|disclose|share|tell)"
+    r")",
+)
 
 
 def check_system_prompt_leakage(
@@ -582,7 +593,8 @@ def check_system_prompt_leakage(
     tenant_id: str,
     sec_config=None,
 ) -> list["Finding"]:
-    """SPL-01a (verbatim segment match), SPL-02a (reveals persona/role name)
+    """SPL-01a (verbatim segment match), SPL-02a (reveals persona/role name),
+    SPL-02b (exposes instruction variables), SPL-03a (system prompt in log),
     and SPL-03b (system prompt in inter-agent msg)."""
     findings: list["Finding"] = []
     declared_prompt: str | None = getattr(sec_config, "system_prompt", None) if sec_config else None
@@ -637,6 +649,69 @@ def check_system_prompt_leakage(
                     detail="Agent output contains un-substituted template variables",
                 ))
                 break
+
+    # SPL-03a — system prompt content written to a log/audit tool
+    # Resolve system text: declared > extracted from llm_start system message
+    system_text = declared_prompt
+    if not system_text:
+        for ev in events:
+            if ev["event_type"] != "llm_start":
+                continue
+            payload_s = ev.get("payload") or {}
+            system_text = payload_s.get("system", "")
+            if not system_text:
+                for msg in payload_s.get("messages", []):
+                    if isinstance(msg, dict) and msg.get("role") == "system":
+                        system_text = str(msg.get("content", ""))
+                        break
+            if system_text:
+                break
+
+    log_events = [
+        e for e in events
+        if e.get("event_type") == "tool_start"
+        and _LOG_TOOL_RE.search(
+            e.get("tool_name") or (e.get("payload") or {}).get("tool_name", "")
+        )
+    ]
+    for ev in log_events:
+        payload_l = ev.get("payload") or {}
+        if isinstance(payload_l, str):
+            try:
+                payload_l = json.loads(payload_l)
+            except Exception:
+                payload_l = {}
+        tool_input_l = payload_l.get("tool_input") or {}
+        if isinstance(tool_input_l, str):
+            try:
+                tool_input_l = json.loads(tool_input_l)
+            except Exception:
+                pass
+        input_text = json.dumps(tool_input_l) if isinstance(tool_input_l, dict) else str(tool_input_l)
+        tool_name_l = ev.get("tool_name") or payload_l.get("tool_name", "")
+
+        if system_text and len(system_text) > 20:
+            from difflib import SequenceMatcher as _SM2
+            sm2 = _SM2(None, system_text.lower(), input_text.lower())
+            lcs2 = max((b.size for b in sm2.get_matching_blocks()), default=0)
+            if lcs2 >= 60:
+                findings.append(_make_finding(
+                    "OW-LLM07", "SPL-03a",
+                    "System prompt in unprotected log",
+                    80, session_id, tenant_id,
+                    severity="high",
+                    detail=f"Log tool '{tool_name_l}' payload contains {lcs2}-char verbatim segment from system prompt",
+                ))
+                break
+        elif _SYSTEM_PHRASE_RE.search(input_text):
+            findings.append(_make_finding(
+                "OW-LLM07", "SPL-03a",
+                "System prompt in unprotected log",
+                80, session_id, tenant_id,
+                severity="high",
+                detail=f"Log tool '{tool_name_l}' payload contains system-prompt-like phrases",
+            ))
+            break
 
     # SPL-03b — system prompt forwarded in inter-agent invoke_agent payload
     tool_starts = [
