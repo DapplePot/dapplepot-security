@@ -3,11 +3,19 @@
 OW-LLM01 sub-checks emitted here:
   PI-01a  Role-override phrase match          (INJ-001, INJ-002, blocklist)
   PI-01b  Delimiter smuggling                 (INJ-005)
+  PI-01c  Encoded / obfuscated payload        (base64 + hex; post-session fallback)
   PI-02a  Web-fetched content with instruction (INJ-004 indirect injection)
   PI-05a  Code injection pattern in prompt    (v3)
   PI-07a  Multimodal content with injection   (v3)
   PI-08a  Adversarial suffix / high-entropy   (v3)
-  PI-09a  Obfuscated/encoded injection        (v3)
+  PI-09a  Obfuscated/encoded injection        (ROT13 + homoglyph; v3)
+
+PI-01c vs PI-09a split:
+  PI-01c  base64 decode → injection pattern match
+          hex-escape (\\xNN x4+) → injection pattern match
+  PI-09a  ROT13 transform → injection pattern match
+          NFKC homoglyph normalisation → injection pattern match
+          (also catches base64/hex that fall through, same _check_pi09a logic)
 """
 import base64
 import codecs
@@ -46,6 +54,12 @@ _SUB_CHECKS = {
         "check_score": 90,
         "severity": "critical",
         "confidence_tier": "deterministic",
+    },
+    "PI-01c": {
+        "check_label": "Encoded / obfuscated payload",
+        "check_score": 75,
+        "severity": "high",
+        "confidence_tier": "high",
     },
     "PI-02a": {
         "check_label": "Indirect injection in retrieved content",
@@ -196,6 +210,44 @@ def _char_entropy(text: str) -> float:
     return -sum((v / total) * math.log2(v / total) for v in counts.values())
 
 
+def _check_pi01c(content: str) -> str | None:
+    """Return 'base64' or 'hex' if an encoded injection is found (PI-01c), else None.
+
+    Only tests base64 decode and hex-escape decode — the two transforms that
+    correspond to PI-01c in the signal registry and the online detector.
+    ROT13 and homoglyph transforms belong to PI-09a.
+    """
+    all_patterns = [sig["pattern"] for sig in _REGEX_SIGNATURES] + INSTRUCTION_PATTERNS
+
+    def matches_any(text: str) -> bool:
+        return any(re.search(p, text) for p in all_patterns)
+
+    # 1. Base64 decode candidates
+    for m in _BASE64_CANDIDATE.finditer(content):
+        candidate = m.group(0)
+        padded = candidate + "=" * (-len(candidate) % 4)
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+            if matches_any(decoded):
+                return "base64"
+        except Exception:
+            pass
+
+    # 2. Hex-escape sequences (\xNN x4+)
+    hex_match = _HEX_PATTERN.search(content)
+    if hex_match:
+        try:
+            decoded_hex = bytes.fromhex(
+                hex_match.group(0).replace("\\x", "")
+            ).decode("utf-8", errors="ignore")
+            if matches_any(decoded_hex):
+                return "hex"
+        except Exception:
+            pass
+
+    return None
+
+
 def _check_pi09a(content: str) -> str | None:
     """Return detection method name if obfuscated injection found, else None."""
     all_patterns = [sig["pattern"] for sig in _REGEX_SIGNATURES] + INSTRUCTION_PATTERNS
@@ -265,6 +317,18 @@ async def detect_injection(
         hit = _blocklist_scan(content, blocklist)
         if hit:
             findings.append(_build_finding(event, "PI-01a", hit[:200]))
+
+        # PI-01c — Encoded / obfuscated payload (base64 + hex; post-session fallback)
+        pi01c_method = _check_pi01c(content)
+        if pi01c_method:
+            findings.append(
+                _build_finding(
+                    event,
+                    "PI-01c",
+                    content[:200],
+                    detail=f"Encoded payload detected (method: {pi01c_method})",
+                )
+            )
 
         # Indirect injection — PI-02a
         if (last_tool_output
