@@ -74,6 +74,7 @@ from security_eval.scorer.llm_signals import (
     SIGNAL_DESCRIPTION,
     check_multi_turn_jailbreak,
     check_rag_integrity,
+    check_rag_goal_shift,
     check_system_prompt_leakage,
     check_vector_integrity,
     check_payload_splitting,
@@ -648,6 +649,7 @@ async def score_session(
     _extend_if_enabled(check_multi_turn_jailbreak(events, session_id, tenant_id))
     _extend_if_enabled(check_payload_splitting(events, session_id, tenant_id))
     _extend_if_enabled(check_rag_integrity(events, session_id, tenant_id, baseline={}))
+    _extend_if_enabled(check_rag_goal_shift(events, session_id, tenant_id))
     _extend_if_enabled(check_system_prompt_leakage(events, session_id, tenant_id, sec_config=sec_config))
     _extend_if_enabled(check_vector_integrity(events, session_id, tenant_id))
     _extend_if_enabled(check_insecure_code_output(events, session_id, tenant_id))
