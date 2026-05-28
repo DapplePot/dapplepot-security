@@ -343,7 +343,7 @@ async def _run_per_event_detectors(
     _skip = skip_sub_checks or frozenset()
     from security_eval.detectors.injection import detect_injection
     from security_eval.detectors.passthrough import detect_passthrough
-    from security_eval.detectors.disclosure import detect_pii
+    from security_eval.detectors.disclosure import detect_pii, detect_tool_params, detect_stack_trace, detect_cross_tenant_output
     from security_eval.detectors.agentic import (
         detect_agent_threats_on_tool_start,
         detect_agent_threats_on_tool_end,
@@ -354,6 +354,7 @@ async def _run_per_event_detectors(
     last_llm_output: dict[str, str] = {}   # node_run_id → completion
     last_tool_output: dict[str, str] = {}  # node_run_id → tool_output
     last_user_turn: str = ""
+    user_tenant_id: str | None = None      # end-tenant for current session (SID-04b)
     findings: list = []
 
     for ev in events:
@@ -361,6 +362,14 @@ async def _run_per_event_detectors(
         nid = ev.get("node_run_id") or ""
         payload = ev.get("payload") or {}
         ev_findings: list = []
+
+        # Track user_tenant_id from session_start so SID-04b can compare tool outputs
+        # ClickHouse normalises session_start → graph_start (toInternalType in session-writer.ts)
+        if etype in ("session_start", "graph_start"):
+            user_tenant_id = (
+                ev.get("user_tenant_id")
+                or (payload.get("user_tenant_id") if isinstance(payload, dict) else None)
+            )
 
         try:
             if etype == "llm_start":
@@ -378,6 +387,7 @@ async def _run_per_event_detectors(
                 completion = payload.get("completion", "") if isinstance(payload, dict) else ""
                 last_llm_output[nid] = str(completion)
                 ev_findings += detect_pii(ev)
+                ev_findings += detect_stack_trace(ev)
                 ev_findings += check_prompt_guard(
                     ev, session_ctx={"last_user_turn": last_user_turn}, agent_manifest={}
                 )
@@ -387,6 +397,7 @@ async def _run_per_event_detectors(
                     ev, last_llm_output=last_llm_output.get(nid, "")
                 )
                 ev_findings += detect_agent_threats_on_tool_start(ev, sec_config=sec_config)
+                ev_findings += detect_tool_params(ev)
 
             elif etype == "tool_end":
                 tool_output = payload.get("tool_output", "") if isinstance(payload, dict) else ""
@@ -394,6 +405,7 @@ async def _run_per_event_detectors(
                     tool_output = json.dumps(tool_output)
                 last_tool_output[nid] = tool_output
                 ev_findings += detect_pii(ev)
+                ev_findings += detect_cross_tenant_output(ev, user_tenant_id=user_tenant_id)
                 ev_findings += detect_agent_threats_on_tool_end(ev)
 
         except Exception:

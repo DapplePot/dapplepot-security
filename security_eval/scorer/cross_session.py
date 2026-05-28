@@ -4,7 +4,8 @@ All functions query ClickHouse (event history) or Postgres (session scores) for
 cross-session patterns and return a Finding or None.
 
 Sub-checks:
-  SID-03a  Cross-user context bleed           (OW-LLM02)
+  SID-03a  Cross-user context bleed                      (OW-LLM02)
+  SID-04a  Output references data from different session (OW-LLM02)
   UBC-03a  Request rate spike per user         (OW-LLM10)
   UBC-05a  Cost spike (Denial of Wallet)       (OW-LLM10)
   IPA-05a  Identity sharing across users       (OW-ASI03)
@@ -68,6 +69,22 @@ def _make_finding(
 # SID-03a — Cross-user context bleed (OW-LLM02)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_SID03A_PII_PATTERNS = [
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),   # email
+    re.compile(r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"), # SSN
+    re.compile(r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b"),  # credit card
+    re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"),                     # phone
+]
+
+
+def _extract_pii_hashes(text: str) -> set[str]:
+    hashes: set[str] = set()
+    for pat in _SID03A_PII_PATTERNS:
+        for m in pat.finditer(text):
+            hashes.add(hashlib.sha256(m.group(0).encode()).hexdigest()[:16])
+    return hashes
+
+
 async def check_cross_user_bleed(
     events: list[dict],
     session: dict,
@@ -75,72 +92,90 @@ async def check_cross_user_bleed(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """SID-03a — PII found in completion that matches another user's session."""
-    from security_eval.detectors.disclosure import detect_pii
+    """SID-03a — exact PII value from this session also appears in a different
+    user's session on the same agent, indicating context bleed."""
 
-    # Extract PII patterns from this session's completions
-    pii_hashes: set[str] = set()
+    # Step 1: hash every PII match from this session's completions
+    current_pii_hashes: set[str] = set()
     for ev in events:
         if ev["event_type"] != "llm_end":
             continue
-        payload = ev.get("payload") or {}
-        completion = payload.get("completion", "")
+        completion = (ev.get("payload") or {}).get("completion", "")
         if not isinstance(completion, str):
             completion = json.dumps(completion)
-        # Use simple PII patterns to hash matched values
-        _PII_PATTERNS = [
-            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",      # email
-            r"\b\d{3}[-.\s]?\d{2}[-.\s]?\d{4}\b",                          # SSN
-            r"\b(?:\d[ -]?){13,16}\b",                                      # credit card
-            r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",                          # phone
-        ]
-        for pat in _PII_PATTERNS:
-            for m in re.finditer(pat, completion):
-                pii_hashes.add(hashlib.sha256(m.group(0).encode()).hexdigest()[:16])
+        current_pii_hashes |= _extract_pii_hashes(completion)
 
-    if not pii_hashes:
+    if not current_pii_hashes:
         return None
 
-    # Get user_context_id — top-level column first (set by SDK), payload fallback for legacy events
+    # Step 2: require a user_context_id to identify the current user
     user_context_id = next(
-        (ev.get("user_context_id") or ev.get("payload", {}).get("user_context_id")
-         for ev in events
-         if ev.get("user_context_id") or (isinstance(ev.get("payload"), dict) and ev["payload"].get("user_context_id"))),
+        (
+            ev.get("user_context_id") or (
+                ev.get("payload", {}).get("user_context_id")
+                if isinstance(ev.get("payload"), dict) else None
+            )
+            for ev in events
+            if ev.get("user_context_id") or (
+                isinstance(ev.get("payload"), dict) and ev["payload"].get("user_context_id")
+            )
+        ),
         None,
     )
     if not user_context_id:
         return None
 
-    # Query ClickHouse for same PII patterns in other users' sessions
+    # Step 3: fetch completions from other users on the same agent (last 24 h)
     from core.infra import clickhouse as ch
     try:
         other_rows = await ch.fetch(
             """
-            SELECT DISTINCT session_id, user_context_id
+            SELECT session_id, user_context_id, payload
             FROM obs_events
-            WHERE tenant_id = %(tenant_id)s
-              AND user_context_id != %(user_context_id)s
-              AND emitted_at >= now() - INTERVAL 1 DAY
-              AND event_type = 'llm_end'
-            LIMIT 100
+            WHERE tenant_id        = %(tenant_id)s
+              AND agent_id         = %(agent_id)s
+              AND user_context_id  != %(user_context_id)s
+              AND event_type       = 'llm_end'
+              AND emitted_at       >= now() - INTERVAL 1 DAY
+            LIMIT 300
             """,
             tenant_id=tenant_id,
+            agent_id=str(agent_id),
             user_context_id=str(user_context_id),
         )
     except Exception:
         return None
 
-    # Simplified check: if any other user sessions exist, note the risk
-    # Full check would compare hashes against their completions
-    if other_rows:
-        return _make_finding(
-            "OW-LLM02", "SID-03a",
-            "Cross-user context bleed",
-            95, session_id, tenant_id,
-            detail="PII pattern found in completion that may match another user's session data",
-            severity="critical",
-            confidence_tier="high",
-        )
+    # Step 4: check each other session's completion for overlapping PII hashes
+    for row in other_rows:
+        payload = row.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        other_completion = payload.get("completion", "")
+        if not isinstance(other_completion, str):
+            other_completion = json.dumps(other_completion)
+
+        other_hashes = _extract_pii_hashes(other_completion)
+        overlap = current_pii_hashes & other_hashes
+        if overlap:
+            other_user = row.get("user_context_id") or "unknown"
+            other_sess = row.get("session_id") or "unknown"
+            return _make_finding(
+                "OW-LLM02", "SID-03a",
+                "Cross-user context bleed",
+                95, session_id, tenant_id,
+                detail=(
+                    f"Identical PII value appeared in this session (user {user_context_id}) "
+                    f"and in session {other_sess} (user {other_user}) on the same agent — "
+                    f"possible shared memory or prompt cache bleed ({len(overlap)} value(s) matched)"
+                ),
+                severity="critical",
+                confidence_tier="high",
+            )
+
     return None
 
 
@@ -900,11 +935,125 @@ async def check_graph_error_restart_loop(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SID-04a — Output references data from different user's session (OW-LLM02)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Structured business identifiers that are session-scoped and should never
+# appear in a different user's session output.
+_SID04A_IDENTIFIER_PAT = re.compile(
+    r"\b(?:ORD|ORDER|TXN|REF|CUST|ACC|ACCT|POL|CLM|INV|DOC|APP|NHR|MRN|EMP|USR)"
+    r"-[A-Z0-9][A-Z0-9\-]{3,}\b"
+)
+
+
+def _extract_session_identifiers(text: str) -> set[str]:
+    return {hashlib.sha256(m.group(0).encode()).hexdigest()[:16]
+            for m in _SID04A_IDENTIFIER_PAT.finditer(text)}
+
+
+async def check_cross_session_data_reference(
+    events: list[dict],
+    session: dict,
+    tenant_id: str,
+    session_id: str,
+    agent_id: str,
+) -> "Finding | None":
+    """SID-04a — a structured session identifier (order ID, account number, etc.)
+    from this session's output also appeared in a different user's prior session,
+    indicating cross-session context contamination."""
+
+    # Step 1: collect identifiers from this session's completions
+    current_id_hashes: set[str] = set()
+    for ev in events:
+        if ev["event_type"] != "llm_end":
+            continue
+        completion = (ev.get("payload") or {}).get("completion", "")
+        if not isinstance(completion, str):
+            completion = json.dumps(completion)
+        current_id_hashes |= _extract_session_identifiers(completion)
+
+    if not current_id_hashes:
+        return None
+
+    # Step 2: require user_context_id to identify the current user
+    user_context_id = next(
+        (
+            ev.get("user_context_id") or (
+                ev.get("payload", {}).get("user_context_id")
+                if isinstance(ev.get("payload"), dict) else None
+            )
+            for ev in events
+            if ev.get("user_context_id") or (
+                isinstance(ev.get("payload"), dict) and ev["payload"].get("user_context_id")
+            )
+        ),
+        None,
+    )
+    if not user_context_id:
+        return None
+
+    # Step 3: fetch completions from other users on the same agent (last 7 days)
+    from core.infra import clickhouse as ch
+    try:
+        other_rows = await ch.fetch(
+            """
+            SELECT session_id, user_context_id, payload
+            FROM obs_events
+            WHERE tenant_id       = %(tenant_id)s
+              AND agent_id        = %(agent_id)s
+              AND user_context_id != %(user_context_id)s
+              AND event_type      = 'llm_end'
+              AND emitted_at      >= now() - INTERVAL 7 DAY
+            LIMIT 300
+            """,
+            tenant_id=tenant_id,
+            agent_id=str(agent_id),
+            user_context_id=str(user_context_id),
+        )
+    except Exception:
+        return None
+
+    # Step 4: check for overlapping identifier hashes
+    for row in other_rows:
+        payload = row.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        other_completion = payload.get("completion", "")
+        if not isinstance(other_completion, str):
+            other_completion = json.dumps(other_completion)
+
+        other_hashes = _extract_session_identifiers(other_completion)
+        overlap = current_id_hashes & other_hashes
+        if overlap:
+            other_user = row.get("user_context_id") or "unknown"
+            other_sess = row.get("session_id") or "unknown"
+            return _make_finding(
+                "OW-LLM02", "SID-04a",
+                "Output references data from different session",
+                92, session_id, tenant_id,
+                detail=(
+                    f"Structured identifier in this session (user {user_context_id}) "
+                    f"also appeared in session {other_sess} (user {other_user}) — "
+                    f"possible shared memory or prompt cache cross-session bleed "
+                    f"({len(overlap)} identifier(s) matched)"
+                ),
+                severity="critical",
+                confidence_tier="high",
+            )
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Registry for orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
 CROSS_SESSION_FUNCTIONS: list[tuple[str, object]] = [
     ("cross-SID-03a",   check_cross_user_bleed),
+    ("cross-SID-04a",   check_cross_session_data_reference),
     ("cross-UBC-03a",   check_request_rate_spike),
     ("cross-UBC-05a",   check_cost_spike),
     ("cross-IPA-05a",   check_identity_sharing),

@@ -39,6 +39,7 @@ _SECRET_PATTERNS = [
     re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*"),
 ]
 
+
 _JWT_PATTERN = re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")
 
 _PII_PATTERNS = [
