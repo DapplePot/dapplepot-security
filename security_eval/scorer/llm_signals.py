@@ -955,6 +955,84 @@ def check_insecure_code_output(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# IOH-03b — Sub-agent receives broken structured output (OW-LLM05)
+# ─────────────────────────────────────────────────────────────────────────────
+_SUB_AGENT_TOOL_RE = re.compile(
+    r"(?i)\b(invoke_agent|call_agent|delegate|run_agent|sub_agent|agent_call|"
+    r"execute_agent|dispatch_agent|spawn_agent|agent_invoke|delegate_to)\b"
+)
+_SUB_AGENT_ERROR_RE = re.compile(
+    r"(?i)\b(traceback|exception|error\b|failed|timeout|timed.?out|"
+    r"connection.?refused|internal.?server.?error)\b"
+)
+_SUB_AGENT_RESULT_KEYS = frozenset({
+    "result", "output", "response", "data", "content", "answer", "message",
+})
+_SUB_AGENT_ERROR_KEYS = frozenset({"error", "exception", "err", "detail", "reason"})
+
+
+def check_broken_sub_agent_output(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """IOH-03b — sub-agent tool_end returns broken/malformed structured output."""
+    for ev in events:
+        if ev["event_type"] != "tool_end":
+            continue
+        payload = ev.get("payload") or {}
+        tool_name = str(payload.get("tool_name", ""))
+
+        if not _SUB_AGENT_TOOL_RE.search(tool_name):
+            continue
+
+        tool_output = payload.get("tool_output")
+        broken = False
+        reason = ""
+
+        if tool_output is None:
+            broken = True
+            reason = "sub-agent returned null output"
+        elif isinstance(tool_output, str):
+            if not tool_output.strip():
+                broken = True
+                reason = "sub-agent returned empty string"
+            elif _SUB_AGENT_ERROR_RE.search(tool_output):
+                broken = True
+                reason = f"sub-agent returned error string: {tool_output[:120]}"
+        elif isinstance(tool_output, dict):
+            if not tool_output:
+                broken = True
+                reason = "sub-agent returned empty dict"
+            elif tool_output.get("status") in ("error", "failed", "failure"):
+                broken = True
+                reason = f"sub-agent output has error status: {tool_output.get('status')!r}"
+            elif tool_output.get("success") is False:
+                broken = True
+                reason = f"sub-agent output has success=false: {json.dumps(tool_output)[:120]}"
+            elif (
+                not (_SUB_AGENT_RESULT_KEYS & set(tool_output.keys()))
+                and (_SUB_AGENT_ERROR_KEYS & set(tool_output.keys()))
+            ):
+                broken = True
+                reason = f"sub-agent output contains only error keys: {sorted(tool_output.keys())[:5]}"
+        elif isinstance(tool_output, list) and not tool_output:
+            broken = True
+            reason = "sub-agent returned empty list"
+
+        if broken:
+            return [_make_finding(
+                "OW-LLM05", "IOH-03b",
+                "Sub-agent receives broken structured output",
+                65, session_id, tenant_id,
+                severity="medium",
+                detail=f"tool={tool_name!r}: {reason}",
+            )]
+
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MIS-01a — Cited URL returns 404 / non-matching (OW-LLM09)
 # ─────────────────────────────────────────────────────────────────────────────
 
