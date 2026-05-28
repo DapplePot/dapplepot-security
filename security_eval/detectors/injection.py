@@ -249,45 +249,27 @@ def _check_pi01c(content: str) -> str | None:
 
 
 def _check_pi09a(content: str) -> str | None:
-    """Return detection method name if obfuscated injection found, else None."""
+    """Return 'rot13' or 'homoglyph' if an obfuscated injection is found (PI-09a), else None.
+
+    Only tests ROT13 and Unicode homoglyph normalisation — the two transforms that
+    distinguish PI-09a from PI-01c.  Base64 and hex-escape detection belong to
+    PI-01c (_check_pi01c) and are intentionally excluded here to avoid duplicate
+    findings for the same content.
+    """
     all_patterns = [sig["pattern"] for sig in _REGEX_SIGNATURES] + INSTRUCTION_PATTERNS
 
     def matches_any(text: str) -> bool:
         return any(re.search(p, text) for p in all_patterns)
 
-    # 1. Base64 decode candidates
-    for m in _BASE64_CANDIDATE.finditer(content):
-        candidate = m.group(0)
-        # Pad to valid base64 length
-        padded = candidate + "=" * (-len(candidate) % 4)
-        try:
-            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
-            if matches_any(decoded):
-                return "base64"
-        except Exception:
-            pass
-
-    # 2. ROT13
+    # 1. ROT13
     rot13 = codecs.encode(content, "rot_13")
     if matches_any(rot13):
         return "rot13"
 
-    # 3. Unicode homoglyph normalization
+    # 2. Unicode homoglyph normalization (NFKC)
     normalized = unicodedata.normalize("NFKC", content)
     if normalized != content and matches_any(normalized):
         return "homoglyph"
-
-    # 4. Hex-encoded sequences
-    hex_match = _HEX_PATTERN.search(content)
-    if hex_match:
-        try:
-            decoded_hex = bytes.fromhex(hex_match.group(0).replace("\\x", "")).decode(
-                "utf-8", errors="ignore"
-            )
-            if matches_any(decoded_hex):
-                return "hex"
-        except Exception:
-            pass
 
     return None
 
