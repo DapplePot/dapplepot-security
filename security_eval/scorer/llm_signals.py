@@ -529,6 +529,87 @@ async def signal_ow_llm10_token_spike(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PI-04a — Goal vector drift across >= 3 turns (OW-LLM01)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_goal_vector_drift(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """PI-04a — conversation goal drifts from a benign initial request toward a
+    sensitive/injection topic across >= 3 user turns.
+
+    Detection rules (all must hold):
+      1. >= 3 user messages found across llm_start events.
+      2. The FIRST user message does NOT match any injection/INSTRUCTION pattern.
+      3. The LAST user message DOES match an injection or INSTRUCTION pattern —
+         indicating the drift completed into adversarial territory.
+      4. At least one intermediate turn shows similarity-drop relative to the
+         first turn (SequenceMatcher ratio < 0.5 for any middle turn vs turn 1),
+         confirming gradual drift rather than a single-message injection (PI-01a).
+
+    Score=65, severity=medium — weaker than PI-04b because the final message
+    contains an injection signal but the path there may be organic escalation
+    rather than deliberate splitting.
+    """
+    from security_eval.detectors.injection import (
+        matches_injection_pattern,
+        INSTRUCTION_PATTERNS,
+    )
+    from difflib import SequenceMatcher
+
+    llm_starts = [e for e in events if e["event_type"] == "llm_start"]
+    user_messages: list[str] = []
+    for ev in llm_starts:
+        payload = ev.get("payload") or {}
+        for msg in payload.get("messages", []):
+            if isinstance(msg, dict) and msg.get("role") in ("user", "human"):
+                content = str(msg.get("content", "")).strip()
+                if content:
+                    user_messages.append(content)
+                    break  # one user message per turn is enough
+
+    if len(user_messages) < 3:
+        return []
+
+    first, *middle, last = user_messages
+
+    # Rule 2: first turn must be clean
+    if matches_injection_pattern(first) or any(
+        re.search(p, first) for p in INSTRUCTION_PATTERNS
+    ):
+        return []
+
+    # Rule 3: last turn must contain an injection/instruction signal
+    if not (matches_injection_pattern(last) or any(
+        re.search(p, last) for p in INSTRUCTION_PATTERNS
+    )):
+        return []
+
+    # Rule 4: at least one middle turn shows drift away from the original goal
+    def _similarity(a: str, b: str) -> float:
+        return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+    drift_confirmed = any(
+        _similarity(first, m) < 0.5 for m in middle
+    )
+    if not drift_confirmed:
+        return []
+
+    return [_make_finding(
+        "OW-LLM01", "PI-04a",
+        "Goal vector drift across turns",
+        65, session_id, tenant_id,
+        severity="medium",
+        detail=(
+            f"Session drifted from benign start to injection signal over "
+            f"{len(user_messages)} turns; first={first[:60]!r} → last={last[:60]!r}"
+        ),
+    )]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NEW: PI-04b Multi-turn accumulation jailbreak (OW-LLM01)
 # ─────────────────────────────────────────────────────────────────────────────
 def check_multi_turn_jailbreak(

@@ -1,10 +1,13 @@
-﻿"""Injection detector — runs on every llm_start event.
+﻿"""Injection detector — runs on llm_start and tool_end events.
 
 OW-LLM01 sub-checks emitted here:
   PI-01a  Role-override phrase match          (INJ-001, INJ-002, blocklist)
   PI-01b  Delimiter smuggling                 (INJ-005)
   PI-01c  Encoded / obfuscated payload        (base64 + hex; post-session fallback)
   PI-02a  Web-fetched content with instruction (INJ-004 indirect injection)
+  PI-02c  File / attachment payload injection  (document/file content blocks)
+  PI-03a  API response carries directives      (tool_end; API/HTTP tool output)
+  PI-03b  DB query result embeds prompt fragment (tool_end; DB/SQL tool output)
   PI-05a  Code injection pattern in prompt    (v3)
   PI-07a  Multimodal content with injection   (v3)
   PI-08a  Adversarial suffix / high-entropy   (v3)
@@ -15,7 +18,13 @@ PI-01c vs PI-09a split:
           hex-escape (\\xNN x4+) → injection pattern match
   PI-09a  ROT13 transform → injection pattern match
           NFKC homoglyph normalisation → injection pattern match
-          (also catches base64/hex that fall through, same _check_pi09a logic)
+
+PI-02a vs PI-02c vs PI-03a:
+  PI-02a  injection in tool_end output echoed back into llm_start (80-char overlap)
+  PI-02c  injection inside an uploaded document/file content block in the user message
+  PI-03a  injection pattern found directly in an API/HTTP tool_end response body
+  PI-03b  injection pattern found directly in a DB/SQL tool_end result row
+          (both fire on the tool_end itself; no echo required)
 """
 import base64
 import codecs
@@ -58,6 +67,24 @@ _SUB_CHECKS = {
     "PI-01c": {
         "check_label": "Encoded / obfuscated payload",
         "check_score": 75,
+        "severity": "high",
+        "confidence_tier": "high",
+    },
+    "PI-02c": {
+        "check_label": "File / attachment payload injection",
+        "check_score": 80,
+        "severity": "high",
+        "confidence_tier": "high",
+    },
+    "PI-03a": {
+        "check_label": "API response carries directives",
+        "check_score": 88,
+        "severity": "high",
+        "confidence_tier": "high",
+    },
+    "PI-03b": {
+        "check_label": "DB query result embeds prompt fragment",
+        "check_score": 82,
         "severity": "high",
         "confidence_tier": "high",
     },
@@ -213,6 +240,175 @@ def _char_entropy(text: str) -> float:
     return -sum((v / total) * math.log2(v / total) for v in counts.values())
 
 
+def _extract_document_texts(msg: dict) -> list[str]:
+    """Extract text from document/file content blocks in a message (PI-02c).
+
+    Handles:
+      {"type": "document", "source": {"type": "text", "data": "<plaintext>"}}
+      {"type": "document", "source": {"type": "base64", "data": "<b64>"}}
+      {"type": "file", ...} — same structure
+    Also extracts any standalone "text" parts that appear alongside a document
+    block (common when an agent framework inlines parsed file content as a text
+    part next to the original document block).
+    """
+    raw_content = msg.get("content")
+    if not isinstance(raw_content, list):
+        return []
+
+    texts: list[str] = []
+    has_doc = False
+
+    for part in raw_content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type", "")
+
+        if ptype in ("document", "file"):
+            has_doc = True
+            source = part.get("source") or {}
+            src_type = source.get("type", "")
+            data = source.get("data", "")
+
+            if src_type == "text":
+                texts.append(str(data))
+            elif src_type == "base64":
+                try:
+                    texts.append(
+                        base64.b64decode(data).decode("utf-8", errors="ignore")
+                    )
+                except Exception:
+                    pass
+
+            # Some frameworks put extracted text directly on the block
+            if part.get("text"):
+                texts.append(str(part["text"]))
+
+    # Text parts that sit alongside a document block are likely parsed file output
+    if has_doc:
+        for part in raw_content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                t = str(part.get("text", ""))
+                if t and t not in texts:
+                    texts.append(t)
+
+    return texts
+
+
+# PI-03a: tool names that indicate an outbound API/HTTP call
+_API_TOOL_RE = re.compile(
+    r"(?i)^(http|api|rest|fetch|request|get_|post_|put_|patch_|delete_|"
+    r"call_|invoke_|url_|web_|curl|webhook|endpoint)"
+)
+
+# PI-03b: tool names that indicate a database query
+_DB_TOOL_RE = re.compile(
+    r"(?i)(sql|db_|database|query|execute_sql|run_query|select_|"
+    r"pg_|postgres|mysql|sqlite|mongo|dynamo|bigquery|snowflake|"
+    r"lookup|search_db|db_lookup|table_scan)"
+)
+
+
+def detect_api_response_injection(event: dict) -> list["Finding"]:
+    """Scan tool_end output for injection patterns in API/HTTP response bodies (PI-03a).
+
+    Fires when:
+      1. The tool_name matches _API_TOOL_RE — indicating an outbound HTTP/API call.
+      2. The tool_end output (the API response body) contains a role-override or
+         instruction pattern from _REGEX_SIGNATURES + INSTRUCTION_PATTERNS.
+
+    This catches cases where a third-party API endpoint (compromised or adversarial)
+    embeds injection directives in its JSON/XML response body.  Unlike PI-02a, there
+    is no overlap/echo requirement — the finding fires on the tool_end event directly
+    when the response body contains the directive.
+    """
+    if event.get("event_type") != "tool_end":
+        return []
+
+    tool_name = event.get("tool_name") or (event.get("payload") or {}).get("tool_name", "")
+    if not tool_name or not _API_TOOL_RE.search(str(tool_name)):
+        return []
+
+    payload = event.get("payload") or {}
+    raw_output = payload.get("tool_output", "")
+    output_text = json.dumps(raw_output) if isinstance(raw_output, dict) else str(raw_output)
+
+    all_patterns = [sig["pattern"] for sig in _REGEX_SIGNATURES] + INSTRUCTION_PATTERNS
+
+    from security_eval.findings import Finding
+    for pat in all_patterns:
+        m = re.search(pat, output_text)
+        if m:
+            return [Finding(
+                tenant_id=event.get("tenant_id", ""),
+                session_id=event["session_id"],
+                event_id=event["event_id"],
+                event_type=event["event_type"],
+                owasp_signal_id="OW-LLM01",
+                sub_check_id="PI-03a",
+                check_label="API response carries directives",
+                check_score=88,
+                category="prompt_injection",
+                severity="high",
+                matched_text=m.group(0)[:200],
+                detail=f"Injection directive in API response body from tool {tool_name!r}: {m.group(0)[:80]}",
+                detection_phase="post_session",
+                confidence_tier="high",
+            )]
+    return []
+
+
+def detect_db_result_injection(event: dict) -> list["Finding"]:
+    """Scan tool_end output for injection patterns in DB/SQL query results (PI-03b).
+
+    Fires when:
+      1. The tool_name matches _DB_TOOL_RE — indicating a database query call.
+      2. The tool_end output (query result rows) contains a role-override or
+         instruction pattern from _REGEX_SIGNATURES + INSTRUCTION_PATTERNS.
+
+    An attacker poisons a database row (via a prior write, SQL injection, or
+    compromised seed data) with an injection directive stored as a column value.
+    When the agent queries that table and the row is returned in tool_output,
+    the directive is present in the agent's context and may be acted upon.
+
+    Unlike PI-02a, there is no overlap/echo requirement — the finding fires
+    directly on the tool_end event when the query result contains the directive.
+    """
+    if event.get("event_type") != "tool_end":
+        return []
+
+    tool_name = event.get("tool_name") or (event.get("payload") or {}).get("tool_name", "")
+    if not tool_name or not _DB_TOOL_RE.search(str(tool_name)):
+        return []
+
+    payload = event.get("payload") or {}
+    raw_output = payload.get("tool_output", "")
+    output_text = json.dumps(raw_output) if isinstance(raw_output, (dict, list)) else str(raw_output)
+
+    all_patterns = [sig["pattern"] for sig in _REGEX_SIGNATURES] + INSTRUCTION_PATTERNS
+
+    from security_eval.findings import Finding
+    for pat in all_patterns:
+        m = re.search(pat, output_text)
+        if m:
+            return [Finding(
+                tenant_id=event.get("tenant_id", ""),
+                session_id=event["session_id"],
+                event_id=event["event_id"],
+                event_type=event["event_type"],
+                owasp_signal_id="OW-LLM01",
+                sub_check_id="PI-03b",
+                check_label="DB query result embeds prompt fragment",
+                check_score=82,
+                category="prompt_injection",
+                severity="high",
+                matched_text=m.group(0)[:200],
+                detail=f"Injection directive in DB result from tool {tool_name!r}: {m.group(0)[:80]}",
+                detection_phase="post_session",
+                confidence_tier="high",
+            )]
+    return []
+
+
 def _check_pi01c(content: str) -> str | None:
     """Return 'base64' or 'hex' if an encoded injection is found (PI-01c), else None.
 
@@ -357,6 +553,22 @@ async def detect_injection(
                         detail="Multimodal message with injection-adjacent text",
                     )
                 )
+
+        # PI-02c — File / attachment payload injection
+        _all_injection_patterns = [sig["pattern"] for sig in _REGEX_SIGNATURES] + INSTRUCTION_PATTERNS
+        for doc_text in _extract_document_texts(msg):
+            for pat in _all_injection_patterns:
+                m = re.search(pat, doc_text)
+                if m:
+                    findings.append(
+                        _build_finding(
+                            event,
+                            "PI-02c",
+                            doc_text[:200],
+                            detail=f"Injection pattern in file/document content: {m.group(0)[:80]}",
+                        )
+                    )
+                    break
 
         # PI-08a — Adversarial suffix (high-entropy tail)
         tail = content[-100:]

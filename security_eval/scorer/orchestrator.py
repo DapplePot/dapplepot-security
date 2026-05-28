@@ -72,6 +72,7 @@ from core.config import (
 from security_eval.scorer.llm_signals import (
     SIGNAL_ID_FUNCTIONS,
     SIGNAL_DESCRIPTION,
+    check_goal_vector_drift,
     check_multi_turn_jailbreak,
     check_rag_integrity,
     check_rag_goal_shift,
@@ -342,7 +343,7 @@ async def _run_per_event_detectors(
     double-counting when the scorer merges SDK findings later.
     """
     _skip = skip_sub_checks or frozenset()
-    from security_eval.detectors.injection import detect_injection
+    from security_eval.detectors.injection import detect_injection, detect_api_response_injection, detect_db_result_injection
     from security_eval.detectors.passthrough import detect_passthrough
     from security_eval.detectors.disclosure import detect_pii, detect_tool_params, detect_stack_trace, detect_cross_tenant_output
     from security_eval.detectors.agentic import (
@@ -407,6 +408,8 @@ async def _run_per_event_detectors(
                 last_tool_output[nid] = tool_output
                 ev_findings += detect_pii(ev)
                 ev_findings += detect_cross_tenant_output(ev, user_tenant_id=user_tenant_id)
+                ev_findings += detect_api_response_injection(ev)
+                ev_findings += detect_db_result_injection(ev)
                 ev_findings += detect_agent_threats_on_tool_end(ev)
 
         except Exception:
@@ -646,6 +649,7 @@ async def score_session(
     from security_eval.detectors.agentic import detect_ea_tool_call_limit, check_mcp_descriptor_poisoning
     _extend_if_enabled(detect_ea_tool_call_limit(events, sec_config, session_id, tenant_id))
     _extend_if_enabled(check_mcp_descriptor_poisoning(events, session_id, tenant_id, sec_config=sec_config))
+    _extend_if_enabled(check_goal_vector_drift(events, session_id, tenant_id))
     _extend_if_enabled(check_multi_turn_jailbreak(events, session_id, tenant_id))
     _extend_if_enabled(check_payload_splitting(events, session_id, tenant_id))
     _extend_if_enabled(check_rag_integrity(events, session_id, tenant_id, baseline={}))
