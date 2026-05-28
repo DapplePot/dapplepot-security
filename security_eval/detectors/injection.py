@@ -108,14 +108,17 @@ _BASE64_CANDIDATE = re.compile(r"[A-Za-z0-9+/]{20,}={0,2}")
 _REGEX_SIGNATURES = [
     {
         "sub_check_id": "PI-01a",
+        "name": "Instruction suppression phrase",
         "pattern": r"(?i)(ignore|disregard|forget).{0,30}(previous|prior|above|system).{0,30}(instruction|prompt|message)",
     },
     {
         "sub_check_id": "PI-01a",
+        "name": "Persona override phrase",
         "pattern": r"(?i)(pretend|act|behave|you are now|you are a).{0,40}(without|no|ignore).{0,30}(restriction|limit|filter|rule)",
     },
     {
         "sub_check_id": "PI-01b",
+        "name": "Delimiter / turn-separator token",
         "pattern": r"(?i)\[system\]|\<system\>|###\s*system|</s>|<\|im_start\|>|<\|im_end\|>",
     },
 ]
@@ -293,12 +296,18 @@ async def detect_injection(
         # Regex signatures → PI-01a and PI-01b
         for sig in _REGEX_SIGNATURES:
             if re.search(sig["pattern"], content):
-                findings.append(_build_finding(event, sig["sub_check_id"], content[:200]))
+                findings.append(_build_finding(
+                    event, sig["sub_check_id"], content[:200],
+                    detail=sig.get("name"),
+                ))
 
         # Blocklist scan → PI-01a (role-override category)
         hit = _blocklist_scan(content, blocklist)
         if hit:
-            findings.append(_build_finding(event, "PI-01a", hit[:200]))
+            findings.append(_build_finding(
+                event, "PI-01a", hit[:200],
+                detail=f"Blocklist phrase matched: {hit[:80]}",
+            ))
 
         # PI-01c — Encoded / obfuscated payload (base64 + hex; post-session fallback)
         pi01c_method = _check_pi01c(content)
@@ -316,14 +325,20 @@ async def detect_injection(
         if (last_tool_output
                 and _overlap_chars(content, last_tool_output) >= _INDIRECT_MIN_OVERLAP_CHARS
                 and any(re.search(p, content) for p in INSTRUCTION_PATTERNS)):
-            findings.append(_build_finding(event, "PI-02a", content[:200]))
+            findings.append(_build_finding(
+                event, "PI-02a", content[:200],
+                detail="Injection directive found in retrieved tool content",
+            ))
 
         # PI-05a — Code injection pattern in prompt (non-system messages only)
         if msg.get("role") not in ("system",):
             for pat in _CODE_INJECTION_PATTERNS:
                 m = re.search(pat, content)
                 if m:
-                    findings.append(_build_finding(event, "PI-05a", content[:200]))
+                    findings.append(_build_finding(
+                        event, "PI-05a", content[:200],
+                        detail=f"Code execution pattern: {m.group(0)[:80]}",
+                    ))
                     break
 
         # PI-07a — Multimodal content with injection signal
