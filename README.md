@@ -137,7 +137,9 @@ trust_score = int(100 × (1 − α/(α+β)))
 | `security_eval/scorer/llm_signals.py` | OW-LLM01–10 signal functions (~1,000 LOC) |
 | `security_eval/scorer/asi_signals.py` | OW-ASI01–10 signal functions (~1,300 LOC) |
 | `security_eval/scorer/attack_chains.py` | 7 attack chain patterns |
+| `security_eval/scorer/cross_session.py` | Cross-session signal functions (SID-03a, SID-04a, UBC-03a/05a, IPA-05a, MCP-02a/04a, RA-02a) |
 | `security_eval/scorer/trust.py` | Bayesian agent trust scoring |
+| `security_eval/scorer/probe.py` | Probe utilities used by signal functions |
 | `core/security_config.py` | `AgentSecurityConfig`, `SubCheckOverride`, `push_agent_defaults()`, Redis cache |
 | `db/postgres/` | 23 migration files |
 
