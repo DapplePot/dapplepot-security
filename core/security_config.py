@@ -355,7 +355,7 @@ async def push_agent_defaults(redis, tenant_id: str, agent_id: str) -> AgentSecu
         cfg_dict: dict = json.loads(raw_defaults)
     else:
         cfg_dict = build_default_config().model_dump()
-        await redis.set(_DEFAULTS_KEY, json.dumps(cfg_dict))
+        await redis.set(_DEFAULTS_KEY, json.dumps(cfg_dict, default=list))
 
     # Apply tenant-wide overrides if already configured
     raw_tenant = await redis.get(_tenant_overrides_key(tenant_id))
@@ -587,7 +587,7 @@ async def get_agent_security_config(
         cfg_dict: dict = json.loads(raw_defaults)
     else:
         cfg_dict = build_default_config().model_dump()
-        await redis.set(_DEFAULTS_KEY, json.dumps(cfg_dict))
+        await redis.set(_DEFAULTS_KEY, json.dumps(cfg_dict, default=list))
 
     raw_tenant = await redis.get(_tenant_overrides_key(tenant_id))
     if raw_tenant:
