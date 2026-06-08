@@ -35,6 +35,14 @@ PII_PATTERNS = [
         "severity":     "critical",
     },
     {
+        "sub_check_id": "SID-02c",
+        "check_label":  "Health / biometric data in output",
+        "check_score":  80,
+        "name":         "Date of birth",
+        "pattern":      r'(?i)\b(?:date\s+of\s+birth|dob)\s*[:\-]',
+        "severity":     "high",
+    },
+    {
         "sub_check_id": "SID-01a",
         "check_label":  "API key / token pattern in output",
         "check_score":  95,
