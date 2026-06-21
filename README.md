@@ -125,6 +125,17 @@ trust_score = int(100 × (1 − α/(α+β)))
 - **`agent_alert_config`** — added `tool_manifest JSONB DEFAULT '[]'` (allowed tool names for manifest sub-checks) and `max_tool_calls_per_session INT` (hard cap; NULL = statistical baseline)
 - **`security_findings`** — uniqueness constraint is now `(session_id, sub_check_id, event_id)` — the same sub-check can fire multiple times per session and all firings are stored
 - **`detection_phase`** — now accepts `'cross_session'` in addition to `'online'` and `'post_session'`
+- **`alerts`** — `rule_id` column and FK to `policy_rules` removed (policy_rules table dropped — scaffolded for user-defined custom rules but never wired up). Alerts now have only `rule_name` + `payload->>'rule_type'` for grouping.
+
+## Alert Types
+
+The scorer produces three alert types via `security_eval/findings.py`. All share the same `alerts` table; consumers distinguish via `rule_name`.
+
+| `rule_name` | Scope | Dedup | Notes |
+|-------------|-------|-------|-------|
+| `Security Risk Score` | session | once per `session_id` | Fires when composite ≥ `COMPOSITE_ALERT_THRESHOLD_V3` (default 60). Suppressed when every finding was already caught online (covered by online alert). |
+| `Online Security Detection` | session | once per `session_id` | Bundles all online findings for the session with per-detection action (`sanitize` / `block_call` / `terminate_session` / `alert`). |
+| `Agent Trust Degradation` | **agent** | once per `agent_id` per day | Agent-level — `session_id` is `NULL`. Fires when `trust_score < 50` for the last `AGENT_TRUST_CONSECUTIVE_SESSIONS` (default 3) scored sessions for the agent. Pre-check at insert time enforces the daily cap. |
 
 ## Key Files
 

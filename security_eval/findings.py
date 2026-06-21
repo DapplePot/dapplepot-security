@@ -155,11 +155,8 @@ async def write_agent_risk_score(
     )
 
 
-_SECURITY_RULE_ID    = "00000000-0000-0000-0000-000000000001"
 _SECURITY_RULE_NAME  = "Security Risk Score"
-_TRUST_RULE_ID       = "00000000-0000-0000-0000-000000000002"
 _TRUST_RULE_NAME     = "Agent Trust Degradation"
-_ONLINE_RULE_ID      = "00000000-0000-0000-0000-000000000002"
 _ONLINE_RULE_NAME    = "Online Security Detection"
 
 # Actions that require an audit row in session_actions.
@@ -251,7 +248,6 @@ async def produce_security_alert(
         "alert_id":     str(uuid.uuid4()),
         "tenant_id":    score_row["tenant_id"],
         "session_id":   session_id,
-        "rule_id":      _SECURITY_RULE_ID,
         "rule_name":    _SECURITY_RULE_NAME,
         "severity":     severity,
         "triggered_at": datetime.now(timezone.utc).isoformat(),
@@ -260,7 +256,6 @@ async def produce_security_alert(
             "title":     f"Security Risk: {max_band.capitalize()} ({max_score}/100)",
             "message":   trigger_note,
             "rule_type": "security_risk",
-            "source":    "security",
             "agent_id":  score_row.get("agent_id"),
             "llm_score": score_row["llm_score"],
             "llm_band":  llm_band,
@@ -291,29 +286,51 @@ async def produce_security_alert(
 
 
 async def produce_trust_alert(score_row: dict) -> None:
-    """Produce a standalone trust-degradation alert, separate from security risk alerts."""
-    session_id  = score_row["session_id"]
-    agent_id    = score_row.get("agent_id") or session_id
+    """Produce a standalone trust-degradation alert, separate from security risk alerts.
+
+    Agent-level alert: trust is a cross-session rollup, so the alert is not tied
+    to any single session. Dedup is per-agent-per-day so a persistently degraded
+    agent doesn't spam one alert per session.
+    """
+    agent_id    = score_row.get("agent_id")
     trust_score = float(score_row.get("trust_score") or 0)
     trust_trend = score_row.get("trust_trend", "stable")
 
-    day       = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    dedup_key = f"trust:{agent_id}:{day}"
+    if not agent_id:
+        return
 
+    from core.infra.postgres import get_pool
+    pool = await get_pool()
+    existing = await pool.fetchval(
+        """
+        SELECT 1 FROM alerts a
+        LEFT JOIN sessions s ON s.session_id = a.session_id
+        WHERE a.rule_name = $1
+          AND a.tenant_id = $2
+          AND a.triggered_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+          AND (s.agent_id = $3 OR a.payload->>'agent_id' = $3::text)
+        LIMIT 1
+        """,
+        _TRUST_RULE_NAME,
+        score_row["tenant_id"],
+        agent_id,
+    )
+    if existing:
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     alert = {
         "alert_id":     str(uuid.uuid4()),
         "tenant_id":    score_row["tenant_id"],
-        "session_id":   session_id,
-        "rule_id":      _TRUST_RULE_ID,
+        "session_id":   None,
         "rule_name":    _TRUST_RULE_NAME,
         "severity":     "warning",
         "triggered_at": datetime.now(timezone.utc).isoformat(),
-        "dedup_key":    dedup_key,
+        "dedup_key":    f"trust:{agent_id}:{today}",
         "payload": {
             "title":       f"Agent Trust Degrading: {round(trust_score)}/100 ({_trust_status_label(trust_score)})",
             "message":     "Trust score below 50 for the last 3 consecutive sessions",
             "rule_type":   "trust_degradation",
-            "source":      "security",
             "agent_id":    score_row.get("agent_id"),
             "trust_score": trust_score,
             "trust_trend": trust_trend,
@@ -413,7 +430,6 @@ async def produce_combined_online_alert(
         "alert_id":     str(uuid.uuid4()),
         "tenant_id":    tenant_id,
         "session_id":   session_id,
-        "rule_id":      _ONLINE_RULE_ID,
         "rule_name":    _ONLINE_RULE_NAME,
         "severity":     severity,
         "triggered_at": datetime.now(timezone.utc).isoformat(),
@@ -422,7 +438,6 @@ async def produce_combined_online_alert(
             "title":           f"Online Detections: {n} check{'s' if n != 1 else ''} fired",
             "message":         f"{checks_text}. Actions: {action_summary}.",
             "rule_type":       "online_security_summary",
-            "source":          "security",
             "agent_id":        agent_id,
             "detection_count":    n,
             "action_counts":      action_counts,

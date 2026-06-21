@@ -19,7 +19,7 @@ async def deliver_alert(alert: dict[str, Any]) -> None:
     else:
         triggered_at = triggered_at_raw
 
-    if not triggered_at or not alert.get('session_id') or not alert.get('rule_name'):
+    if not triggered_at or not alert.get('rule_name'):
         log.warning('Skipping malformed alert %s', alert.get('alert_id'))
         return
 
@@ -29,15 +29,14 @@ async def deliver_alert(alert: dict[str, Any]) -> None:
         await conn.execute(
             """
             INSERT INTO alerts
-                (alert_id, tenant_id, session_id, rule_id, rule_name,
+                (alert_id, tenant_id, session_id, rule_name,
                  severity, triggered_at, dedup_key, payload)
-            VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9::jsonb)
+            VALUES ($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8::jsonb)
             ON CONFLICT DO NOTHING
             """,
             alert.get('alert_id'),
             alert.get('tenant_id'),
             alert.get('session_id'),
-            None if str(alert.get('rule_id', '')).startswith('00000000') else alert.get('rule_id'),
             alert.get('rule_name'),
             alert.get('severity', 'medium'),
             triggered_at,
