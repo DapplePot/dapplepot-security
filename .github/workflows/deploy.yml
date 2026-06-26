@@ -38,19 +38,28 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     permissions:
+      contents: read
+      id-token: write
       packages: read
     steps:
-      - uses: appleboy/ssh-action@v1
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
+      - uses: google-github-actions/auth@v2
         with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          envs: GHCR_TOKEN,GITHUB_ACTOR
-          script: |
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-            docker compose -f /opt/dapplepot/docker-compose.yml pull security
-            docker compose -f /opt/dapplepot/docker-compose.yml up -d --no-deps security
-            docker image prune -f
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Security on VM
+        run: |
+          gcloud compute ssh "${{ secrets.GCE_INSTANCE }}" \
+            --zone "${{ secrets.GCE_ZONE }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --tunnel-through-iap \
+            --strict-host-key-checking=no \
+            --command "
+              set -e
+              echo '${{ secrets.GITHUB_TOKEN }}' | sudo docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+              sudo docker compose -f /opt/dapplepot/docker-compose.yml pull security
+              sudo docker compose -f /opt/dapplepot/docker-compose.yml up -d --no-deps security
+              sudo docker image prune -f
+            "
