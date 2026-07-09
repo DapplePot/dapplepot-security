@@ -700,12 +700,16 @@ def detect_agent_threats_on_llm_start(event: dict, sec_config=None) -> list["Fin
         if role not in ("user", "tool"):
             continue
 
-        # OW-ASI06:MCP-01a — injected content alters current plan
+        # OW-ASI06:MCP-01a — context/memory injection markers in prompt.
+        # NOTE: label describes what the check detects (injection markers in
+        # user/tool messages), not that a plan alteration was verified. The
+        # check is a signature scan; downstream drift/goal-hijack checks
+        # (AGH-01a/02a) reason about actual behavioural change.
         fragment = _check_context_injection(content)
         if fragment:
             findings.append(_make_finding(
                 "OW-ASI06", "MCP-01a",
-                check_label="Injected content alters current plan",
+                check_label="Context/memory injection markers in prompt",
                 check_score=88,
                 event=event,
                 severity="high",

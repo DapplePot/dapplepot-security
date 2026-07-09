@@ -178,10 +178,27 @@ async def _persist_sdk_finding(
                     signal_name, session_id,
                 )
                 return
-            # Use payload as-is; filter to init fields
+            # Use payload as-is; filter to init fields.
             import dataclasses
             _init_fields = {f.name for f in dataclasses.fields(Finding) if f.init}
-            finding = Finding(**{k: v for k, v in payload.items() if k in _init_fields})
+            _kwargs = {k: v for k, v in payload.items() if k in _init_fields}
+            # `event_id` in the security_finding envelope is a fresh UUID for
+            # the finding event itself — the *triggering* event's id lives in
+            # `payload.trigger_event_id`. Use that so the UI can scroll the
+            # timeline to the real trigger. Same treatment as Path B below.
+            _kwargs['event_id'] = (
+                payload.get('trigger_event_id')
+                or _kwargs.get('event_id')
+                or str(uuid.uuid4())
+            )
+            _kwargs.setdefault(
+                'event_type',
+                payload.get('trigger_event_type') or 'security_finding',
+            )
+            _kwargs.setdefault('session_id', session_id)
+            _kwargs.setdefault('tenant_id',  tenant_id or '')
+            _kwargs.setdefault('detection_phase', 'online')
+            finding = Finding(**_kwargs)
         else:
             matched = payload.get('matched_text') or payload.get('reason')
             finding = Finding(

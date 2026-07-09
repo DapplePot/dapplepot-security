@@ -68,12 +68,23 @@ def _make_finding(
 # ─────────────────────────────────────────────────────────────────────────────
 # SID-03a — Cross-user context bleed (OW-LLM02)
 # ─────────────────────────────────────────────────────────────────────────────
+# Patterns imported from security_eval.patterns.pii — single source shared with
+# online.py and disclosure.py. SID-03a uses the strict SSN variant (rejects
+# placeholders like 000-xx-xxxx) since a false positive across sessions costs
+# more than in a single-session scan.
+
+from security_eval.patterns.pii import (
+    EMAIL_PATTERN as _EMAIL_PATTERN,
+    SSN_STRICT_PATTERN as _SSN_STRICT_PATTERN,
+    CREDIT_CARD_PATTERN as _CREDIT_CARD_PATTERN,
+    PHONE_PATTERN as _PHONE_PATTERN,
+)
 
 _SID03A_PII_PATTERNS = [
-    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),   # email
-    re.compile(r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"), # SSN
-    re.compile(r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b"),  # credit card
-    re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"),                     # phone
+    _EMAIL_PATTERN,
+    _SSN_STRICT_PATTERN,
+    _CREDIT_CARD_PATTERN,
+    _PHONE_PATTERN,
 ]
 
 
@@ -577,12 +588,31 @@ async def check_cross_tenant_retrieval(
     session_id: str,
     agent_id: str,
 ) -> "Finding | None":
-    """MCP-04a — retrieval result contains identifier from a different tenant."""
+    """MCP-04a — retrieval result carries an explicit tenant_id field that
+    differs from the current session's tenant.
+
+    Registry classification: scope=event, subject=tenant. The historical
+    implementation lived in cross_session.py but only reads the current
+    session's events; a move to detectors/ is still pending.
+
+    Pattern-tightening pass:
+      Previously fired on ANY UUID appearing in retrieval output that did not
+      equal tenant_id — noisy because retrieval outputs regularly contain
+      per-record UUIDs unrelated to tenant identity. Tightened to require an
+      explicit "tenant_id" / "tenantId" / "tenant" field carrying a value
+      that differs from the current tenant. Confidence downgraded from
+      deterministic to high (the field name is the deterministic part; UUID
+      shape is not).
+    """
     _RETRIEVAL_PAT = re.compile(r"(?i)(retrieve|rag|search|vector_search|similarity)")
-    _UUID_PAT = re.compile(
-        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-        re.IGNORECASE,
+    # Match "tenant_id": "value", 'tenant_id': 'value', tenantId=value, tenant: value —
+    # covers JSON, dict-repr, and query-string style outputs. Value is anything
+    # non-whitespace up to a delimiter.
+    _TENANT_FIELD_PAT = re.compile(
+        r'(?i)["\']?(tenant(?:_?id)?)["\']?\s*[:=]\s*["\']?([A-Za-z0-9\-_]{4,})["\']?'
     )
+
+    current_tenant = str(tenant_id).lower()
 
     for ev in events:
         if ev["event_type"] != "tool_end":
@@ -595,18 +625,20 @@ async def check_cross_tenant_retrieval(
         if not isinstance(output, str):
             output = json.dumps(output)
 
-        # Look for UUIDs or tenant IDs in output
-        for m in _UUID_PAT.finditer(output):
-            candidate = m.group(0)
-            # If the candidate is NOT the current tenant_id, it may be cross-tenant
-            if candidate.lower() != str(tenant_id).lower():
+        for m in _TENANT_FIELD_PAT.finditer(output):
+            found_tenant = m.group(2).lower()
+            if found_tenant != current_tenant:
                 return _make_finding(
                     "OW-ASI06", "MCP-04a",
                     "Cross-tenant retrieval anomaly",
                     95, session_id, tenant_id,
-                    detail="Retrieval result contains cross-tenant identifier",
+                    detail=(
+                        f"Retrieval tool '{tool_name}' returned a record with "
+                        f"tenant_id={found_tenant!r} — does not match session "
+                        f"tenant {current_tenant!r}"
+                    ),
                     severity="critical",
-                    confidence_tier="deterministic",
+                    confidence_tier="high",
                 )
     return None
 

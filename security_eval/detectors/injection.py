@@ -36,17 +36,19 @@ from typing import TYPE_CHECKING
 
 from core.config import settings
 from core.infra.redis import get_redis
+from security_eval.patterns import (
+    injection   as _pat_injection,
+    obfuscation as _pat_obfuscation,
+    code_exec   as _pat_code,
+)
 
 if TYPE_CHECKING:
     from security_eval.findings import Finding
 
-# Instruction-like patterns used by the indirect injection check (PI-02a)
-INSTRUCTION_PATTERNS = [
-    r"(?i)(ignore|disregard|forget).{0,30}(instruction|prompt|rule)",
-    r"(?i)(you (must|should|shall|will)).{0,40}(do|execute|perform|run)",
-    r"(?i)(new (instruction|task|directive|command))",
-    r"(?i)(override|bypass|circumvent).{0,30}(filter|restriction|policy)",
-]
+# Instruction-like patterns used by the indirect injection check (PI-02a).
+# Imported from the shared library; kept as a module-level name for existing
+# call sites that concatenate with other pattern lists.
+INSTRUCTION_PATTERNS = _pat_injection.INSTRUCTION_PATTERNS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sub-check registry — maps each signature to its canonical OW-LLM01 sub-check
@@ -120,16 +122,12 @@ _SUB_CHECKS = {
     },
 }
 
-# PI-05a: Code injection patterns
-_CODE_INJECTION_PATTERNS = [
-    r"(?i)(import\s+os|import\s+subprocess|__import__|eval\s*\(|exec\s*\()",
-    r"(?i)(os\.system|subprocess\.\w+|open\s*\(.+['\"]w['\"])",
-    r"(?i)(require\s*\(\s*['\"]child_process|\.exec\s*\(|spawn\s*\()",
-]
+# PI-05a: Code injection patterns (extended variant — see patterns/code_exec.py)
+_CODE_INJECTION_PATTERNS = _pat_code.CODE_INJECTION_PATTERNS_EXTENDED
 
-# PI-09a: Hex-encoded sequences
-_HEX_PATTERN = re.compile(r"(?:\\x[0-9a-f]{2}){4,}", re.IGNORECASE)
-_BASE64_CANDIDATE = re.compile(r"[A-Za-z0-9+/]{20,}={0,2}")
+# PI-09a: Hex + base64 candidate patterns
+_HEX_PATTERN      = _pat_obfuscation.HEX_PATTERN
+_BASE64_CANDIDATE = _pat_obfuscation.BASE64_CANDIDATE
 
 # Hardcoded regex signatures
 _REGEX_SIGNATURES = [

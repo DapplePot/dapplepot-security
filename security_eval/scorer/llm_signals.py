@@ -5,6 +5,7 @@ Per-event detectors (injection, PII, passthrough, agentic, prompt guard) live in
 security_eval/detectors/ and are called by the orchestrator's event loop.
 """
 import json
+import math
 import re
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
@@ -108,6 +109,7 @@ def _make_finding(
     detail: str,
     severity: str | None = None,
     event_id: str = "00000000-0000-0000-0000-000000000000",
+    involved_event_ids: list[str] | None = None,
 ) -> "Finding":
     from security_eval.findings import Finding
     if severity is None:
@@ -126,6 +128,7 @@ def _make_finding(
         matched_text=None,
         detail=detail,
         detection_phase="post_session",
+        involved_event_ids=involved_event_ids or [],
     )
 
 
@@ -150,6 +153,7 @@ async def signal_ow_llm06_tool_count(
     """
     tool_events = [e for e in events if e["event_type"] == "tool_start"]
     tool_call_count = len(tool_events)
+    involved = [e["event_id"] for e in tool_events]
 
     # ── 1. User-defined threshold (authoritative when set) ──────────────────
     # When a manual cap is configured it is the sole source of truth — skip the
@@ -164,6 +168,8 @@ async def signal_ow_llm06_tool_count(
                 "Sub-agents spawned or tool calls exceed fan-out limit",
                 check_score, session_id, tenant_id,
                 detail=f"Tool calls ({tool_call_count}) exceeds configured max ({max_calls})",
+                event_id=involved[0] if involved else "00000000-0000-0000-0000-000000000000",
+                involved_event_ids=involved,
             )
         return None  # under the manual cap — statistical check bypassed
 
@@ -205,6 +211,8 @@ async def signal_ow_llm06_tool_count(
         "Sub-agents spawned or tool calls exceed fan-out limit",
         check_score, session_id, tenant_id,
         detail=f"Tool calls ({tool_call_count}) is {sigmas:.1f}σ above 7-day baseline (mean={mean:.1f})",
+        event_id=involved[0] if involved else "00000000-0000-0000-0000-000000000000",
+        involved_event_ids=involved,
     )
 
 
@@ -227,21 +235,27 @@ async def signal_ow_llm06_scope(
     if not allowed:
         return None
 
-    tool_names_used = [
-        e["tool_name"] for e in events
-        if e["event_type"] == "tool_start" and e.get("tool_name")
+    # Capture the full event objects so we can point involved_event_ids at
+    # every out-of-scope tool_start.
+    oos_events = [
+        e for e in events
+        if e["event_type"] == "tool_start"
+           and e.get("tool_name")
+           and e["tool_name"] not in allowed
     ]
-    out_of_scope = [t for t in tool_names_used if t not in allowed]
-    if not out_of_scope:
+    if not oos_events:
         return None
 
-    unique_oos = list(dict.fromkeys(out_of_scope))
+    unique_oos = list(dict.fromkeys(e["tool_name"] for e in oos_events))
     check_score = min(80, 80 + (len(unique_oos) - 1) * 5)
+    involved = [e["event_id"] for e in oos_events]
     return _make_finding(
         "OW-LLM06", "EA-01a",
         "Tool not in approved manifest invoked",
         check_score, session_id, tenant_id,
         detail=f"Out-of-scope tools invoked: {', '.join(unique_oos[:5])}",
+        event_id=involved[0],
+        involved_event_ids=involved,
     )
 
 
@@ -297,6 +311,7 @@ async def signal_ow_llm06_write_on_read(
                         75, session_id, tenant_id,
                         detail=f"Tool '{tool_name}' wrote to '{val}' — outside declared namespace '{write_namespace}'",
                         severity="high",
+                        event_id=e["event_id"],
                     )
         return None
 
@@ -328,15 +343,21 @@ async def signal_ow_llm06_write_on_read(
     is_read_intent = any(re.search(p, initial_input) for p in READ_INTENT_PATTERNS)
     if not is_read_intent:
         return None
-    tool_names = [e["tool_name"] for e in tool_events]
-    write_tools = [t for t in tool_names if any(re.search(p, t) for p in WRITE_TOOL_PATTERNS)]
-    if not write_tools:
+    write_events = [
+        e for e in tool_events
+        if any(re.search(p, e["tool_name"]) for p in WRITE_TOOL_PATTERNS)
+    ]
+    if not write_events:
         return None
+    write_tools = [e["tool_name"] for e in write_events]
+    involved = [e["event_id"] for e in write_events]
     return _make_finding(
         "OW-LLM06", "EA-01c",
         "Data written outside designated namespace",
         75, session_id, tenant_id,
         detail=f"Write/delete tools used ({', '.join(dict.fromkeys(write_tools))[:5]}) on read-intent session",
+        event_id=involved[0],
+        involved_event_ids=involved,
     )
 
 
@@ -421,6 +442,7 @@ async def signal_ow_llm09(
                         f"Tool '{tool_name}' requires approval but no HITL gate node "
                         f"was recorded between the preceding LLM turn and this tool call"
                     ),
+                    event_id=ev["event_id"],
                 )
             # Reset after any tool_start so each tool is evaluated independently
             hitl_seen_since_llm = False
@@ -519,12 +541,19 @@ async def signal_ow_llm10_token_spike(
         return None
 
     model_label = f" ({worst_model})" if worst_model and worst_model != "__unknown__" else ""
+    # Every llm_end for the offending model contributed to the spike.
+    involved = [
+        e["event_id"] for e in llm_events
+        if (e.get("llm_model") or "__unknown__") == worst_model
+    ]
     return _make_finding(
         "OW-LLM10", "UBC-01a",
         "Single session token count > 4σ baseline",
         55, session_id, tenant_id,
         severity="medium",
         detail=f"Token count {worst_tokens}{model_label} is {worst_sigmas:.1f}σ above 7-day per-model baseline",
+        event_id=involved[0] if involved else "00000000-0000-0000-0000-000000000000",
+        involved_event_ids=involved,
     )
 
 
@@ -561,6 +590,7 @@ def check_goal_vector_drift(
 
     llm_starts = [e for e in events if e["event_type"] == "llm_start"]
     user_messages: list[str] = []
+    turn_events: list[dict] = []  # the llm_start that carried each user message
     for ev in llm_starts:
         payload = ev.get("payload") or {}
         for msg in payload.get("messages", []):
@@ -568,6 +598,7 @@ def check_goal_vector_drift(
                 content = str(msg.get("content", "")).strip()
                 if content:
                     user_messages.append(content)
+                    turn_events.append(ev)
                     break  # one user message per turn is enough
 
     if len(user_messages) < 3:
@@ -597,6 +628,7 @@ def check_goal_vector_drift(
     if not drift_confirmed:
         return []
 
+    involved = [e["event_id"] for e in turn_events]
     return [_make_finding(
         "OW-LLM01", "PI-04a",
         "Goal vector drift across turns",
@@ -606,6 +638,8 @@ def check_goal_vector_drift(
             f"Session drifted from benign start to injection signal over "
             f"{len(user_messages)} turns; first={first[:60]!r} → last={last[:60]!r}"
         ),
+        event_id=involved[-1] if involved else "00000000-0000-0000-0000-000000000000",
+        involved_event_ids=involved,
     )]
 
 
@@ -628,7 +662,8 @@ def check_multi_turn_jailbreak(
     )
 
     llm_starts = [e for e in events if e["event_type"] == "llm_start"]
-    fragments = []
+    fragments: list[str] = []
+    involved: list[str] = []  # every llm_start that contributed a fragment
     for ev in llm_starts:
         payload = ev.get("payload") or {}
         user_msgs = [
@@ -637,6 +672,8 @@ def check_multi_turn_jailbreak(
         for m in user_msgs:
             if has_partial_injection_signal(str(m.get("content", ""))):
                 fragments.append(str(m.get("content", "")))
+                involved.append(ev["event_id"])
+                break  # one contribution per event
 
     if len(fragments) < 3:
         return []
@@ -651,6 +688,8 @@ def check_multi_turn_jailbreak(
         92, session_id, tenant_id,
         severity="critical",
         detail=f"Jailbreak assembled incrementally over {len(fragments)} turns",
+        event_id=involved[-1] if involved else "00000000-0000-0000-0000-000000000000",
+        involved_event_ids=involved,
     )]
 
 
@@ -669,15 +708,18 @@ def check_rag_integrity(
     findings: list["Finding"] = []
     rag_events = [e for e in events if e.get("tool_name") in RAG_TOOL_NAMES]
 
-    # DMP-01a — count anomaly
+    # DMP-01a — count anomaly. Every RAG call contributed to the spike.
     p95 = baseline.get("rag_call_p95", 10)
     if len(rag_events) > p95 * 1.5:
+        involved = [e["event_id"] for e in rag_events]
         findings.append(_make_finding(
             "OW-LLM04", "DMP-01a",
             "RAG call count spike",
             60, session_id, tenant_id,
             severity="medium",
             detail=f"RAG tool calls ({len(rag_events)}) exceed 1.5× p95 baseline ({p95})",
+            event_id=involved[0] if involved else "00000000-0000-0000-0000-000000000000",
+            involved_event_ids=involved,
         ))
 
     # DMP-01c — instruction text in retrieved chunks
@@ -693,6 +735,7 @@ def check_rag_integrity(
                 85, session_id, tenant_id,
                 severity="high",
                 detail="RAG tool_end payload contains prompt injection pattern",
+                event_id=e["event_id"],
             ))
             break  # one finding per session is enough
 
@@ -784,6 +827,7 @@ def check_rag_goal_shift(
                             f"Agent completion attributes out-of-scope action to "
                             f"retrieved content: {matched[:120]!r}"
                         ),
+                        event_id=ev["event_id"],
                     )
                     f.confidence_tier = "high"
                     return [f]
@@ -805,6 +849,7 @@ def check_rag_goal_shift(
                             f"Outbound tool {tool_name!r} first appeared after "
                             f"retrieval — not present in pre-retrieval tool calls"
                         ),
+                        event_id=ev["event_id"],
                     )
                     f.confidence_tier = "high"
                     return [f]
@@ -864,6 +909,7 @@ def check_system_prompt_leakage(
                     85, session_id, tenant_id,
                     severity="high",
                     detail=f"Verbatim segment of {lcs} chars from declared system prompt in completion",
+                    event_id=ev["event_id"],
                 ))
                 break
 
@@ -883,6 +929,7 @@ def check_system_prompt_leakage(
                     50, session_id, tenant_id,
                     severity="medium",
                     detail="Agent output reveals its configured role or persona name",
+                    event_id=e["event_id"],
                 ))
                 break
 
@@ -895,6 +942,7 @@ def check_system_prompt_leakage(
                     60, session_id, tenant_id,
                     severity="medium",
                     detail="Agent output contains un-substituted template variables",
+                    event_id=e["event_id"],
                 ))
                 break
 
@@ -949,6 +997,7 @@ def check_system_prompt_leakage(
                     80, session_id, tenant_id,
                     severity="high",
                     detail=f"Log tool '{tool_name_l}' payload contains {lcs2}-char verbatim segment from system prompt",
+                    event_id=ev["event_id"],
                 ))
                 break
         elif _SYSTEM_PHRASE_RE.search(input_text):
@@ -958,6 +1007,7 @@ def check_system_prompt_leakage(
                 80, session_id, tenant_id,
                 severity="high",
                 detail=f"Log tool '{tool_name_l}' payload contains system-prompt-like phrases",
+                event_id=ev["event_id"],
             ))
             break
 
@@ -982,6 +1032,7 @@ def check_system_prompt_leakage(
                 88, session_id, tenant_id,
                 severity="high",
                 detail="invoke_agent tool_start payload contains 'system' key",
+                event_id=e["event_id"],
             ))
             break
 
@@ -1026,12 +1077,15 @@ def check_vector_integrity(
                         near_dup_count += 1
 
         if near_dup_count >= 3:
+            rag_ids = [e["event_id"] for e in rag_events]
             findings.append(_make_finding(
                 "OW-LLM08", "VEW-01b",
                 "Repeated near-duplicate RAG queries",
                 75, session_id, tenant_id,
                 severity="high",
                 detail=f"Detected {near_dup_count} near-duplicate RAG query pairs",
+                event_id=rag_ids[0],
+                involved_event_ids=rag_ids,
             ))
 
     # VEW-02a — unauthorised write to vector namespace
@@ -1041,14 +1095,220 @@ def check_vector_integrity(
         and re.search(r"(?i)(write|upsert|insert|add).*(vector|embed|store)", e.get("tool_name", ""))
     ]
     if write_tool_events:
+        write_ids = [e["event_id"] for e in write_tool_events]
         findings.append(_make_finding(
             "OW-LLM08", "VEW-02a",
             "Unauthorised write to vector namespace",
             92, session_id, tenant_id,
             severity="critical",
             detail=f"Vector write tool invoked: {write_tool_events[0].get('tool_name')}",
+            event_id=write_ids[0],
+            involved_event_ids=write_ids,
         ))
 
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Retrieval telemetry checks — require the SDK to emit embedding_model +
+# retrieval_distance in the tool_end payload.
+#
+# DMP-01b: retrieval cosine distance outlier (OW-LLM04)
+# VEW-01a: query retrieves semantically distant doc (OW-LLM08)
+# VEW-03a: embedding model at query ≠ ingest model (OW-LLM08)
+#
+# All three are session-scope statistical/policy checks. They silently return
+# nothing on sessions with no retrieval telemetry — SDK versions that don't
+# populate the field cause the check to be blind, not spuriously alerting.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Retrieval distance thresholds.
+# Cosine distance 0..2 (0 = identical, 2 = opposite).
+# DMP-01b: an *outlier* is a distance materially larger than the session mean —
+#   requires ≥ 3 retrievals to have a stable baseline.
+# VEW-01a: an *absolutely distant* doc is one beyond a hard ceiling regardless
+#   of the session baseline. Both thresholds are conservative starting points;
+#   Reflex/Verdict will calibrate them later against real traffic.
+_DMP01B_MIN_RETRIEVALS  = 3
+_DMP01B_OUTLIER_ZSCORE  = 2.5     # ≥ this many σ above the leave-one-out baseline
+_DMP01B_MIN_ABS_DELTA   = 0.10    # AND ≥ this far from the baseline in absolute terms
+_VEW01A_HARD_DISTANCE   = 0.85    # cosine distance ≥ this is semantically far
+
+
+def _retrieval_events(events: list[dict]) -> list[dict]:
+    """Return the tool_end events that carry retrieval telemetry.
+
+    We treat any tool_end with a `retrieval_distance` field as a retrieval,
+    which is the SDK contract — see dapplepot-sdk/_adapter.tool_end.
+    """
+    out: list[dict] = []
+    for e in events:
+        if e.get("event_type") != "tool_end":
+            continue
+        payload = e.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("retrieval_distance") is not None:
+            out.append(e)
+    return out
+
+
+def check_retrieval_distance(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """DMP-01b — retrieval cosine distance outlier vs the session's own baseline.
+
+    Fires when a single retrieval sits ≥ 2.5σ above the session's mean cosine
+    distance. Requires at least 3 retrievals to establish a baseline; a single
+    lone retrieval is treated as insufficient signal.
+
+    Blind (returns []) on sessions with no retrieval telemetry.
+    """
+    findings: list["Finding"] = []
+    retrievals = _retrieval_events(events)
+    if len(retrievals) < _DMP01B_MIN_RETRIEVALS:
+        return findings
+
+    distances: list[float] = []
+    for e in retrievals:
+        payload = e.get("payload") or {}
+        try:
+            distances.append(float(payload["retrieval_distance"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(distances) < _DMP01B_MIN_RETRIEVALS:
+        return findings
+
+    # Leave-one-out z-score: including a real outlier in the baseline flattens
+    # the mean and inflates the stdev, hiding the outlier. For each candidate,
+    # compute baseline stats from the *rest* of the retrievals and z-score
+    # against that. Fires on the first retrieval whose z ≥ threshold.
+    for idx, e in enumerate(retrievals):
+        payload = e.get("payload") or {}
+        try:
+            d = float(payload["retrieval_distance"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        rest = distances[:idx] + distances[idx + 1:]
+        if len(rest) < 2:
+            continue
+        mean = sum(rest) / len(rest)
+        variance = sum((x - mean) ** 2 for x in rest) / len(rest)
+        stdev = math.sqrt(variance)
+
+        # Require BOTH statistical significance and absolute distance: a very
+        # tight baseline (all values within 0.02 of each other) shouldn't fire
+        # on a 0.03 deviation just because it's 3σ.
+        abs_delta = d - mean
+        if abs_delta < _DMP01B_MIN_ABS_DELTA:
+            continue
+        if stdev < 1e-6:
+            z = float("inf")  # tight baseline + real absolute jump → clearly outlier
+        else:
+            z = abs_delta / stdev
+
+        if z >= _DMP01B_OUTLIER_ZSCORE:
+            findings.append(_make_finding(
+                "OW-LLM04", "DMP-01b",
+                "Retrieval cosine distance outlier",
+                70, session_id, tenant_id,
+                severity="high",
+                detail=(
+                    f"Retrieval by tool '{e.get('tool_name')}' has cosine "
+                    f"distance {d:.3f} "
+                    f"({'∞' if z == float('inf') else f'{z:.1f}σ'} above baseline mean {mean:.3f})"
+                ),
+                event_id=e["event_id"],
+            ))
+            break  # one outlier finding per session is enough
+    return findings
+
+
+def check_semantic_distance(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """VEW-01a — query retrieves a semantically distant document.
+
+    Fires on any retrieval with cosine distance ≥ _VEW01A_HARD_DISTANCE,
+    independent of the session's own baseline. Complements DMP-01b, which
+    is baseline-relative and needs multiple retrievals.
+
+    Blind (returns []) on sessions with no retrieval telemetry.
+    """
+    findings: list["Finding"] = []
+    for e in _retrieval_events(events):
+        payload = e.get("payload") or {}
+        try:
+            d = float(payload["retrieval_distance"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if d >= _VEW01A_HARD_DISTANCE:
+            findings.append(_make_finding(
+                "OW-LLM08", "VEW-01a",
+                "Query retrieves semantically distant doc",
+                60, session_id, tenant_id,
+                severity="medium",
+                detail=(
+                    f"Retrieval by '{e.get('tool_name')}' returned a document "
+                    f"at cosine distance {d:.3f} (threshold {_VEW01A_HARD_DISTANCE})"
+                ),
+                event_id=e["event_id"],
+            ))
+            break  # one finding per session is enough
+    return findings
+
+
+def check_embedding_model(
+    events: list[dict],
+    session_id: str,
+    tenant_id: str,
+) -> list["Finding"]:
+    """VEW-03a — embedding model at query time differs from a prior model
+    seen in the same session.
+
+    Retrieval quality is only meaningful when the query embedding uses the
+    same model that produced the indexed vectors. When the model changes
+    mid-session — e.g. the caller upgraded, or two different vector stores
+    are being consulted — distances lose comparability.
+
+    Fires when ≥ 2 distinct embedding_model values appear in retrieval
+    tool_ends for this session.
+
+    Blind on sessions with 0 or 1 unique embedding_model values.
+    """
+    findings: list["Finding"] = []
+    models: set[str] = set()
+    involved: list[str] = []
+    for e in events:
+        if e.get("event_type") != "tool_end":
+            continue
+        payload = e.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        m = payload.get("embedding_model")
+        if isinstance(m, str) and m:
+            models.add(m)
+            involved.append(e["event_id"])
+
+    if len(models) >= 2:
+        findings.append(_make_finding(
+            "OW-LLM08", "VEW-03a",
+            "Embedding model at query ≠ ingest model",
+            88, session_id, tenant_id,
+            severity="high",
+            detail=(
+                f"Retrievals used {len(models)} distinct embedding models: "
+                f"{sorted(models)}"
+            ),
+            event_id=involved[0] if involved else "00000000-0000-0000-0000-000000000000",
+            involved_event_ids=involved,
+        ))
     return findings
 
 
@@ -1093,6 +1353,7 @@ def check_payload_splitting(
     )
 
     all_user_messages: list[str] = []
+    turn_events: list[dict] = []  # llm_start event that carried each user message
     for ev in events:
         if ev["event_type"] != "llm_start":
             continue
@@ -1100,6 +1361,7 @@ def check_payload_splitting(
         for msg in payload.get("messages", []):
             if isinstance(msg, dict) and msg.get("role") == "user":
                 all_user_messages.append(str(msg.get("content", "")))
+                turn_events.append(ev)
 
     if len(all_user_messages) < 3:
         return []
@@ -1114,12 +1376,15 @@ def check_payload_splitting(
         combined = " ".join(window)
         if individual_matches(combined):
             if not any(individual_matches(m) for m in window):
+                involved = [e["event_id"] for e in turn_events[i:i + 3]]
                 return [_make_finding(
                     "OW-LLM01", "PI-06a",
                     "Payload splitting across messages",
                     88, session_id, tenant_id,
                     severity="high",
                     detail=f"Split payload detected across messages {i}..{i + 2}",
+                    event_id=involved[-1] if involved else "00000000-0000-0000-0000-000000000000",
+                    involved_event_ids=involved,
                 )]
     return []
 
@@ -1171,6 +1436,7 @@ def check_insecure_code_output(
                 70, session_id, tenant_id,
                 severity="high",
                 detail=f"Insecure pattern(s) in generated code: {matched_patterns[:3]}",
+                event_id=ev["event_id"],
             )]
     return []
 
@@ -1248,6 +1514,7 @@ def check_broken_sub_agent_output(
                 65, session_id, tenant_id,
                 severity="medium",
                 detail=f"tool={tool_name!r}: {reason}",
+                event_id=ev["event_id"],
             )]
 
     return []
@@ -1265,10 +1532,15 @@ def _extract_claim_terms(text: str, url: str, min_len: int = 5) -> list[str]:
     return [w for w in words if w not in _CLAIM_STOPWORDS]
 
 
-def _build_fetch_pairs(events: list[dict]) -> list[tuple[str, dict]]:
-    """Pair tool_start URL-fetch events with their subsequent tool_end outputs."""
+def _build_fetch_pairs(events: list[dict]) -> list[tuple[str, dict, dict]]:
+    """Pair tool_start URL-fetch events with their subsequent tool_end outputs.
+
+    Returns (url, tool_output_dict, tool_end_event) tuples. The tool_end event
+    is included so callers can populate involved_event_ids without re-walking
+    the timeline.
+    """
     sorted_events = sorted(events, key=lambda e: e.get("sequence_index", 0))
-    pairs: list[tuple[str, dict]] = []
+    pairs: list[tuple[str, dict, dict]] = []
     pending: dict[str, str] = {}
     for ev in sorted_events:
         event_type = ev.get("event_type", "")
@@ -1297,7 +1569,7 @@ def _build_fetch_pairs(events: list[dict]) -> list[tuple[str, dict]]:
                     tool_output = json.loads(tool_output)
                 except Exception:
                     tool_output = {"body": tool_output}
-            pairs.append((url, tool_output))
+            pairs.append((url, tool_output, ev))
     return pairs
 
 
@@ -1326,7 +1598,7 @@ def check_cited_url_404(
     if not fetch_pairs:
         return []
 
-    for fetched_url, tool_output in fetch_pairs:
+    for fetched_url, tool_output, tool_end_ev in fetch_pairs:
         # Find which cited URL corresponds to this fetch
         cited_completion = None
         for cited_url, completion in cited_urls.items():
@@ -1353,6 +1625,7 @@ def check_cited_url_404(
                 65, session_id, tenant_id,
                 severity="medium",
                 detail=f"Cited URL unreachable: {cited_url[:80]} → HTTP {status or 'error'}",
+                event_id=tool_end_ev["event_id"],
             )]
 
         if not isinstance(body, str) or len(body.strip()) < 50:
@@ -1362,6 +1635,7 @@ def check_cited_url_404(
                 65, session_id, tenant_id,
                 severity="medium",
                 detail=f"Cited URL returned empty or minimal content: {cited_url[:80]}",
+                event_id=tool_end_ev["event_id"],
             )]
 
         claim_terms = _extract_claim_terms(completion, cited_url)
@@ -1375,6 +1649,7 @@ def check_cited_url_404(
                     65, session_id, tenant_id,
                     severity="medium",
                     detail=f"Cited URL content does not support stated claim: {cited_url[:80]}",
+                    event_id=tool_end_ev["event_id"],
                 )]
 
     return []
@@ -1439,6 +1714,7 @@ def check_claim_not_in_tool_output(
                     70, session_id, tenant_id,
                     severity="high",
                     detail=f"Attributed claim absent from retrieved output: {claim[:120]!r}",
+                    event_id=ev["event_id"],
                 )]
 
     return []
@@ -1539,6 +1815,7 @@ def check_output_contradicts_tool(
                             f"Tool '{tool['name']}' returned a negative status "
                             f"but completion asserts the opposite: {completion[:120]!r}"
                         ),
+                        event_id=ev["event_id"],
                     )]
 
             # ── Strategy B: numeric contradiction ────────────────────────────
@@ -1571,6 +1848,7 @@ def check_output_contradicts_tool(
                                 f"but completion states {c_val} "
                                 f"({deviation:.0%} deviation)"
                             ),
+                            event_id=ev["event_id"],
                         )]
 
     return []
@@ -1615,6 +1893,7 @@ def check_hallucinated_packages(
                         65, session_id, tenant_id,
                         severity="medium",
                         detail=f"Potentially hallucinated package: {pkg}",
+                        event_id=ev["event_id"],
                     )]
             for match in _NPM_INSTALL.finditer(block):
                 pkg = match.group(1).strip()
@@ -1625,6 +1904,7 @@ def check_hallucinated_packages(
                         65, session_id, tenant_id,
                         severity="medium",
                         detail=f"Potentially hallucinated npm package: {pkg}",
+                        event_id=ev["event_id"],
                     )]
     return []
 
@@ -1670,6 +1950,7 @@ def check_ungrounded_high_stakes(
                     60, session_id, tenant_id,
                     severity="medium",
                     detail=f"High-stakes {domain} output without retrieval grounding or HITL",
+                    event_id=ev["event_id"],
                 )]
     return []
 
@@ -1727,12 +2008,18 @@ async def check_input_size_anomaly(
         if z is not None and z >= 4.0:
             mean = sum(population) / len(population)
             model_label = f" ({model})" if model != "__unknown__" else ""
+            involved = [
+                e["event_id"] for e in llm_events
+                if (e.get("llm_model") or "__unknown__") == model
+            ]
             findings.append(_make_finding(
                 "OW-LLM10", "UBC-02a",
                 "Input size anomaly",
                 50, session_id, tenant_id,
                 severity="medium",
                 detail=f"Input tokens {inp}{model_label} is {z:.1f}σ above per-model baseline {mean:.0f}",
+                event_id=involved[0] if involved else "00000000-0000-0000-0000-000000000000",
+                involved_event_ids=involved,
             ))
     return findings
 
@@ -1793,6 +2080,7 @@ def check_irreversible_without_gate(
                     85, session_id, tenant_id,
                     severity="high",
                     detail=f"Tool '{tool_name}' called without a user confirmation turn between tool calls",
+                    event_id=ev["event_id"],
                 )]
             last_was_tool = True
 
@@ -1844,6 +2132,7 @@ def check_reads_outside_working_dir(
                     65, session_id, tenant_id,
                     severity="medium",
                     detail=f"Tool '{tool_name}' read path '{val}' — outside declared working directory '{working_dir}'",
+                    event_id=ev["event_id"],
                 ))
                 break
 
@@ -1908,6 +2197,7 @@ def check_network_not_in_allowlist(
                     75, session_id, tenant_id,
                     severity="high",
                     detail=f"Tool '{ev.get('tool_name', '')}' contacted host '{host}' — not in declared network allowlist",
+                    event_id=ev["event_id"],
                 ))
 
     return findings
@@ -1967,12 +2257,19 @@ def check_operating_hours(
             reason.append(f"day={session_day} not in {declared_days}")
         if outside_hours:
             reason.append(f"time={session_time.strftime('%H:%M')} UTC outside {time_from_str}–{time_to_str}")
+        # session_start is the trigger event for this schedule violation.
+        session_start_ev = next((e for e in events if e.get("event_type") == "session_start"), None)
+        kwargs: dict = {
+            "severity": "medium",
+            "detail": f"Session started outside schedule: {'; '.join(reason)}",
+        }
+        if session_start_ev:
+            kwargs["event_id"] = session_start_ev["event_id"]
         return [_make_finding(
             "OW-ASI10", "RA-01b",
             "Agent active outside declared operating hours",
             60, session_id, tenant_id,
-            severity="medium",
-            detail=f"Session started outside schedule: {'; '.join(reason)}",
+            **kwargs,
         )]
 
     return []
@@ -2023,6 +2320,7 @@ def check_package_not_in_sbom(
                 88, session_id, tenant_id,
                 severity="high",
                 detail=f"Package '{raw_pkg}' is not in the declared SBOM allowlist",
+                event_id=ev["event_id"],
             ))
     return findings
 
@@ -2077,6 +2375,7 @@ def check_mcp_endpoint_anomaly(
                     85, session_id, tenant_id,
                     severity="high",
                     detail=f"Tool '{tool_name}' contacted undeclared MCP endpoint '{raw}'",
+                    event_id=ev["event_id"],
                 ))
     return findings
 
@@ -2116,6 +2415,7 @@ def check_system_prompt_modification(
                         98, session_id, tenant_id,
                         severity="critical",
                         detail=f"System message similarity to declared prompt: {ratio:.0%} — possible self-modification",
+                        event_id=ev["event_id"],
                     )]
     else:
         # Auto: look for output claiming to change instructions
@@ -2137,6 +2437,7 @@ def check_system_prompt_modification(
                         98, session_id, tenant_id,
                         severity="critical",
                         detail="Agent output claims to have updated or changed its own system instructions",
+                        event_id=ev["event_id"],
                     )]
 
     return []
@@ -2170,12 +2471,20 @@ def check_undeclared_llm_used(
     if not undeclared:
         return []
 
+    # Every llm_start that used an undeclared model is a contributor. Anchor
+    # the finding on the first one; the timeline highlights all of them.
+    contributing = [
+        e for e in events
+        if e.get("event_type") == "llm_start" and e.get("llm_model") in undeclared
+    ]
     return [_make_finding(
         "OW-LLM06", "EA-04a",
         "Undeclared LLM model used",
         70, session_id, tenant_id,
         severity="medium",
         detail=f"Model(s) not in declared inventory: {', '.join(sorted(undeclared))}",
+        event_id=contributing[0]["event_id"] if contributing else "00000000-0000-0000-0000-000000000000",
+        involved_event_ids=[e["event_id"] for e in contributing],
     )]
 
 
@@ -2209,9 +2518,11 @@ def check_context_window_stuffing(
 
     from collections import defaultdict
     input_by_model: dict[str, int] = defaultdict(int)
+    events_by_model: dict[str, list[str]] = defaultdict(list)
     for e in events:
         if e.get("event_type") == "llm_end" and e.get("llm_model"):
             input_by_model[e["llm_model"]] += e.get("llm_input_tokens") or 0
+            events_by_model[e["llm_model"]].append(e["event_id"])
 
     findings = []
     for model, ctx_tokens in ctx_map.items():
@@ -2220,12 +2531,15 @@ def check_context_window_stuffing(
             continue
         ratio = session_input / ctx_tokens
         if ratio >= 0.85:
+            involved = events_by_model.get(model, [])
             findings.append(_make_finding(
                 "OW-LLM10", "UBC-01b",
                 "Context window stuffing attack",
                 70, session_id, tenant_id,
                 severity="high",
                 detail=f"{model}: {session_input:,} input tokens is {ratio:.0%} of {ctx_tokens:,} context window",
+                event_id=involved[0] if involved else "00000000-0000-0000-0000-000000000000",
+                involved_event_ids=involved,
             ))
     return findings
 
@@ -2264,6 +2578,7 @@ def check_budget_cap_exceeded(
 
     session_cost = 0.0
     undeclared_models: set[str] = set()
+    priced_event_ids: list[str] = []  # llm_ends that contributed to the cost
     for e in events:
         if e.get("event_type") != "llm_end":
             continue
@@ -2275,6 +2590,7 @@ def check_budget_cap_exceeded(
         in_rate, out_rate = price_map[model]
         session_cost += (e.get("llm_input_tokens")  or 0) / 1000 * in_rate
         session_cost += (e.get("llm_output_tokens") or 0) / 1000 * out_rate
+        priced_event_ids.append(e["event_id"])
 
     if session_cost <= budget:
         return []
@@ -2289,6 +2605,8 @@ def check_budget_cap_exceeded(
         80, session_id, tenant_id,
         severity="high",
         detail=detail,
+        event_id=priced_event_ids[0] if priced_event_ids else "00000000-0000-0000-0000-000000000000",
+        involved_event_ids=priced_event_ids,
     )]
 
 

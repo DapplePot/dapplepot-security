@@ -435,6 +435,11 @@ async def score_session(
     session_id: str,
     agent_id: str,
 ) -> dict:
+    # Capture the start time so we can persist analysis_duration_ms alongside
+    # the risk score. Recorded here (before the CH retry loop) so the surfaced
+    # latency includes retry overhead — that's what the customer's SLA sees.
+    from datetime import datetime, timezone
+    _analysis_started_at = datetime.now(timezone.utc)
     """
     1.  Fetch full event list for session from ClickHouse.
     2.  Fetch session row from Postgres.
@@ -586,23 +591,22 @@ async def score_session(
     #   the async ingest pipeline and graph_end triggering score_session).
     # - Sub-checks configured as online but NOT in the SDK's implementation set are NOT
     #   skipped — no finding will arrive from the SDK for them so post-session must cover them.
-    _SDK_ONLINE_CAPABLE = frozenset({
-        'PI-01a', 'PI-01b', 'PI-01c', 'PI-02a', 'PI-05a', 'PI-08a',
-        'SID-01a', 'SID-01c', 'SID-02a',
-        'IOH-01a',
-        'EA-01a', 'EA-02b',
-    })
+    # ── Facet-derived sets (from security_eval.registry / registry_snapshot.json) ──
+    #
+    # `_SDK_ONLINE_CAPABLE` and `_SESSION_LEVEL_ONLY` used to be hand-maintained
+    # frozensets here — one of the four copies of the enforceable set the
+    # codebase carried. Now derived from the canonical checks.yaml via the
+    # gen_seed.py snapshot; when the registry changes, re-run the generator
+    # and this picks up automatically.
+    from security_eval.registry import (
+        ENFORCEABLE_SUBCHECK_IDS as _SDK_ONLINE_CAPABLE,
+        SESSION_LEVEL_ONLY_IDS as _SESSION_LEVEL_ONLY,
+    )
     config_online = sec_config.online_subcheck_ids() & _SDK_ONLINE_CAPABLE
     # Also include any sub-checks that actually fired online (already in DB) but
     # weren't covered by the config set (e.g. findings from older SDK versions).
     fired_online = frozenset(f.sub_check_id for f in sdk_findings)
     online_ids: frozenset[str] = config_online | fired_online
-
-    # Sub-checks that have a dedicated session-level scorer in SIGNAL_ID_FUNCTIONS
-    # and must not also fire per-event when running post-session — the per-event
-    # detector exists only for online (real-time) detection. When not configured
-    # online the session-level function produces the authoritative single finding.
-    _SESSION_LEVEL_ONLY: frozenset[str] = frozenset({'EA-01a', 'EA-02b'})
 
     # ─── Per-event detectors (replayed post-session) ──────────────────────────
     # Skip sub-checks that the SDK already handled online — avoids double-counting.
@@ -822,7 +826,51 @@ async def score_session(
     if all_session_findings:
         await write_findings(all_session_findings)
 
-    # ─── Write session risk score (v2 cols + v3 cols) ─────────────────────────
+    # ─── Engine visibility — analysis metadata ─────────────────────────────
+    # Persist "N checks evaluated · N skipped (by reason)" so the UI can
+    # render the session-report engine-visibility strip. The scorer already
+    # knows all of this; we just count and write it.
+    try:
+        from security_eval.registry import ALL_CHECKS
+        needs_setup: list[str] = []
+        for _c in ALL_CHECKS:
+            if _c.get("status") != "active":
+                continue
+            _required = _c.get("requires_policy_fields") or []
+            if not _required:
+                continue
+            for _field in _required:
+                _val = getattr(sec_config, _field, None)
+                _configured = (
+                    _val is not None
+                    and _val != []
+                    and _val != {}
+                    and _val != ""
+                )
+                if not _configured:
+                    needs_setup.append(_c["id"])
+                    break
+        # Not-applicable checks (registry status != active) never contribute.
+        _skipped_by_reason = {
+            "needs_setup":    sorted(set(needs_setup)),
+            # Handled online by the SDK; per-event replay skipped them.
+            "handled_online": sorted(list(online_ids)),
+        }
+        _total_active = sum(1 for _c in ALL_CHECKS if _c.get("status") == "active")
+        _skipped_count = sum(len(v) for v in _skipped_by_reason.values())
+        _evaluated_count = max(0, _total_active - _skipped_count)
+        _analysis_ended_at = datetime.now(timezone.utc)
+        _analysis_duration_ms = int(
+            (_analysis_ended_at - _analysis_started_at).total_seconds() * 1000
+        )
+    except Exception:
+        logger.exception("engine visibility metadata computation failed; writing nulls")
+        _skipped_by_reason = {}
+        _evaluated_count = None
+        _skipped_count = None
+        _analysis_duration_ms = None
+
+    # ─── Write session risk score (v2 cols + v3 cols + analysis metadata) ────
     await pool.execute(
         """
         INSERT INTO session_risk_scores
@@ -832,26 +880,37 @@ async def score_session(
              v3_llm_composite, v3_asi_composite,
              attack_chains_detected,
              trust_score,
-             scorer_version, scored_at)
+             scorer_version,
+             checks_evaluated, checks_skipped, checks_skipped_by_reason,
+             analysis_duration_ms, analysis_started_at,
+             scored_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7,
                 $8::jsonb, $9::jsonb,
                 $10::jsonb, $11::jsonb,
                 $12,
                 $13,
-                $14, now())
+                $14,
+                $15, $16, $17::jsonb,
+                $18, $19,
+                now())
         ON CONFLICT (session_id) DO UPDATE SET
-            llm_score              = EXCLUDED.llm_score,
-            llm_band               = EXCLUDED.llm_band,
-            asi_score              = EXCLUDED.asi_score,
-            asi_band               = EXCLUDED.asi_band,
-            llm_signal_status      = EXCLUDED.llm_signal_status,
-            asi_signal_status      = EXCLUDED.asi_signal_status,
-            v3_llm_composite       = EXCLUDED.v3_llm_composite,
-            v3_asi_composite       = EXCLUDED.v3_asi_composite,
-            attack_chains_detected = EXCLUDED.attack_chains_detected,
-            trust_score            = EXCLUDED.trust_score,
-            scorer_version         = EXCLUDED.scorer_version,
-            scored_at              = now()
+            llm_score                = EXCLUDED.llm_score,
+            llm_band                 = EXCLUDED.llm_band,
+            asi_score                = EXCLUDED.asi_score,
+            asi_band                 = EXCLUDED.asi_band,
+            llm_signal_status        = EXCLUDED.llm_signal_status,
+            asi_signal_status        = EXCLUDED.asi_signal_status,
+            v3_llm_composite         = EXCLUDED.v3_llm_composite,
+            v3_asi_composite         = EXCLUDED.v3_asi_composite,
+            attack_chains_detected   = EXCLUDED.attack_chains_detected,
+            trust_score              = EXCLUDED.trust_score,
+            scorer_version           = EXCLUDED.scorer_version,
+            checks_evaluated         = EXCLUDED.checks_evaluated,
+            checks_skipped           = EXCLUDED.checks_skipped,
+            checks_skipped_by_reason = EXCLUDED.checks_skipped_by_reason,
+            analysis_duration_ms     = EXCLUDED.analysis_duration_ms,
+            analysis_started_at      = EXCLUDED.analysis_started_at,
+            scored_at                = now()
         """,
         session_id,
         tenant_id,
@@ -867,6 +926,11 @@ async def score_session(
         all_chains,
         trust_result["trust_score"],
         SCORER_VERSION,
+        _evaluated_count,
+        _skipped_count,
+        json.dumps(_skipped_by_reason),
+        _analysis_duration_ms,
+        _analysis_started_at,
     )
 
     # ─── Upsert per-agent rolling aggregate (with trust) ─────────────────────

@@ -1,0 +1,135 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Model coverage — which sub-checks are handled by Reflex vs Verdict.
+#
+# Orthogonal to checks.yaml — those are check definitions, this is a
+# routing map. Kept separate so the model-service dimension doesn't
+# touch every check block in the main registry.
+#
+# Every listed sub-check ID must exist in checks.yaml with status: active
+# (not-applicable checks never route to any service).
+#
+# Consumed by security_eval.registry which exposes:
+#     REFLEX_SUBCHECK_IDS, VERDICT_SUBCHECK_IDS
+#     REFLEX_CATEGORY_OF, VERDICT_CATEGORY_OF     (id → category lookup)
+#     REFLEX_BY_CATEGORY, VERDICT_BY_CATEGORY     (category → set of ids)
+#
+# When adding a new check, decide which service (if any) it routes to and
+# add it here alongside your checks.yaml edit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+reflex:
+
+  prompt_injection:
+    - PI-01a   # Role-override phrase match
+    - PI-01b   # Delimiter smuggling
+    - PI-01c   # Encoded / obfuscated payload
+    - PI-02a   # Web-fetched content with injection pattern
+    - PI-02c   # File / attachment payload injection
+    - PI-03a   # API response carries directives
+    - PI-03b   # DB query result embeds prompt fragment
+    - PI-05a   # Code injection pattern in prompt
+    - PI-07a   # Multimodal content with injection signal
+    - PI-08a   # Adversarial suffix (high-entropy tail)
+    - PI-09a   # Obfuscated / encoded injection
+    - MCP-01a  # Context/memory injection markers in prompt
+    - AGH-04a  # Document-sourced instruction injection
+
+  secret_disclosure:
+    - SID-01a  # API key / token pattern in output
+    - SID-01b  # Secret in tool call params
+    - SID-01c  # JWT / session token in agent message
+    - SID-02a  # Name + email + phone co-occurrence
+    - SID-02b  # Financial identifiers in output
+    - SID-02c  # Health / biometric data in output
+    - SID-03b  # Error stack trace forwarded to user
+
+  code_execution:
+    - RCE-01a  # Agent writes & runs unapproved script
+    - RCE-01b  # eval() / exec() with agent-generated string
+    - RCE-01c  # Agent code creates child processes
+    - RCE-02a  # Shell metacharacters in tool params
+    - RCE-02b  # OS command via string interpolation
+    - RCE-03a  # Agent mounts host filesystem paths
+    - RCE-03b  # Agent calls Docker / K8s API
+    - RCE-05a  # Backdoor pattern in generated code
+    - RCE-06a  # Unsafe deserialization in tool args
+    - RCE-08a  # Lockfile manipulation in tool execution
+    - ASCV-04a # Unknown package install in tool execution
+
+  output_handling:
+    - IOH-01a  # Shell command pattern in output
+    - IOH-01b  # HTML / JS in output without escaping
+    - IOH-01c  # SQL fragment in output passed to DB
+    - IOH-02a  # Raw LLM output as tool param
+    - IOH-03a  # Email template injection in output
+    - IOH-03b  # Sub-agent receives broken structured output
+    - IOH-04a  # Insecure code pattern in generated output
+
+  other:
+    - HAT-02a  # Credential request in agent output
+    - HAT-03a  # Payment detail manipulation
+    - RA-04a   # Self-replication via provisioning tools
+    - MCP-03a  # Poisoned content in memory write
+    - IPA-02a  # Delegation with full permissions
+    - IPA-02b  # Credential cached in shared memory namespace
+    - IAC-01b  # Injected directive in inter-agent message
+
+
+verdict:
+
+  goal_drift:
+    - PI-02b   # Retrieved doc causes goal-shift
+    - PI-04a   # Goal vector drift across ≥ 3 turns
+    - PI-04b   # Jailbreak built incrementally
+    - PI-06a   # Payload splitting across messages
+    - AGH-01a  # Semantic drift from initial instruction
+    - AGH-01b  # Agent states a different goal explicitly
+    - AGH-02a  # Zero-click goal hijack
+    - AGH-02b  # Webhook / scheduled trigger with tampered payload
+    - AGH-03a  # Goal drift across turns
+    - AGH-03b  # Sub-agent goal not in parent decomposition
+
+  deception:
+    - HAT-01a  # Agent mimics human communication style
+    - HAT-01b  # Agent suppresses uncertainty markers
+    - HAT-02b  # Agent overrides user safety concern
+    - HAT-04a  # Fabricated rationale before destructive act
+    - HAT-05a  # Side-effect on preview / read-only action
+    - IPA-01b  # Agent uses credentials of another agent
+    - IPA-01c  # Agent impersonates human identity
+    - IPA-03b  # Agent presents as different agent
+    - SPL-01a  # Verbatim system prompt segment in output
+    - SPL-01b  # Agent confirms system prompt on probe
+    - SPL-02a  # Reveals role name / persona name
+    - SPL-02b  # Error message exposes instruction variables
+    - SPL-03a  # System prompt in unprotected log
+    - SPL-03b  # System prompt forwarded in inter-agent message
+
+  grounding_failure:
+    - MIS-01a  # Cited URL returns 404 / non-matching
+    - MIS-01b  # Claim attributed to source not in tool output
+    - MIS-02a  # Output contradicts own tool result
+    - MIS-03a  # High-stakes action without interrupt gate
+    - SAG-02a  # Hallucinated package reference
+    - SAG-03a  # High-stakes domain without grounding
+
+  other:
+    - TME-01c  # Tool call sequence deviates from workflow
+    - TME-02b  # Tool chaining to bypass restrictions
+    - TME-03a  # Irreversible action without confirm
+    - TME-04a  # Over-privileged tool invocation
+    - TME-05a  # Cross-tool exfiltration chain
+    - TME-07a  # Admin tool chain to external endpoint
+    - MCP-02c  # Memory record contains instruction text
+    - MCP-03b  # Shared scratchpad has stale / adversarial data
+    - MCP-05a  # Memory write after injection signal
+    - CF-02b   # Error message causes secondary injection
+    - CF-03a   # Auto-remediation feedback loop
+    - CF-04a   # Hallucination propagation in defence agents
+    - RA-02b   # Agent resists shutdown / interruption
+    - RA-03a   # Self-approval in workflow
+    - RA-05a   # Destructive optimization (reward hacking)
+    - RCE-07a  # Multi-tool chain exploitation
+
+# Verdict also runs FP triage over every input finding regardless of service —
+# not enumerated here because the trigger is "finding exists" not sub-check ID.

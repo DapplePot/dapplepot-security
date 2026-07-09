@@ -118,3 +118,87 @@ def compute_agent_trust_score(
         "alpha": round(alpha, 3),
         "beta": round(beta, 3),
     }
+
+
+def recompute_trust_decay_only(
+    agent_id: str,
+    historical_scores: list[dict],
+) -> dict:
+    """Apply decay to an existing history without treating any session as
+    new evidence. Used by the scheduled daily recompute so that dormant
+    agents' trust ages naturally rather than freezing at their last
+    observed value.
+
+    Returns the same shape as `compute_agent_trust_score`, but
+    `sessions_evaluated` is len(historical) (no + 1 for a "new" session).
+    """
+    alpha = _ALPHA_PRIOR
+    beta = _BETA_PRIOR
+
+    now = datetime.now(timezone.utc)
+    decay_weighted_scores: list[float] = []
+
+    for hist in sorted(historical_scores, key=lambda x: x["scored_at"]):
+        scored_at = hist["scored_at"]
+        if isinstance(scored_at, str):
+            try:
+                scored_at = datetime.fromisoformat(scored_at)
+                if scored_at.tzinfo is None:
+                    scored_at = scored_at.replace(tzinfo=timezone.utc)
+            except Exception:
+                scored_at = now
+        elif isinstance(scored_at, datetime) and scored_at.tzinfo is None:
+            scored_at = scored_at.replace(tzinfo=timezone.utc)
+
+        days_ago = (now - scored_at).total_seconds() / 86400
+        weight = math.exp(-_DECAY_LAMBDA * days_ago)
+
+        max_score = max(
+            int(hist.get("llm_score", 0) or 0),
+            int(hist.get("asi_score", 0) or 0),
+        )
+        if max_score > 40:
+            alpha += weight * (max_score / 100)
+        else:
+            beta += weight * ((100 - max_score) / 100)
+        decay_weighted_scores.append(max_score * weight)
+
+    risk_probability = alpha / (alpha + beta)
+    trust_score = round(100 * (1 - risk_probability), 1)
+
+    # Same trend logic as compute_agent_trust_score but without the new session.
+    recent = historical_scores[-20:] if len(historical_scores) >= 5 else []
+    slope = 0.0
+    if len(recent) >= 5:
+        x = list(range(len(recent)))
+        y = [max(int(h.get("llm_score", 0) or 0), int(h.get("asi_score", 0) or 0)) for h in recent]
+        n = len(x)
+        sum_x = sum(x)
+        sum_y = sum(y)
+        sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+        sum_x2 = sum(xi ** 2 for xi in x)
+        denom = n * sum_x2 - sum_x ** 2
+        if denom != 0:
+            slope = (n * sum_xy - sum_x * sum_y) / denom
+    if slope > 2.0:
+        trend = "degrading"
+    elif slope < -2.0:
+        trend = "improving"
+    else:
+        trend = "stable"
+
+    decay_avg = (
+        sum(decay_weighted_scores) / len(decay_weighted_scores)
+        if decay_weighted_scores
+        else 0.0
+    )
+
+    return {
+        "trust_score": trust_score,
+        "trend": trend,
+        "trend_slope": round(slope, 3),
+        "sessions_evaluated": len(historical_scores),
+        "decay_weighted_avg": round(decay_avg, 2),
+        "alpha": round(alpha, 3),
+        "beta": round(beta, 3),
+    }

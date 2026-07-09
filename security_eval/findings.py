@@ -33,6 +33,12 @@ class Finding:
     # SDK event emission time — stored so the UI timeline uses the real event
     # timestamp rather than the DB insert time (created_at).
     emitted_at: str | None = None
+    # Every event that contributed to this finding firing. For per-event
+    # detectors this is typically [event_id]; for session-level scorers that
+    # match a pattern across multiple events, this holds the full set (e.g.
+    # every llm_start that contributed a fragment to a multi-turn jailbreak).
+    # Empty list means "not populated" — the UI falls back to `event_id`.
+    involved_event_ids: list[str] = field(default_factory=list)
     # v3 confidence fields
     confidence_tier: str = "high"   # deterministic | high | medium | low | skeletal
     confidence: float = field(init=False)
@@ -45,6 +51,10 @@ class Finding:
         self.framework = parts[1][:3] if len(parts) >= 2 else "LLM"
         # Derive confidence float from tier
         self.confidence = CONFIDENCE_WEIGHTS.get(self.confidence_tier, 0.9)
+        # Ensure involved_event_ids at least contains the primary event_id when
+        # the caller hasn't populated it. Keeps downstream consumers simple.
+        if not self.involved_event_ids and self.event_id:
+            self.involved_event_ids = [self.event_id]
 
 
 async def write_findings(findings: list[Finding]) -> None:
@@ -58,8 +68,8 @@ async def write_findings(findings: list[Finding]) -> None:
             (tenant_id, session_id, event_id, event_type,
              framework, owasp_signal_id, sub_check_id, check_label, check_score,
              category, severity, detection_phase, matched_text, detail,
-             confidence_tier, confidence, emitted_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+             confidence_tier, confidence, emitted_at, involved_event_ids)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         ON CONFLICT (session_id, sub_check_id, event_id) DO UPDATE SET
             check_score     = GREATEST(security_findings.check_score, EXCLUDED.check_score),
             severity        = CASE
@@ -68,12 +78,20 @@ async def write_findings(findings: list[Finding]) -> None:
                                 THEN EXCLUDED.severity
                                 ELSE security_findings.severity
                               END,
-            detection_phase = EXCLUDED.detection_phase,
-            detail          = COALESCE(EXCLUDED.detail, security_findings.detail),
-            matched_text    = COALESCE(security_findings.matched_text, EXCLUDED.matched_text),
-            confidence_tier = EXCLUDED.confidence_tier,
-            confidence      = EXCLUDED.confidence,
-            emitted_at      = COALESCE(security_findings.emitted_at, EXCLUDED.emitted_at)
+            detection_phase   = EXCLUDED.detection_phase,
+            detail            = COALESCE(EXCLUDED.detail, security_findings.detail),
+            matched_text      = COALESCE(security_findings.matched_text, EXCLUDED.matched_text),
+            confidence_tier   = EXCLUDED.confidence_tier,
+            confidence        = EXCLUDED.confidence,
+            emitted_at        = COALESCE(security_findings.emitted_at, EXCLUDED.emitted_at),
+            -- Prefer the larger set — a later firing that touched more events
+            -- is a superset of the earlier one for the same (session, sub_check).
+            involved_event_ids = CASE
+                                    WHEN COALESCE(array_length(EXCLUDED.involved_event_ids, 1), 0)
+                                       > COALESCE(array_length(security_findings.involved_event_ids, 1), 0)
+                                    THEN EXCLUDED.involved_event_ids
+                                    ELSE security_findings.involved_event_ids
+                                 END
         WHERE EXCLUDED.check_score >= security_findings.check_score
         """,
         [
@@ -95,6 +113,7 @@ async def write_findings(findings: list[Finding]) -> None:
                 f.confidence_tier,
                 f.confidence,
                 datetime.fromisoformat(f.emitted_at.replace("Z", "+00:00")) if isinstance(f.emitted_at, str) else f.emitted_at,
+                f.involved_event_ids or [f.event_id] if f.event_id else [],
             )
             for f in findings
         ],

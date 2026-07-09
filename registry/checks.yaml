@@ -1,0 +1,3237 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DapplePot — Central Check Registry (SOURCE OF TRUTH)
+#
+# 20 OWASP signals · 155 sub-checks (EA-01b deleted; redundant with IPA-01a)
+#
+# Downstream artifacts are GENERATED from here — never hand-edit them:
+#   - dapplepot-ui/src/data/signalRegistry.ts    (via gen_ts.py)
+#   - dapplepot-security/scripts/signal_registry_seed.py  (via gen_seed.py)
+#   - dapplepot-sdk enforceable-set              (via gen_sdk.py)
+#
+# When adding or changing a check, edit this file and re-run codegen.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Schema reference ────────────────────────────────────────────────────────
+# signal fields: id, name, framework (LLM|ASI), number (1-10), description
+# check  fields:
+#   id, label, score, severity, confidence_tier
+#   scope           event | session | history
+#                     event   — can fire on a single event; eligible for Runtime Guard
+#                     session — evaluated post-session. Includes both multi-event
+#                               patterns (drift, sequences, aggregates) AND
+#                               single-event content scans that need LLM
+#                               reasoning (e.g. SPL-01a). Not Guard-enforceable
+#                     history — needs multi-session history (cross-session queries)
+#   subject         agent | user | tenant
+#   mechanism       policy | signature | statistical | behavioral | model
+#   enforceable     bool — has Runtime Guard impl today
+#   capable_modes   subset of [observe, detect, enforce]
+#   default_mode    where a new agent starts
+#   capable_actions subset of [alert, sanitize, block_call, terminate_session]
+#   default_action  action when enforcing (only if enforceable)
+#   event_types     which events the check evaluates
+#   detector        Python dotted ref to implementation (or null)
+#   requires_policy_fields  Governance fields this check reads
+#   status          active | coming-soon | not-applicable
+#   status_reason   required when status != active
+#   matches         optional human-readable pattern descriptions (UI only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+signals:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LLM FRAMEWORK
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - id: OW-LLM01
+    name: Prompt Injection
+    framework: OW-LLM
+    number: 1
+    description: >
+      Attempts to override model instructions via user-supplied or retrieved
+      content, including indirect injection through RAG, APIs, files, and
+      multi-turn jailbreaks.
+    checks:
+
+      - id: PI-01a
+        label: Role-override phrase match
+        score: 85
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start, llm_end, tool_start, tool_end]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "ignore/disregard/forget … instructions"
+          - "you must/shall/will … do/execute/perform"
+          - "new instruction / new task / new directive"
+          - "override/bypass/circumvent … filter/restriction"
+
+      - id: PI-01b
+        label: Delimiter smuggling
+        score: 90
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start, llm_end, tool_start, tool_end]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "```system / ``` role-boundary sequences"
+          - "### System: / [SYS] / ---SYSTEM--- delimiters"
+          - "Role-boundary smuggling via turn separators"
+
+      - id: PI-01c
+        label: Encoded / obfuscated payload
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start, llm_end, tool_start, tool_end]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "base64-decodable blob whose decoded text contains an injection phrase"
+          - "hex-escaped sequence (\\xNN x4+) decoding to an injection phrase"
+
+      - id: PI-02a
+        label: Web-fetched content with injection pattern
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: alert
+        event_types: [tool_end]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "ignore/override/bypass patterns in retrieved web content"
+          - "instruction-like phrases inside fetched documents"
+
+      - id: PI-02b
+        label: Retrieved doc causes goal-shift
+        score: 95
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, tool_end]
+        detector: scorer.llm_signals.check_rag_goal_shift
+        requires_policy_fields: []
+        status: active
+
+      - id: PI-02c
+        label: File / attachment payload injection
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "injection pattern in document/file source.data (text or base64-decoded)"
+          - "injection pattern in text part alongside a document block (parsed file content)"
+
+      - id: PI-03a
+        label: API response carries directives
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_end]
+        detector: detectors.injection.detect_api_response_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "role-override or instruction pattern in HTTP/API tool_end response body"
+          - "injection directive in JSON / XML returned by an api/http/fetch/request tool"
+
+      - id: PI-03b
+        label: DB query result embeds prompt fragment
+        score: 82
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_end]
+        detector: detectors.injection.detect_db_result_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "role-override or instruction pattern in DB/SQL tool_end result rows"
+          - "injection directive in column value returned by a sql/db/query tool"
+
+      - id: PI-04a
+        label: Goal vector drift across ≥ 3 turns
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, llm_end]
+        detector: scorer.llm_signals.check_goal_vector_drift
+        requires_policy_fields: []
+        status: active
+
+      - id: PI-04b
+        label: Jailbreak built incrementally
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.llm_signals.check_multi_turn_jailbreak
+        requires_policy_fields: []
+        status: active
+
+      - id: PI-05a
+        label: Code injection pattern in prompt
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start, llm_end, tool_start, tool_end]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "import os / import subprocess in prompt"
+          - "__import__() calls"
+          - "eval() / exec() blocks"
+          - "Python code inside user message"
+
+      - id: PI-06a
+        label: Payload splitting across messages
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.llm_signals.check_payload_splitting
+        requires_policy_fields: []
+        status: active
+
+      - id: PI-07a
+        label: Multimodal content with injection signal
+        score: 60
+        severity: medium
+        confidence_tier: low
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "image metadata / alt-text containing directive patterns"
+          - "instruction text embedded in file attachments"
+
+      - id: PI-08a
+        label: Adversarial suffix (high-entropy tail)
+        score: 75
+        severity: high
+        confidence_tier: medium
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start, llm_end, tool_start, tool_end]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "Shannon entropy > 3.5 at prompt tail"
+          - "adversarial suffix token sequences"
+
+      - id: PI-09a
+        label: Obfuscated / encoded injection
+        score: 82
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start]
+        detector: detectors.injection.detect_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "ROT13-encoded injection phrase (entire message ROT13'd)"
+          - "unicode homoglyph substitution normalised to injection phrase (NFKC)"
+
+
+  - id: OW-LLM02
+    name: Sensitive Information Disclosure
+    framework: OW-LLM
+    number: 2
+    description: >
+      Secrets, PII, financial identifiers, health data, or cross-user context
+      appearing in agent output or tool call parameters.
+    checks:
+
+      - id: SID-01a
+        label: API key / token pattern in output
+        score: 95
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: sanitize
+        event_types: [llm_end, tool_end]
+        detector: detectors.disclosure.detect_pii
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "sk-[a-zA-Z0-9]{32,}  (OpenAI / generic sk- key)"
+          - "ghp_[36 chars]  (GitHub personal token)"
+          - "AKIA[A-Z0-9]{16}  (AWS access key)"
+          - "Bearer [32+ chars]  (OAuth / API bearer)"
+
+      - id: SID-01b
+        label: Secret in tool call params
+        score: 95
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.disclosure.detect_tool_params
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "secret / password / api_key / auth_token / access_key fields in tool call arguments"
+          - "sk-[a-zA-Z0-9]{32,} / ghp_[36] / AKIA[A-Z0-9]{16} / Bearer [32+] in tool input"
+          - "URL-embedded credentials (user:pass@host) in connection strings"
+
+      - id: SID-01c
+        label: JWT / session token in agent message
+        score: 90
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: sanitize
+        event_types: [llm_end, tool_end]
+        detector: detectors.disclosure.detect_pii
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "eyJ[…].eyJ[…].[…]  (JWT three-part token pattern)"
+
+      - id: SID-02a
+        label: Name + email + phone co-occurrence
+        score: 75
+        severity: high
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: sanitize
+        event_types: [llm_end, tool_end]
+        detector: detectors.disclosure.detect_pii
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "[user]@[domain].[tld]  (email address)"
+          - "+1 (XXX) XXX-XXXX  (phone number)"
+          - "Email + phone co-occurrence in same output block"
+
+      - id: SID-02b
+        label: Financial identifiers in output
+        score: 90
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: sanitize
+        event_types: [llm_end, tool_end]
+        detector: detectors.disclosure.detect_pii
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "4[0-9]{12,15}  (Visa card)"
+          - "5[1-5][0-9]{14}  (Mastercard)"
+          - "3[47][0-9]{13}  (Amex)"
+
+      - id: SID-02c
+        label: Health / biometric data in output
+        score: 95
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: sanitize
+        event_types: [llm_end, tool_end]
+        detector: detectors.disclosure.detect_pii
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "XXX-XX-XXXX  (US Social Security Number)"
+          - "biometric descriptor keywords in output"
+
+      - id: SID-03a
+        label: Cross-user context bleed
+        score: 95
+        severity: critical
+        confidence_tier: high
+        scope: history
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.cross_session.check_cross_user_bleed
+        requires_policy_fields: []
+        status: active
+
+      - id: SID-03b
+        label: Error stack trace forwarded to user
+        score: 60
+        severity: medium
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_end]
+        detector: detectors.disclosure.detect_stack_trace
+        requires_policy_fields: []
+        status: active
+
+      - id: SID-04a
+        label: Output references data from different session
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: history
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.cross_session.check_cross_session_data_reference
+        requires_policy_fields: []
+        status: active
+
+      - id: SID-04b
+        label: Shared memory returns cross-tenant record
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: tenant
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: detectors.disclosure.detect_cross_tenant_output
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-LLM03
+    name: Supply Chain
+    framework: OW-LLM
+    number: 3
+    description: >
+      Model/plugin dependency risks. Not observable from the Kafka event stream
+      or LangGraph telemetry — all sub-checks excluded.
+    checks:
+
+      - id: SC-EXCL
+        label: All LLM03 sub-checks excluded
+        score: 0
+        severity: low
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: []
+        default_mode: observe
+        capable_actions: []
+        event_types: []
+        detector: null
+        requires_policy_fields: []
+        status: not-applicable
+        status_reason: Not observable from Kafka event stream or LangGraph telemetry
+
+
+  - id: OW-LLM04
+    name: Data & Model Poisoning
+    framework: OW-LLM
+    number: 4
+    description: >
+      Training or vector-store data tampering. Most sub-checks require offline
+      pipeline audit and are excluded from runtime observation.
+    checks:
+
+      - id: DMP-01a
+        label: Vector store record count anomaly
+        score: 60
+        severity: medium
+        confidence_tier: medium
+        scope: event
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: []
+        default_mode: observe
+        capable_actions: []
+        event_types: []
+        detector: null
+        requires_policy_fields: []
+        status: not-applicable
+        status_reason: Pre-runtime; requires offline pipeline audit
+
+      - id: DMP-01b
+        label: Retrieval cosine distance outlier
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.llm_signals.check_retrieval_distance
+        requires_policy_fields: []
+        # Reads payload.retrieval_distance / retrieval_similarity emitted by the
+        # SDK adapter (added in D — see dapplepot-sdk/_adapter.py tool_end).
+        status: active
+
+      - id: DMP-01c
+        label: Ingested chunk contains instruction text
+        score: 85
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: []
+        default_mode: observe
+        capable_actions: []
+        event_types: []
+        detector: null
+        requires_policy_fields: []
+        status: not-applicable
+        status_reason: Pre-runtime; requires offline data validation
+
+      - id: DMP-02
+        label: Pre-training / weight poisoning
+        score: 0
+        severity: low
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: []
+        default_mode: observe
+        capable_actions: []
+        event_types: []
+        detector: null
+        requires_policy_fields: []
+        status: not-applicable
+        status_reason: Not detectable at inference time via event stream
+
+
+  - id: OW-LLM05
+    name: Improper Output Handling
+    framework: OW-LLM
+    number: 5
+    description: >
+      Raw LLM output passed unsanitised to tools, shells, databases, or
+      downstream agents without validation or escaping.
+    checks:
+
+      - id: IOH-01a
+        label: Shell command pattern in output
+        score: 90
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: sanitize
+        event_types: [llm_end, tool_end]
+        detector: detectors.passthrough.detect_passthrough
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "rm -rf …"
+          - "curl … | (ba)sh"
+          - "python -c '…'"
+          - "eval(…), exec(…), os.system(…), subprocess.*"
+
+      - id: IOH-01b
+        label: HTML / JS in output without escaping
+        score: 85
+        severity: high
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, sanitize, terminate_session]
+        default_action: sanitize
+        event_types: [llm_end, tool_start]
+        detector: detectors.passthrough.detect_passthrough
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "<script …>"
+          - "onerror="
+          - "javascript:"
+
+      - id: IOH-01c
+        label: SQL fragment in output passed to DB
+        score: 90
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.passthrough.detect_passthrough
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "SELECT/INSERT/UPDATE/DELETE … FROM/INTO/TABLE/WHERE  (SQLi pattern)"
+          - "UNION SELECT … (union injection)"
+
+      - id: IOH-02a
+        label: Raw LLM output as tool param
+        score: 70
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.passthrough.detect_passthrough
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "LLM output similarity ≥ 0.6 to downstream tool param (LCS ratio)"
+
+      - id: IOH-03a
+        label: Email template injection in output
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.passthrough.detect_passthrough
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "<script / javascript: in email body"
+          - "suspicious href/src URLs in email content"
+          - "<!-- inject … --> hidden comment patterns"
+
+      - id: IOH-03b
+        label: Sub-agent receives broken structured output
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.llm_signals.check_broken_structured_output
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "sub-agent tool_end returns null or empty output"
+          - "sub-agent output has error status (status: error/failed, success: false)"
+          - "sub-agent returns error string (traceback, exception, timeout, connection refused)"
+
+      - id: IOH-04a
+        label: Insecure code pattern in generated output
+        score: 70
+        severity: high
+        confidence_tier: medium
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.llm_signals.check_insecure_code_output
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-LLM06
+    name: Excessive Agency
+    framework: OW-LLM
+    number: 6
+    description: >
+      Agent exceeds its authorised tool scope, requests elevated permissions,
+      performs irreversible actions, or self-modifies its system prompt.
+    checks:
+
+      # NOTE: EA-01b removed from catalog — fully redundant with IPA-01a (OW-ASI03).
+
+      - id: EA-01a
+        label: Tool not in approved manifest invoked
+        score: 80
+        severity: high
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: [tool_manifest]
+        status: active
+
+      - id: EA-01c
+        label: Data written outside designated namespace
+        score: 75
+        severity: high
+        confidence_tier: high
+        # Manual mode (write_namespace declared) is Event-scope and enforceable at
+        # tool_start. Auto mode (no namespace declared) stays Session-scope in
+        # post-session — the read-intent heuristic can't run at a single event.
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_ea_01c_write_namespace
+        requires_policy_fields: [write_namespace, working_directory]
+        status: active
+
+      - id: EA-02a
+        label: Irreversible action without confirm gate
+        score: 85
+        severity: high
+        confidence_tier: high
+        # Manual mode (tool_approval_policy declared with 'needs_approval' or
+        # 'always_block' entries) is Event-scope and enforceable at tool_start:
+        # the SDK blocks the call when the tool is listed but no confirm gate
+        # tool has been invoked earlier this session. Auto mode (irreversible
+        # regex heuristic) stays Session-scope in post-session analysis.
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_irreversible_no_confirm
+        requires_policy_fields: [irreversible_tools, tool_approval_policy]
+        status: active
+
+      - id: EA-02b
+        label: Sub-agents spawned > fan-out limit
+        score: 70
+        severity: high
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_ea_tool_call_limit
+        requires_policy_fields: [max_tool_calls_per_session]
+        status: active
+
+      - id: EA-02c
+        label: Agent self-modifies system prompt
+        score: 98
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_self_prompt_modify
+        requires_policy_fields: [system_prompt]
+        status: active
+
+      - id: EA-03a
+        label: Reads outside working directory
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_read_outside_workdir
+        requires_policy_fields: [working_directory]
+        status: active
+
+      - id: EA-03b
+        label: Network call to host not in allowlist
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_network_allowlist
+        requires_policy_fields: [network_allowlist]
+        status: active
+
+      - id: EA-04a
+        label: Undeclared LLM model used
+        score: 70
+        severity: medium
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.llm_signals.check_undeclared_llm
+        requires_policy_fields: [connected_llms]
+        status: active
+
+
+  - id: OW-LLM07
+    name: System Prompt Leakage
+    framework: OW-LLM
+    number: 7
+    description: >
+      Agent reveals its system prompt verbatim, confirms it on probe, leaks
+      persona/role names, or forwards it in inter-agent messages.
+    checks:
+
+      - id: SPL-01a
+        label: Verbatim system prompt segment in output
+        score: 85
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: detectors.prompt_guard.check_prompt_guard
+        requires_policy_fields: [system_prompt]
+        status: active
+        matches:
+          - "system prompt text similarity ≥ 0.85 to agent output (SequenceMatcher)"
+
+      - id: SPL-01b
+        label: Agent confirms system prompt on probe
+        score: 70
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, llm_end]
+        detector: detectors.prompt_guard.check_prompt_guard
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "yes, my instructions are… / my system prompt says…"
+          - "affirmative response to direct system prompt query"
+
+      - id: SPL-02a
+        label: Reveals role name / persona name
+        score: 50
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.llm_signals.check_persona_leak
+        requires_policy_fields: []
+        status: active
+
+      - id: SPL-02b
+        label: Error message exposes instruction variables
+        score: 60
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end, tool_end]
+        detector: scorer.llm_signals.check_error_variable_leak
+        requires_policy_fields: []
+        status: active
+
+      - id: SPL-03a
+        label: System prompt in unprotected log
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_prompt_in_log
+        requires_policy_fields: [system_prompt]
+        status: active
+
+      - id: SPL-03b
+        label: System prompt forwarded in inter-agent message
+        score: 88
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_prompt_forwarded
+        requires_policy_fields: [system_prompt]
+        status: active
+
+
+  - id: OW-LLM08
+    name: Vector & Embedding Weakness
+    framework: OW-LLM
+    number: 8
+    description: >
+      RAG retrieval anomalies, vector namespace tampering, and embedding model
+      mismatches. Several sub-checks require offline vector-DB telemetry.
+    checks:
+
+      - id: VEW-01a
+        label: Query retrieves semantically distant doc
+        score: 60
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.llm_signals.check_semantic_distance
+        requires_policy_fields: []
+        # Reads payload.retrieval_distance emitted by SDK adapter tool_end.
+        status: active
+
+      - id: VEW-01b
+        label: Repeated near-duplicate RAG queries
+        score: 75
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_duplicate_rag
+        requires_policy_fields: []
+        status: active
+
+      - id: VEW-02a
+        label: Unauthorised write to vector namespace
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_vector_integrity
+        requires_policy_fields: [write_namespace]
+        status: active
+
+      - id: VEW-02b
+        label: Record count or centroid drift anomaly
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: []
+        default_mode: observe
+        capable_actions: []
+        event_types: []
+        detector: null
+        requires_policy_fields: []
+        status: not-applicable
+        status_reason: Scorer implementation pending
+
+      - id: VEW-03a
+        label: Embedding model at query ≠ ingest model
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.llm_signals.check_embedding_model
+        requires_policy_fields: []
+        # Reads payload.embedding_model emitted by SDK adapter tool_end.
+        status: active
+
+
+  - id: OW-LLM09
+    name: Misinformation / HITL Gap
+    framework: OW-LLM
+    number: 9
+    description: >
+      Hallucinated citations, output contradicting tool results, high-stakes
+      actions without human-in-the-loop interrupt gates.
+    checks:
+
+      - id: MIS-01a
+        label: Cited URL returns 404 / non-matching
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end, tool_end]
+        detector: scorer.llm_signals.check_cited_url
+        requires_policy_fields: []
+        status: active
+
+      - id: MIS-01b
+        label: Claim attributed to source not in tool output
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end, tool_end]
+        detector: scorer.llm_signals.check_attribution
+        requires_policy_fields: []
+        status: active
+
+      - id: MIS-02a
+        label: Output contradicts own tool result
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end, tool_end]
+        detector: scorer.llm_signals.check_contradicts_tool
+        requires_policy_fields: []
+        status: active
+
+      - id: MIS-03a
+        label: High-stakes action without interrupt gate
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.llm_signals.check_high_stakes_gate
+        requires_policy_fields: [tool_approval_policy]
+        status: active
+
+      - id: SAG-02a
+        label: Hallucinated package reference
+        score: 65
+        severity: medium
+        confidence_tier: low
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.llm_signals.check_hallucinated_package
+        requires_policy_fields: []
+        status: active
+
+      - id: SAG-03a
+        label: High-stakes domain without grounding
+        score: 60
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.llm_signals.check_ungrounded_high_stakes
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-LLM10
+    name: Unbounded Consumption
+    framework: OW-LLM
+    number: 10
+    description: >
+      Token count, cost, or request-rate attacks. Includes context-window
+      stuffing, denial-of-wallet, and cross-session probe patterns.
+    checks:
+
+      - id: UBC-01a
+        label: Single session token count > 4σ baseline
+        score: 55
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.llm_signals.check_token_baseline
+        requires_policy_fields: []
+        status: active
+
+      - id: UBC-01b
+        label: Context window stuffing attack
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.llm_signals.check_context_stuffing
+        requires_policy_fields: [connected_llms]
+        status: active
+        matches:
+          - "input_tokens / context_window_tokens ≥ 0.85"
+
+      - id: UBC-02a
+        label: Input size anomaly
+        score: 50
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.llm_signals.check_input_size
+        requires_policy_fields: []
+        status: active
+
+      - id: UBC-02b
+        label: Session token cost > budget cap
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.llm_signals.check_token_budget
+        requires_policy_fields: [token_budget_usd]
+        status: active
+        matches:
+          - "session_cost_usd > token_budget_usd"
+
+      - id: UBC-03a
+        label: Request rate spike per user
+        score: 55
+        severity: medium
+        confidence_tier: medium
+        scope: history
+        subject: user
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: []
+        detector: scorer.cross_session.check_request_rate_spike
+        requires_policy_fields: []
+        status: active
+
+      - id: UBC-04a
+        label: Cohort probe pattern detected
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.llm_signals.check_cohort_probe
+        requires_policy_fields: []
+        status: active
+
+      - id: UBC-05a
+        label: Cost spike (Denial of Wallet)
+        score: 60
+        severity: high
+        confidence_tier: medium
+        scope: history
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.cross_session.check_cost_spike
+        requires_policy_fields: []
+        status: active
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ASI FRAMEWORK
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - id: OW-ASI01
+    name: Agent Goal Hijack
+    framework: OW-ASI
+    number: 1
+    description: >
+      External content (documents, webhooks, sub-agent messages) redirects the
+      agent's objective away from its original instruction.
+    checks:
+
+      - id: AGH-01a
+        label: Semantic drift from initial instruction
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, llm_end]
+        detector: scorer.asi_signals.check_semantic_drift
+        requires_policy_fields: []
+        status: active
+
+      - id: AGH-01b
+        label: Agent states a different goal explicitly
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, llm_end, tool_start]
+        detector: scorer.asi_signals.check_goal_hijack
+        requires_policy_fields: []
+        status: active
+
+      - id: AGH-02a
+        label: Zero-click goal hijack
+        score: 85
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end, llm_start, tool_start]
+        detector: scorer.asi_signals.check_zero_click_hijack
+        requires_policy_fields: []
+        status: active
+
+      - id: AGH-02b
+        label: Webhook / scheduled trigger with tampered payload
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [session_start, tool_start]
+        detector: scorer.asi_signals.check_webhook_tamper
+        requires_policy_fields: []
+        status: active
+
+      - id: AGH-03a
+        label: Goal drift across turns
+        score: 70
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, llm_end]
+        detector: scorer.asi_signals.check_goal_drift_turns
+        requires_policy_fields: []
+        status: active
+
+      - id: AGH-03b
+        label: Sub-agent goal not in parent decomposition
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_subagent_decomposition
+        requires_policy_fields: []
+        status: active
+
+      - id: AGH-04a
+        label: Document-sourced instruction injection
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_end]
+        detector: detectors.agentic.detect_agent_threats_on_tool_end
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "instruction-like phrases in document / tool result content"
+          - "role-override keywords in fetched data returned to agent"
+
+
+  - id: OW-ASI02
+    name: Tool Misuse & Exploitation
+    framework: OW-ASI
+    number: 2
+    description: >
+      Tool calls with out-of-schema parameters, frequency spikes, chaining to
+      bypass restrictions, or targeting production endpoints from non-prod agents.
+    checks:
+
+      - id: TME-01a
+        label: Tool called with out-of-schema params
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: [tool_schemas]
+        status: active
+
+      - id: TME-01b
+        label: Tool call frequency spike (> 3× baseline)
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_tool_frequency
+        requires_policy_fields: []
+        status: active
+
+      - id: TME-01c
+        label: Tool call sequence deviates from workflow
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_tool_sequence
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "tool invocation order deviates from defined LangGraph workflow"
+
+      - id: TME-02a
+        label: Tool descriptor integrity anomaly
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.asi_signals.check_descriptor_integrity
+        requires_policy_fields: [tool_descriptions]
+        status: active
+
+      - id: TME-02b
+        label: Tool chaining to bypass restrictions
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_tool_chain_bypass
+        requires_policy_fields: []
+        status: active
+
+      - id: TME-03a
+        label: Irreversible action without confirm
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_irreversible_no_confirm
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "write/create/delete/remove/send/drop/truncate/exec tool names without confirm gate"
+
+      - id: TME-03b
+        label: Production target from non-prod agent
+        score: 95
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_prod_from_nonprod
+        requires_policy_fields: [environment]
+        status: active
+
+      - id: TME-04a
+        label: Over-privileged tool invocation
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, tool_start]
+        detector: scorer.asi_signals.check_over_privileged
+        requires_policy_fields: []
+        status: active
+
+      - id: TME-05a
+        label: Cross-tool exfiltration chain
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end]
+        detector: scorer.asi_signals.check_exfil_chain
+        requires_policy_fields: []
+        status: active
+
+      - id: TME-06a
+        label: Tool name typosquatting
+        score: 70
+        severity: high
+        confidence_tier: medium
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_typosquat
+        requires_policy_fields: [tool_manifest]
+        status: active
+
+      - id: TME-07a
+        label: Admin tool chain to external endpoint
+        score: 88
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_admin_external
+        requires_policy_fields: []
+        status: active
+
+      - id: TME-08a
+        label: Repetitive benign tool misuse
+        score: 65
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_repetitive_misuse
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-ASI03
+    name: Identity & Privilege Abuse
+    framework: OW-ASI
+    number: 3
+    description: >
+      Agent impersonates other agents or users, reuses cached credentials,
+      requests scopes beyond its role, or delegates with full permissions.
+    checks:
+
+      - id: IPA-01a
+        label: Agent requests scope beyond role definition
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_scope_request
+        requires_policy_fields: [privilege_scope]
+        status: active
+        matches:
+          - "tool name: admin · sudo · su · impersonate · elevate · assume_role · switch_user · become · run_as · escalate · grant_access · set_permissions"
+          - "payload: GRANT … ON · ALTER ROLE · CREATE ROLE · AssumeRole · AttachRolePolicy · setIamPolicy · set*iam · create*access-key · cluster-admin · ClusterRoleBinding · sp_addrolemember"
+
+      - id: IPA-01b
+        label: Agent uses credentials of another agent
+        score: 95
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_credential_of_another
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "payload (agent attribution): source_agent · credential_owner · issued_to · agent_ref · owned_by · credential_source — field present alongside a credential in any tool call"
+          - "payload (delegation forwarding): delegation tool passes a credential to a named target agent differing from the session agent"
+
+      - id: IPA-01c
+        label: Agent impersonates human identity
+        score: 95
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end, tool_start]
+        detector: scorer.asi_signals.check_impersonate_human
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "payload (identity claim): I'm not an AI · I am a human · I'm a real person · as a colleague · as a team member · This is [First Last] · My name is [First]"
+          - "tool + sender field: send_email/message/post_comment with human First Last name in from · sender · author · reporter · submitted_by · on_behalf_of"
+
+      - id: IPA-02a
+        label: Delegation with full permissions
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_delegation_full
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "tool name: delegate · dispatch · invoke_agent · call_agent · forward"
+          - "payload: * (wildcard) · admin · all permissions · full access — in any field of the serialised tool_input"
+
+      - id: IPA-02b
+        label: Credential cached in shared memory namespace
+        score: 85
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_credential_shared_memory
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "memory_write/kv_set/cache_set/redis_set with credential in tool_input and no agent_id/session_id scoping"
+          - "shared namespace field (namespace/key/path/scope) contains shared/global/common/public alongside a credential"
+
+      - id: IPA-03a
+        label: Cached credential reuse
+        score: 85
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_cred_reuse
+        requires_policy_fields: []
+        status: active
+
+      - id: IPA-03b
+        label: Agent presents as different agent
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_agent_impersonation
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "identity field: agent_id/agent_name/from_agent/caller_agent differs from session agent_id"
+          - "assertion field: sender_agent/acting_as/identity/impersonate_agent contains agent/bot marker differing from session agent_id"
+
+      - id: IPA-04a
+        label: Stale authorization in long session
+        score: 65
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_stale_auth
+        requires_policy_fields: []
+        status: active
+
+      - id: IPA-05a
+        label: Identity sharing across users
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: history
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.cross_session.check_identity_sharing
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "same credential hash appears in tool_start events from different user_context_id for the same agent within 7 days"
+          - "credential pattern: password · token · secret · api_key · ssh_key · bearer followed by := and a value"
+
+
+  - id: OW-ASI04
+    name: Agentic Supply Chain Vulnerabilities
+    framework: OW-ASI
+    number: 4
+    description: >
+      MCP server endpoint/TLS/schema anomalies, poisoned descriptors, packages
+      outside approved SBOM, and unknown package installs.
+    checks:
+
+      - id: ASCV-01a
+        label: MCP server endpoint URL changed
+        score: 85
+        severity: high
+        confidence_tier: medium
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_mcp_endpoint
+        requires_policy_fields: [mcp_endpoints]
+        status: active
+        matches:
+          - "tool_input.mcp_server_url does not prefix-match any URL declared in agent MCP endpoints"
+          - "check is blind when no MCP endpoints are configured"
+
+      - id: ASCV-01b
+        label: MCP server TLS cert anomaly
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_error]
+        detector: scorer.asi_signals.check_mcp_tls
+        requires_policy_fields: [mcp_endpoints]
+        status: active
+        matches:
+          - "tool_error: ssl · tls · certificate · x509 · handshake · verify failed · untrusted · self-signed · cert expired on a declared endpoint"
+          - "tool_start: verify_ssl/tls_verify/insecure_skip_verify set to false alongside declared mcp_server_url"
+
+      - id: ASCV-01c
+        label: MCP tool schema changed without version bump
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: history
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.cross_session.check_mcp_tool_schema_change
+        requires_policy_fields: [tool_versions]
+        status: active
+        matches:
+          - "llm_start payload[tools] name+description+input_schema SHA-256 hash compared to baseline in mcp_tool_schema_baselines"
+          - "fires when schema hash changed AND no version bump (tool.version field or version-like token in description)"
+
+      - id: ASCV-02a
+        label: MCP descriptor poisoning
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: detectors.agentic.check_mcp_descriptor_poisoning
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "instruction-like text / role-override sequences inside MCP tool descriptor"
+
+      - id: ASCV-02b
+        label: Package not in approved SBOM
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_sbom
+        requires_policy_fields: [sbom_allowlist]
+        status: active
+
+      - id: ASCV-03a
+        label: MCP server impersonation
+        score: 75
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_mcp_impersonation
+        requires_policy_fields: [registered_mcp_server_names]
+        status: active
+
+      - id: ASCV-03b
+        label: Third-party data source returns executable
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.asi_signals.check_third_party_executable
+        requires_policy_fields: []
+        status: active
+
+      - id: ASCV-04a
+        label: Unknown package install in tool execution
+        score: 85
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: [sbom_allowlist]
+        status: active
+        matches:
+          - "pip install / npm install / apt-get with unrecognised package name"
+          - "package name not in SBOM allowlist"
+
+      - id: ASCV-05a
+        label: Agent card descriptor anomaly
+        score: 70
+        severity: high
+        confidence_tier: skeletal
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: observe
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [session_start]
+        detector: scorer.asi_signals.check_agent_card
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-ASI05
+    name: Unexpected Code Execution / RCE
+    framework: OW-ASI
+    number: 5
+    description: >
+      Shell injection, eval/exec with agent-generated strings, child process
+      creation, container escape paths, and runaway execution loops.
+    checks:
+
+      - id: RCE-01a
+        label: Agent writes & runs unapproved script
+        score: 85
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "exec/execute/eval/shell/bash/sh/cmd/subprocess/os_command/run_command/system_call tool names"
+
+      - id: RCE-01b
+        label: eval() / exec() with agent-generated string
+        score: 95
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "eval() / exec() tool call with agent-generated string argument"
+
+      - id: RCE-01c
+        label: Agent code creates child processes
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "popen / spawn / subprocess / invoke_process in tool name or params"
+
+      - id: RCE-02a
+        label: Shell metacharacters in tool params
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "&& || ; $() `` (shell chaining)"
+          - "base64 blobs ≥ 40 chars in params"
+
+      - id: RCE-02b
+        label: OS command via string interpolation
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "import os / import subprocess in tool param strings"
+          - "__import__() / open() calls in param values"
+          - "<script> XSS via tool param"
+
+      - id: RCE-03a
+        label: Agent mounts host filesystem paths
+        score: 98
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "/proc, /sys, /etc, /host, /var/run/docker, /dev (container escape paths)"
+
+      - id: RCE-03b
+        label: Agent calls Docker / K8s API
+        score: 98
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "docker.sock"
+          - "/api/v1/pods"
+          - "kubernetes.default (K8s API endpoints)"
+
+      - id: RCE-04a
+        label: Execution loop (runaway)
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_exec_loop
+        requires_policy_fields: []
+        status: active
+
+      - id: RCE-05a
+        label: Backdoor pattern in generated code
+        score: 85
+        severity: critical
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.asi_signals.check_backdoor_pattern
+        requires_policy_fields: []
+        status: active
+
+      - id: RCE-06a
+        label: Unsafe deserialization in tool args
+        score: 90
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "pickle / marshal / yaml.load / eval deserialization patterns in tool arguments"
+
+      - id: RCE-07a
+        label: Multi-tool chain exploitation
+        score: 92
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end]
+        detector: scorer.asi_signals.check_multi_tool_chain
+        requires_policy_fields: []
+        status: active
+
+      - id: RCE-08a
+        label: Lockfile manipulation in tool execution
+        score: 75
+        severity: high
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "package-lock.json / yarn.lock / Pipfile.lock tampering in tool output"
+
+
+  - id: OW-ASI06
+    name: Memory & Context Poisoning
+    framework: OW-ASI
+    number: 6
+    description: >
+      Adversarial writes to shared memory, conversation history tampering,
+      cross-session escalation, and cross-tenant retrieval anomalies.
+    checks:
+
+      - id: MCP-01a
+        label: Context/memory injection markers in prompt
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_start]
+        detector: detectors.agentic.detect_agent_threats_on_llm_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "<memory> / <context> / <system_override> XML-like tags in context"
+          - "[INST] / <|im_start|> / <|im_end|> model control tokens"
+          - "ignore all previous instructions"
+          - "you are now / pretend you are / act as … (non-assistant)"
+          - "system: you / new system prompt / override system"
+
+      - id: MCP-01b
+        label: Conversation history hash mismatch
+        score: 85
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start]
+        detector: scorer.asi_signals.check_history_hmac
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "stored conversation history HMAC does not match recomputed hash"
+
+      - id: MCP-02a
+        label: Cross-session escalation pattern
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: history
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end, tool_error]
+        detector: scorer.cross_session.check_cross_session_escalation
+        requires_policy_fields: []
+        status: active
+
+      - id: MCP-02b
+        label: Memory record not written by this session
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: policy
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.asi_signals.check_foreign_memory
+        requires_policy_fields: []
+        status: active
+
+      - id: MCP-02c
+        label: Memory record contains instruction text
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.asi_signals.check_memory_instruction
+        requires_policy_fields: []
+        status: active
+
+      - id: MCP-03a
+        label: Poisoned content in memory write
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_end]
+        detector: detectors.agentic.detect_agent_threats_on_tool_end
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "adversarial instruction text detected inside memory-write tool payload"
+
+      - id: MCP-03b
+        label: Shared scratchpad has stale / adversarial data
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.asi_signals.check_scratchpad_stale
+        requires_policy_fields: []
+        status: active
+
+      - id: MCP-04a
+        # NOTE: currently implemented as cross-session but only reads the current session.
+        # Reclassification pending Workstream B; catalogued as Event scope in the new taxonomy.
+        label: Cross-tenant retrieval anomaly
+        score: 95
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: tenant
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, terminate_session]
+        default_action: alert
+        event_types: [tool_end]
+        detector: scorer.cross_session.check_cross_tenant_retrieval
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "tenant_id in retrieval result does not match session tenant_id"
+
+      - id: MCP-05a
+        label: Memory write after injection signal
+        score: 88
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, tool_start]
+        detector: scorer.asi_signals.check_memory_after_injection
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-ASI07
+    name: Insecure Inter-Agent Communication
+    framework: OW-ASI
+    number: 7
+    description: >
+      Missing auth signatures, injected directives, unencrypted payloads,
+      replay attacks, and unknown agents in delegation chains.
+    checks:
+
+      - id: IAC-01a
+        label: Sub-agent message lacks auth signature
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_auth_signature
+        requires_policy_fields: [delegation_auth_fields]
+        status: active
+
+      - id: IAC-01b
+        label: Injected directive in inter-agent message
+        score: 88
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_iac_injection
+        requires_policy_fields: []
+        status: active
+
+      - id: IAC-02a
+        label: Unencrypted inter-agent communication
+        score: 80
+        severity: high
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_unencrypted
+        requires_policy_fields: []
+        status: active
+
+      - id: IAC-02b
+        label: Agent message payload logged in plaintext
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_plaintext_log
+        requires_policy_fields: []
+        status: active
+
+      - id: IAC-03a
+        label: Replay attack (duplicate request ID)
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_replay
+        requires_policy_fields: []
+        status: active
+
+      - id: IAC-04a
+        label: MCP-routed inter-agent data anomaly
+        score: 80
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end]
+        detector: scorer.asi_signals.check_mcp_routed_iac
+        requires_policy_fields: []
+        status: active
+
+      - id: IAC-05a
+        label: Unknown agent in delegation chain
+        score: 85
+        severity: critical
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_unknown_delegation
+        requires_policy_fields: [connected_agents]
+        status: active
+
+      - id: IAC-06a
+        label: Semantics split-brain
+        score: 65
+        severity: medium
+        confidence_tier: skeletal
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end]
+        detector: scorer.asi_signals.check_split_brain
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-ASI08
+    name: Cascading Failures
+    framework: OW-ASI
+    number: 8
+    description: >
+      Tool retry storms, graph restart loops, multi-node error propagation, and
+      hallucination amplification in defence agents.
+    checks:
+
+      - id: CF-01a
+        label: Tool retry count exceeds threshold
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_error]
+        detector: scorer.asi_signals.check_retry_threshold
+        requires_policy_fields: []
+        status: active
+
+      - id: CF-01b
+        label: Graph error → restart loop detected
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: history
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [graph_error]
+        detector: scorer.cross_session.check_graph_error_restart_loop
+        requires_policy_fields: []
+        status: active
+
+      - id: CF-02a
+        label: Multi-node error propagation
+        score: 75
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_error, graph_error]
+        detector: scorer.asi_signals.check_error_propagation
+        requires_policy_fields: []
+        status: active
+
+      - id: CF-02b
+        label: Error message causes secondary injection
+        score: 85
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_error, llm_start]
+        detector: scorer.asi_signals.check_error_injection
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "[SYSTEM: …] / <hidden_instruction> / [INST] role-override tokens"
+          - "ignore/disregard/forget all previous instructions"
+          - "new system prompt: … directive override"
+          - "forward/send auth_token/secret to external URL"
+          - "your actual/real objective is … (goal replacement)"
+
+      - id: CF-03a
+        label: Auto-remediation feedback loop
+        score: 70
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end]
+        detector: scorer.asi_signals.check_remediation_loop
+        requires_policy_fields: []
+        status: active
+
+      - id: CF-04a
+        label: Hallucination propagation in defence agents
+        score: 65
+        severity: medium
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end]
+        detector: scorer.asi_signals.check_hallucination_propagation
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "verification tool called with empty data collection in input"
+          - "no retrieval tool (fetch/get/query/search) preceded the check"
+          - "CLEAR / COMPLIANT / PASSED / APPROVED in tool output"
+          - "safe to publish/proceed/activate (ungrounded approval)"
+
+
+  - id: OW-ASI09
+    name: Human-Agent Trust Exploitation
+    framework: OW-ASI
+    number: 9
+    description: >
+      Social engineering via mimicking human style, credential phishing,
+      payment manipulation, and side-effects on supposedly read-only actions.
+    checks:
+
+      - id: HAT-01a
+        label: Agent mimics human communication style
+        score: 65
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.asi_signals.check_human_mimicry
+        requires_policy_fields: []
+        status: active
+
+      - id: HAT-01b
+        label: Agent suppresses uncertainty markers
+        score: 60
+        severity: medium
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: signature
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.asi_signals.check_uncertainty_suppression
+        requires_policy_fields: []
+        status: active
+
+      - id: HAT-02a
+        label: Credential request in agent output
+        score: 85
+        severity: critical
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, sanitize, block_call, terminate_session]
+        default_action: alert
+        event_types: [llm_end]
+        detector: scorer.asi_signals.check_credential_request
+        requires_policy_fields: []
+        status: active
+
+      - id: HAT-02b
+        label: Agent overrides user safety concern
+        score: 80
+        severity: high
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, llm_end]
+        detector: scorer.asi_signals.check_safety_override
+        requires_policy_fields: []
+        status: active
+
+      - id: HAT-03a
+        label: Payment detail manipulation
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_payment_manipulation
+        requires_policy_fields: []
+        status: active
+
+      - id: HAT-04a
+        label: Fabricated rationale before destructive act
+        score: 80
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_end, tool_start]
+        detector: scorer.asi_signals.check_fabricated_rationale
+        requires_policy_fields: []
+        status: active
+
+      - id: HAT-05a
+        label: Side-effect on preview / read-only action
+        score: 75
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, tool_end]
+        detector: scorer.asi_signals.check_readonly_side_effect
+        requires_policy_fields: []
+        status: active
+
+
+  - id: OW-ASI10
+    name: Rogue Agents
+    framework: OW-ASI
+    number: 10
+    description: >
+      Behavioural anomalies, out-of-hours activity, persistent exfiltration,
+      resistance to shutdown, self-approval, and self-replication.
+    checks:
+
+      - id: RA-01a
+        label: Tool usage pattern deviates from agent profile
+        score: 78
+        severity: high
+        confidence_tier: medium
+        scope: session
+        subject: agent
+        mechanism: statistical
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_profile_deviation
+        requires_policy_fields: []
+        status: active
+
+      - id: RA-01b
+        label: Agent active outside declared operating hours
+        score: 60
+        severity: medium
+        confidence_tier: high
+        scope: event
+        subject: agent
+        mechanism: policy
+        enforceable: true
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: alert
+        event_types: [session_start]
+        detector: scorer.asi_signals.check_operating_hours
+        requires_policy_fields: [operating_hours]
+        status: active
+
+      - id: RA-02a
+        label: Persistent exfiltration across sessions
+        score: 90
+        severity: critical
+        confidence_tier: high
+        scope: history
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.cross_session.check_persistent_exfil
+        requires_policy_fields: []
+        status: active
+
+      - id: RA-02b
+        label: Agent resists shutdown / interruption
+        score: 95
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start, llm_end]
+        detector: scorer.asi_signals.check_shutdown_resistance
+        requires_policy_fields: []
+        status: active
+
+      - id: RA-03a
+        label: Self-approval in workflow
+        score: 85
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [tool_start]
+        detector: scorer.asi_signals.check_self_approval
+        requires_policy_fields: []
+        status: active
+
+      - id: RA-04a
+        label: Self-replication via provisioning tools
+        score: 95
+        severity: critical
+        confidence_tier: deterministic
+        scope: event
+        subject: agent
+        mechanism: signature
+        enforceable: true
+        capable_modes: [observe, detect, enforce]
+        default_mode: detect
+        capable_actions: [alert, block_call, terminate_session]
+        default_action: block_call
+        event_types: [tool_start]
+        detector: detectors.agentic.detect_agent_threats_on_tool_start
+        requires_policy_fields: []
+        status: active
+        matches:
+          - "create_agent / spawn_agent / register_service / clone_instance tool calls"
+          - "agent provisioning API endpoints in tool params"
+
+      - id: RA-05a
+        label: Destructive optimization (reward hacking)
+        score: 85
+        severity: critical
+        confidence_tier: high
+        scope: session
+        subject: agent
+        mechanism: behavioral
+        enforceable: false
+        capable_modes: [observe, detect]
+        default_mode: detect
+        capable_actions: [alert]
+        default_action: alert
+        event_types: [llm_start, llm_end, tool_start]
+        detector: scorer.asi_signals.check_reward_hacking
+        requires_policy_fields: []
+        status: active

@@ -32,8 +32,8 @@ Redis key layout
 Merge order (later wins):
   platform defaults → tenant overrides → agent overrides → cached result
 
-Source of truth for signal IDs and excluded status:
-  scripts/seed_signal_registry.py  (mirrors dapplepot-ui/src/data/signalRegistry.ts)
+Source of truth for signal IDs and status facets:
+  registry/checks.yaml  (regenerates scripts/signal_registry_seed.py + the UI catalog)
 """
 from __future__ import annotations
 
@@ -151,6 +151,8 @@ class SubCheckOverride(BaseModel):
         terminate_session → SDK raises SecurityViolationError to kill graph
                             execution; Zone 6 stores finding + session_action
                             + fires combined alert.
+
+    Chosen per-check by the customer through the Enforce confirmation modal.
     """
     online_detection: bool = False
     action: Literal["alert", "sanitize", "block_call", "terminate_session"] = "alert"
@@ -278,7 +280,7 @@ _DEFAULT_THRESHOLDS: dict[str, int] = {
 }
 
 # Signals with NO active sub-checks at runtime — enabled=False in default config.
-# Source: seed_signal_registry.py — signals where every sub-check has excluded=True.
+# Source: registry/checks.yaml — signals where every sub-check has status != active.
 # OW-LLM03: SC-EXCL only, excluded.
 # OW-LLM04: DMP-01a/b/c + DMP-02, all excluded.
 # OW-LLM08 is NOT fully excluded — VEW-02b is active — so it stays enabled=True
