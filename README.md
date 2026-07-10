@@ -28,6 +28,16 @@ make server            # uvicorn server.main:app --port 8001 --reload
 | `REDIS_URL` | ✅ | `redis://localhost:6379/0` |
 | `SCORER_VERSION` | — | Default `3.0.0` |
 | `COMPOSITE_ALERT_THRESHOLD_V3` | — | Default `60` |
+| `REFLEX_ENDPOINT_URL` | — | Reflex classifier URL (Cloud Run). Empty = tier off, regex fallback |
+| `REFLEX_TIMEOUT_MS` | — | Reflex HTTP timeout. Default `50`; use `1000`+ for remote Cloud Run |
+| `REFLEX_API_SECRET` | — | Shared secret sent as `X-Internal-Secret` to `dapplepot-reflex` |
+| `NVIDIA_API_KEY` | — | Verdict LLM-judge key (NIM). Empty = tier off, heuristic fallback |
+| `NVIDIA_BASE_URL` | — | Default `https://integrate.api.nvidia.com/v1` |
+| `VERDICT_MODEL` | — | Default `meta/llama-3.1-8b-instruct` |
+| `VERDICT_TIMEOUT_MS` | — | Default `5000` |
+| `VERDICT_GATE_SCORE` | — | Skip Verdict when max rule-based effective score < this. Default `35` |
+| `VERDICT_MAX_CONCURRENT` | — | In-flight NIM calls cap. Default `4` |
+| `VERDICT_MAX_RETRIES` | — | Retry cap on 429/503. Default `3` |
 
 ## HTTP Endpoint
 
@@ -82,6 +92,24 @@ score_session(tenant_id, session_id, agent_id)
   ├─ compute_agent_trust_score()   Bayesian Beta(α=2,β=8) + temporal decay
   └─ write_agent_risk_score()      → agent_risk_scores (Postgres)
 ```
+
+## Model tiers — Reflex + Verdict
+
+Two pluggable model backends. Each is authoritative for its routed
+sub-checks when configured; falls back silently to regex/heuristic when not.
+
+| Tier | Runs in | Enabled by | Routed | Actually judged today |
+|---|---|---|---|---|
+| **Reflex** | `/v1/online-check` (last, after all regex handlers) | `REFLEX_ENDPOINT_URL` | 45 sub-check IDs | ~15 (current classifier is Prompt-Guard-2-86M; covers the `prompt_injection` category + `IAC-01b`/`MCP-03a`. Other 30 routed IDs fall back to regex silently.) |
+| **Verdict** | `orchestrator.score_session` (before v3 scoring) | `NVIDIA_API_KEY` | 46 sub-check IDs | 46 (LLM judge; a broader classifier can drop what's not attempted) |
+
+Routing map: `registry/model_coverage.yaml`.
+Verdict cost-gated by `VERDICT_GATE_SCORE` (default 35 = medium band); one
+combined NIM call per session; retries 429/503; multi-turn sessions send
+current-turn events only + prior findings summary.
+
+Findings returned by `/v1/online-check` are sorted before response:
+`alert < sanitize < block_call < terminate_session`, then `check_score` desc.
 
 ## v3 Scoring Model
 
@@ -151,6 +179,8 @@ The scorer produces three alert types via `security_eval/findings.py`. All share
 | `security_eval/scorer/cross_session.py` | Cross-session signal functions (SID-03a, SID-04a, UBC-03a/05a, IPA-05a, MCP-02a/04a, RA-02a) |
 | `security_eval/scorer/trust.py` | Bayesian agent trust scoring |
 | `security_eval/scorer/probe.py` | Probe utilities used by signal functions |
+| `security_eval/models/` | Reflex + Verdict clients (`reflex.py`, `verdict.py`, `prompts.py`) |
+| `registry/model_coverage.yaml` | Reflex/Verdict sub-check routing |
 | `core/security_config.py` | `AgentSecurityConfig`, `SubCheckOverride`, `push_agent_defaults()`, Redis cache |
 | `db/postgres/` | 23 migration files |
 

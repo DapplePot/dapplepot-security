@@ -185,6 +185,19 @@ def snapshot_summary() -> str:
     )
 
 
+def model_tier_summary() -> str:
+    """One-line summary of Reflex/Verdict tier configuration for startup logs."""
+    # Local import — settings pulls in env parsing; keep registry import cheap.
+    from core.config import settings
+    reflex = settings.reflex_endpoint_url or "not configured (regex fallback)"
+    verdict = (
+        f"{settings.verdict_model} @ {settings.nvidia_base_url}"
+        if settings.nvidia_api_key
+        else "not configured (heuristic fallback)"
+    )
+    return f"Reflex: {reflex}  ·  Verdict: {verdict}"
+
+
 def coverage_report() -> dict:
     """Return the full coverage breakdown by bucket.
 
@@ -239,3 +252,4 @@ def coverage_report() -> dict:
 
 
 logger.info(snapshot_summary())
+logger.info(model_tier_summary())

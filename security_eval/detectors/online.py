@@ -216,6 +216,9 @@ def _extract_content(event_type: str, payload: dict[str, Any]) -> list[str]:
     """Extract text blobs to scan from the event payload."""
     texts: list[str] = []
     if event_type in ('llm_start', 'chat_model_start'):
+        # `messages` in the compact llm_start shape is a 1-element list
+        # containing only the current-turn input. In the legacy shape it's
+        # the full accumulated history. Same iteration works for both.
         for msg in payload.get('messages') or []:
             content = msg.get('content', '') if isinstance(msg, dict) else str(msg)
             if content:

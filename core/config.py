@@ -28,6 +28,38 @@ class Settings(BaseSettings):
     llm_input_cost_per_1k: float = 0.01    # USD per 1k input tokens (default GPT-4 proxy)
     llm_output_cost_per_1k: float = 0.03   # USD per 1k output tokens
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Reflex — fast classifier called on Runtime Guard hot path.
+    # Empty URL = tier disabled; every Reflex-routed check falls back to
+    # its existing regex/pattern implementation.
+    # ─────────────────────────────────────────────────────────────────────
+    reflex_endpoint_url: str = ""
+    reflex_timeout_ms:   int = 50
+    # Shared secret with the reflex service (must match REFLEX_API_SECRET
+    # in dapplepot-reflex). Sent on every request as X-Internal-Secret.
+    # Empty = no auth header attached (dev / self-hosted reflex without auth).
+    reflex_api_secret:   str = ""
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Verdict — LLM judge called at end of score_session.
+    # Empty api_key = tier disabled; every Verdict-routed check falls back
+    # to its existing heuristic scorer. NIM is OpenAI-compatible.
+    # ─────────────────────────────────────────────────────────────────────
+    nvidia_api_key:      str = ""
+    nvidia_base_url:     str = "https://integrate.api.nvidia.com/v1"
+    verdict_model:       str = "meta/llama-3.1-8b-instruct"
+    verdict_timeout_ms:  int = 5000
+    # Cost gate: skip Verdict on sessions whose rule-based max effective
+    # score is below this. 35 = start of the medium band (RISK_BANDS_V3).
+    # Clean/low-risk sessions never call the LLM; only risky ones do.
+    verdict_gate_score:  int = 35
+    # Concurrency cap: at most this many verdict_judge calls may be in-flight
+    # to NIM at once (process-wide). Extras queue in-process.
+    verdict_max_concurrent: int = 4
+    # Retry cap on 429/503 responses. Retry-After header is honoured when
+    # present; otherwise exponential backoff with jitter.
+    verdict_max_retries: int = 3
+
     def get_tool_manifests(self) -> dict[str, list[str]]:
         return json.loads(self.tool_manifests)
 

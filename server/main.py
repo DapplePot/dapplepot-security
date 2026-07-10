@@ -444,16 +444,16 @@ async def _run_trust_decay_sweep() -> None:
     >= _TRUST_STALE_THRESHOLD_DAYS days."""
     pool = await get_pool()
 
-    # Find candidate agents. `agent_risk_scores.scored_at` is the last time
-    # any session-driven update landed. If the agent has no sessions at all
-    # they don't appear in the table; that's fine — no history means the
+    # Find candidate agents. `agent_risk_scores.last_scored_at` is the last
+    # time any session-driven update landed. If the agent has no sessions at
+    # all they don't appear in the table; that's fine — no history means the
     # prior (~80) applies at query time.
     try:
         rows = await pool.fetch(
             """
             SELECT tenant_id, agent_id
             FROM agent_risk_scores
-            WHERE scored_at < now() - ($1 || ' days')::interval
+            WHERE last_scored_at < now() - ($1 || ' days')::interval
             LIMIT $2
             """,
             str(_TRUST_STALE_THRESHOLD_DAYS),
@@ -500,7 +500,7 @@ async def _run_trust_decay_sweep() -> None:
                        trust_trend       = $4,
                        trust_alpha       = $5,
                        trust_beta        = $6,
-                       scored_at         = now()
+                       last_scored_at    = now()
                  WHERE tenant_id = $1 AND agent_id = $2
                 """,
                 tenant_id, agent_id,
@@ -1506,5 +1506,43 @@ async def online_check(request: Request, _: None = Depends(_require_internal_sec
                         'action': enabled_checks['MCP-04a'],
                     })
                     break
+
+    # ── Reflex — fast-classifier override for routed sub-checks ──
+    # If REFLEX_ENDPOINT_URL is configured, replace regex findings for every
+    # Reflex-routed sub-check ID with the model's verdict. Runs LAST so it
+    # can filter output from every standalone signature handler above
+    # (MCP-01a, AGH-04a, MCP-03a etc.), not just detect_online(). If not
+    # configured, this block is a no-op and the regex findings stand.
+    if settings.reflex_endpoint_url:
+        try:
+            from security_eval.registry import REFLEX_SUBCHECK_IDS
+            from security_eval.models import reflex_classify
+            reflex_active = REFLEX_SUBCHECK_IDS & set(enabled_checks.keys())
+            if reflex_active:
+                findings = [f for f in findings if f['sub_check_id'] not in reflex_active]
+                reflex_findings = await reflex_classify(
+                    event={'event_type': event_type, 'payload': payload,
+                           'session_id': session_id, 'tenant_id': tenant_id},
+                    active_ids=reflex_active,
+                )
+                for f in reflex_findings:
+                    findings.append({**f, 'action': enabled_checks[f['sub_check_id']]})
+        except Exception:
+            logger.exception('reflex dispatch failed')
+
+    # ── Sort findings for a coherent timeline in the SDK ──────────────────
+    # Handler chain order (regex → EA-* → MCP-* → Reflex-last) is not
+    # meaningful to a viewer; the SDK emits findings in the order we return
+    # them, so the story on the dashboard reads however we sort them here.
+    # Order by ACTION SEVERITY ASCENDING (least invasive first) so a session
+    # with both a sanitize and a block reads as "we cleaned it up, then had
+    # to block anyway" rather than "blocked (also sanitized?)". Tiebreak by
+    # check_score desc + sub_check_id for stable, deterministic ordering.
+    _ACTION_ORDER = {'alert': 0, 'sanitize': 1, 'block_call': 2, 'terminate_session': 3}
+    findings.sort(key=lambda f: (
+        _ACTION_ORDER.get(f.get('action', 'alert'), 0),
+        -int(f.get('check_score', 0) or 0),
+        str(f.get('sub_check_id', '')),
+    ))
 
     return JSONResponse({'findings': findings})

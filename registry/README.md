@@ -31,6 +31,7 @@ Any manual edit is overwritten by the next `gen_*.py` run. CI enforces this via 
 ### Runtime consumers
 
 - `dapplepot-security/security_eval/registry.py` — loads the JSON snapshot + `model_coverage.yaml`, exposes derived sets (`ENFORCEABLE_SUBCHECK_IDS`, `EVENT_SCOPE_IDS`, `REFLEX_SUBCHECK_IDS`, `VERDICT_SUBCHECK_IDS`, etc.) and `coverage_report()`.
+- `dapplepot-security/security_eval/models/` — Reflex + Verdict clients read `REFLEX_SUBCHECK_IDS`, `VERDICT_BY_CATEGORY`, and `CHECK_BY_ID` for dispatch, category grouping, and Finding metadata.
 - `dapplepot-security/scripts/check_sdk_sync.py` — CI guard that cross-references the SDK's hardcoded `_ONLINE_CAPABLE_SUB_CHECKS` frozenset against the registry.
 
 ## How to add or change a check

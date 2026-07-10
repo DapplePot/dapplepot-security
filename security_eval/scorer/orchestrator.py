@@ -734,6 +734,75 @@ async def score_session(
         except Exception:
             logger.exception('"cross-session signal failed key=%s"', _cs_key)
 
+    # ─── Verdict — LLM-judge override for routed session-scope checks ────────
+    # If NVIDIA_API_KEY is configured, replace rule-based findings for
+    # Verdict-routed sub-check IDs with the model's verdict. If not
+    # configured, this block is a no-op and the rule-based findings stand.
+    # Never overrides an SDK online finding (subtract online_ids).
+    #
+    # Cost gate: to keep NIM traffic proportional to session risk we skip
+    # Verdict on sessions whose rule-based max effective score
+    # (check_score × confidence_weight) is below settings.verdict_gate_score.
+    # This is a strict upper bound on the v3 composite (which averages the
+    # top signal with the mean of the rest), so any session with composite
+    # ≥ gate is guaranteed to clear it. Clean sessions never call the LLM.
+    if settings.nvidia_api_key:
+        try:
+            from security_eval.registry import VERDICT_SUBCHECK_IDS
+            from security_eval.models import verdict_judge
+            active_verdict = VERDICT_SUBCHECK_IDS - online_ids
+            if active_verdict:
+                max_eff = max(
+                    (
+                        int(getattr(f, "check_score", 0) or 0)
+                        * float(getattr(f, "confidence", 1.0) or 1.0)
+                        for f in all_findings
+                    ),
+                    default=0.0,
+                )
+                if max_eff < settings.verdict_gate_score:
+                    logger.info(
+                        '"verdict skipped (below gate) session_id=%s max_eff=%.1f gate=%d"',
+                        session_id, max_eff, settings.verdict_gate_score,
+                    )
+                else:
+                    all_findings = [
+                        f for f in all_findings
+                        if getattr(f, "sub_check_id", None) not in active_verdict
+                    ]
+                    # Multi-turn cost optimization: only send the events from
+                    # the current turn (last graph_start / session_start
+                    # onward) plus a summary of findings from earlier turns.
+                    # Cuts NIM token cost on long sessions and keeps the
+                    # judge focused on new evidence. Falls back to the full
+                    # events list if no graph_start marker is found.
+                    _turn_start = 0
+                    for _idx in range(len(events) - 1, -1, -1):
+                        if events[_idx].get("event_type") in ("graph_start", "session_start"):
+                            _turn_start = _idx
+                            break
+                    _turn_events = events[_turn_start:] if _turn_start else events
+                    _current_event_ids = {
+                        ev.get("event_id") for ev in _turn_events
+                        if ev.get("event_id")
+                    }
+                    _prior = [
+                        f for f in all_findings
+                        if getattr(f, "event_id", None) not in _current_event_ids
+                    ]
+                    verdict_findings = await verdict_judge(
+                        _turn_events, tenant_id, session_id, active_verdict,
+                        prior_findings=_prior,
+                    )
+                    # Respect per-signal enabled flag like the rule-based path does.
+                    for f in verdict_findings:
+                        sig_id = getattr(f, "owasp_signal_id", None)
+                        sig_cfg = sec_config.signals.get(sig_id) if sig_id else None
+                        if sig_cfg is None or sig_cfg.enabled:
+                            all_findings.append(f)
+        except Exception:
+            logger.exception('"verdict dispatch failed session_id=%s"', session_id)
+
     # ─── v3 scoring model ─────────────────────────────────────────────────────
     all_session_findings = all_findings
 
