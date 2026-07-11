@@ -1,0 +1,7 @@
+fastapi>=0.111
+uvicorn[standard]>=0.29
+pydantic>=2.0
+transformers>=4.44
+# CPU-only torch is installed via a separate index-url in the Dockerfile.
+# For local dev, the default torch wheel (with CUDA support) also works.
+torch>=2.3

@@ -1,0 +1,77 @@
+name: Deploy Reflex
+
+# Only runs when the reflex sidecar source actually changes. Pushes that touch
+# security_eval/, server/, etc. are ignored — Prompt-Guard-2 doesn't need a
+# fresh image every time the security service changes.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "services/model/reflex/**"
+      - ".github/workflows/deploy-reflex.yml"
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/dapplepot/dapplepot-reflex
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: services/model/reflex
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          # HF_TOKEN is mounted as a BuildKit secret so the Dockerfile can
+          # download the license-gated Llama-Prompt-Guard-2 weights at build
+          # time. It never lands in an image layer.
+          secrets: |
+            hf_token=${{ secrets.HF_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Reflex on VM
+        run: |
+          gcloud compute ssh "${{ secrets.GCE_INSTANCE }}" \
+            --zone "${{ secrets.GCE_ZONE }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --tunnel-through-iap \
+            --strict-host-key-checking=no \
+            --command "
+              set -e
+              echo '${{ secrets.GITHUB_TOKEN }}' | sudo docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+              sudo docker compose -f /opt/dapplepot/docker-compose.yml pull reflex
+              sudo docker compose -f /opt/dapplepot/docker-compose.yml up -d --no-deps reflex
+              sudo docker image prune -f
+            "

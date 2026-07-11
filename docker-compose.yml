@@ -1,0 +1,24 @@
+# dapplepot-reflex — local build & run of the Prompt-Guard-2 classifier.
+
+services:
+  reflex:
+    build:
+      context: ./services/model/reflex
+      secrets:
+        - hf_token
+    image: dapplepot-reflex:local
+    env_file: .env
+    ports:
+      - "8080:8080"          # exposed for host-side smoke tests; drop on VM
+    mem_limit: 1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20            # first probe waits for the model to finish loading
+      start_period: 60s
+
+secrets:
+  hf_token:
+    environment: HF_TOKEN

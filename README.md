@@ -28,9 +28,9 @@ make server            # uvicorn server.main:app --port 8001 --reload
 | `REDIS_URL` | ✅ | `redis://localhost:6379/0` |
 | `SCORER_VERSION` | — | Default `3.0.0` |
 | `COMPOSITE_ALERT_THRESHOLD_V3` | — | Default `60` |
-| `REFLEX_ENDPOINT_URL` | — | Reflex classifier URL (Cloud Run). Empty = tier off, regex fallback |
-| `REFLEX_TIMEOUT_MS` | — | Reflex HTTP timeout. Default `50`; use `1000`+ for remote Cloud Run |
-| `REFLEX_API_SECRET` | — | Shared secret sent as `X-Internal-Secret` to `dapplepot-reflex` |
+| `REFLEX_ENDPOINT_URL` | — | Reflex classifier URL. Docker-compose default: `http://reflex:8080/`. Empty = tier off, regex fallback |
+| `REFLEX_TIMEOUT_MS` | — | Reflex HTTP timeout. Default `200` (docker-network hop into the sidecar); tighten to `100` once p99 is measured |
+| `REFLEX_API_SECRET` | — | Shared secret sent as `X-Internal-Secret` to the reflex container |
 | `NVIDIA_API_KEY` | — | Verdict LLM-judge key (NIM). Empty = tier off, heuristic fallback |
 | `NVIDIA_BASE_URL` | — | Default `https://integrate.api.nvidia.com/v1` |
 | `VERDICT_MODEL` | — | Default `meta/llama-3.1-8b-instruct` |
@@ -100,7 +100,7 @@ sub-checks when configured; falls back silently to regex/heuristic when not.
 
 | Tier | Runs in | Enabled by | Routed | Actually judged today |
 |---|---|---|---|---|
-| **Reflex** | `/v1/online-check` (last, after all regex handlers) | `REFLEX_ENDPOINT_URL` | 45 sub-check IDs | ~15 (current classifier is Prompt-Guard-2-86M; covers the `prompt_injection` category + `IAC-01b`/`MCP-03a`. Other 30 routed IDs fall back to regex silently.) |
+| **Reflex** | `/v1/online-check` (last, after all regex handlers) | `REFLEX_ENDPOINT_URL` | 45 sub-check IDs | ~15 (current classifier is Prompt-Guard-2-86M, image built from `services/model/reflex/`; covers the `prompt_injection` category + `IAC-01b`/`MCP-03a`. Other 30 routed IDs fall back to regex silently.) |
 | **Verdict** | `orchestrator.score_session` (before v3 scoring) | `NVIDIA_API_KEY` | 46 sub-check IDs | 46 (LLM judge; a broader classifier can drop what's not attempted) |
 
 Routing map: `registry/model_coverage.yaml`.
