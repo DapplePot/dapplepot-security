@@ -3,6 +3,10 @@ name: Deploy Security
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - "services/model/reflex/**"
+      - ".github/workflows/deploy-reflex.yml"
+  workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/dapplepot/dapplepot-security
