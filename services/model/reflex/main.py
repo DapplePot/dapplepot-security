@@ -26,6 +26,8 @@ import logging
 import math
 import os
 import re
+import threading
+import time
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -242,6 +244,25 @@ app = FastAPI(title="dapplepot-reflex", version="0.1.0")
 _PIPE = None  # populated at startup
 
 
+KEEP_WARM_INTERVAL_MS = int(os.environ.get("REFLEX_KEEP_WARM_INTERVAL_MS", "30000"))
+
+
+def _keep_warm_loop() -> None:
+    """Background thread: pings the classifier every
+    REFLEX_KEEP_WARM_INTERVAL_MS milliseconds so torch/transformers state
+    stays hot in CPU cache. Without this, first inference after any idle
+    period pays ~2-3s cold-start on small VMs, which blows past the SDK's
+    5s online-check timeout."""
+    interval_s = KEEP_WARM_INTERVAL_MS / 1000.0
+    while True:
+        try:
+            if _PIPE is not None:
+                _PIPE("keep warm")
+        except Exception as exc:
+            logger.warning("keep-warm ping failed: %s", exc)
+        time.sleep(interval_s)
+
+
 @app.on_event("startup")
 def _load_model() -> None:
     global _PIPE
@@ -253,7 +274,15 @@ def _load_model() -> None:
         max_length=512,
         top_k=None,      # return every class score
     )
-    logger.info("model ready")
+    # Eager warm-up: force torch/tokenizer first-inference cost during
+    # container start (inside the compose start_period) rather than on the
+    # first real user request.
+    t0 = time.time()
+    _PIPE("warmup")
+    logger.info("model ready and warmed in %.2fs", time.time() - t0)
+    # Keep-warm heartbeat.
+    threading.Thread(target=_keep_warm_loop, daemon=True).start()
+    logger.info("keep-warm thread started (interval=%sms)", KEEP_WARM_INTERVAL_MS)
 
 
 def _check_auth(x_internal_secret: str | None) -> None:
