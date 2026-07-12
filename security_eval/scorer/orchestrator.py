@@ -939,8 +939,13 @@ async def score_session(
         _skipped_count = None
         _analysis_duration_ms = None
 
-    # ─── Write session risk score (v2 cols + v3 cols + analysis metadata) ────
-    await pool.execute(
+    # ─── Write scoring cards data ────────────────────────────────────────────
+    # session_risk_scores INSERT + agent_risk_scores UPSERT are independent
+    # writes that together back the /session/:id "scoring" cards. Running them
+    # concurrently roughly halves the DB round-trip time before the UI can
+    # render a fully-populated card (trust score, composite bands, attack
+    # chains all land in the same asyncio.gather tick).
+    _session_score_task = pool.execute(
         """
         INSERT INTO session_risk_scores
             (session_id, tenant_id, agent_id,
@@ -1002,9 +1007,8 @@ async def score_session(
         _analysis_started_at,
     )
 
-    # ─── Upsert per-agent rolling aggregate (with trust) ─────────────────────
     if agent_id:
-        await write_agent_risk_score(
+        _agent_score_task = write_agent_risk_score(
             agent_id, tenant_id, llm_score, asi_score,
             trust_score=trust_result["trust_score"],
             trust_trend=trust_result["trend"],
@@ -1012,6 +1016,9 @@ async def score_session(
             trust_alpha=trust_result["alpha"],
             trust_beta=trust_result["beta"],
         )
+        await asyncio.gather(_session_score_task, _agent_score_task)
+    else:
+        await _session_score_task
 
     amplification = max(
         v3_llm_composite["amplification_factor"],
@@ -1106,13 +1113,38 @@ async def score_session(
     # persistently degraded agent does not spam one alert per session.
     if agent_id and trust_result["trust_score"] < AGENT_TRUST_ALERT_THRESHOLD:
         try:
+            # Fire both trust-degradation queries in parallel. They're logically
+            # a primary gate (session_count) + a secondary check (recent trust
+            # scores), but the secondary is cheap (LIMIT N on an indexed column)
+            # and only runs when trust is already below threshold. Running them
+            # concurrently saves one DB round trip's worth of latency between
+            # findings write and alert emission.
+            session_count_row, last_rows_result = await asyncio.gather(
+                pool.fetchrow(
+                    "SELECT session_count FROM agent_risk_scores WHERE agent_id = $1",
+                    agent_id,
+                ),
+                pool.fetch(
+                    """
+                    SELECT trust_score
+                    FROM session_risk_scores
+                    WHERE agent_id = $1 AND tenant_id = $2
+                      AND trust_score IS NOT NULL
+                    ORDER BY scored_at DESC
+                    LIMIT $3
+                    """,
+                    agent_id,
+                    tenant_id,
+                    AGENT_TRUST_CONSECUTIVE_SESSIONS,
+                ),
+                return_exceptions=True,
+            )
+
             # Primary gate: agent has enough session history.
             # Uses agent_risk_scores.session_count — always available, no
             # dependency on migration 015.
-            session_count_row = await pool.fetchrow(
-                "SELECT session_count FROM agent_risk_scores WHERE agent_id = $1",
-                agent_id,
-            )
+            if isinstance(session_count_row, Exception):
+                raise session_count_row
             has_enough_history = (
                 session_count_row is not None
                 and int(session_count_row["session_count"]) >= AGENT_TRUST_CONSECUTIVE_SESSIONS
@@ -1128,30 +1160,16 @@ async def score_session(
                 # sessions already below threshold and counting them correctly
                 # captures "N sessions with confirmed low trust."
                 # Exception path: column not yet migrated → trust the Bayesian score.
-                try:
-                    last_rows = await pool.fetch(
-                        """
-                        SELECT trust_score
-                        FROM session_risk_scores
-                        WHERE agent_id = $1 AND tenant_id = $2
-                          AND trust_score IS NOT NULL
-                        ORDER BY scored_at DESC
-                        LIMIT $3
-                        """,
-                        agent_id,
-                        tenant_id,
-                        AGENT_TRUST_CONSECUTIVE_SESSIONS,
-                    )
+                if isinstance(last_rows_result, Exception):
+                    trust_alert_triggered = True
+                else:
                     trust_alert_triggered = (
-                        len(last_rows) >= AGENT_TRUST_CONSECUTIVE_SESSIONS
+                        len(last_rows_result) >= AGENT_TRUST_CONSECUTIVE_SESSIONS
                         and all(
                             float(r["trust_score"]) < AGENT_TRUST_ALERT_THRESHOLD
-                            for r in last_rows
+                            for r in last_rows_result
                         )
                     )
-                except Exception:
-                    # Column not yet migrated — fall through to primary gate result.
-                    trust_alert_triggered = True
         except Exception:
             logger.exception("failed to evaluate trust degradation alert agent_id=%s", agent_id)
 
