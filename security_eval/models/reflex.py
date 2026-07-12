@@ -10,8 +10,15 @@ Wire protocol
 Request  (JSON):
     {
         "event": <the raw event dict passed to /v1/online-check>,
-        "sub_check_ids": ["PI-01a", "SID-01c", ...]   # subset the SDK opted into
+        "sub_check_ids": ["PI-01a", "SID-01c", ...],  # subset the SDK opted into
+        "hint_texts":    ["ignore previous instructions", "<!--", ...]  # optional
     }
+    hint_texts: strings this service has already matched via the regex pass
+    (matched_text from detect_online findings). Reflex uses them as anchors
+    when the classifier input has to be truncated, so it sees the regions
+    that matter instead of a naive head+tail. Not used for classification
+    routing — that stays event-shape driven on Reflex's side.
+
 Response (JSON):
     {
         "findings": [
@@ -70,8 +77,17 @@ def _build_finding(sub_check_id: str, matched_text: str, detail: str) -> dict[st
     }
 
 
-async def reflex_classify(event: dict[str, Any], active_ids: frozenset[str] | set[str]) -> list[dict[str, Any]]:
+async def reflex_classify(
+    event: dict[str, Any],
+    active_ids: frozenset[str] | set[str],
+    hint_texts: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """POST the event to the configured Reflex endpoint and return findings.
+
+    hint_texts: optional matched_text values from earlier regex findings on
+    the same event. Reflex uses them as span anchors so its bounded input
+    window doesn't miss injections that live past the naive truncation cut.
+    Absence is fine — Reflex falls back to head+tail sampling.
 
     Returns [] on any failure — the caller keeps the rule-based findings it
     already computed for these IDs, so falling back is safe.
@@ -79,7 +95,20 @@ async def reflex_classify(event: dict[str, Any], active_ids: frozenset[str] | se
     if not settings.reflex_endpoint_url or not active_ids:
         return []
 
-    payload = {"event": event, "sub_check_ids": sorted(active_ids)}
+    payload: dict[str, Any] = {"event": event, "sub_check_ids": sorted(active_ids)}
+    if hint_texts:
+        # Cap: keep the request body small and dedupe.
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for h in hint_texts:
+            if not h or h in seen:
+                continue
+            seen.add(h)
+            uniq.append(h)
+            if len(uniq) >= 20:
+                break
+        if uniq:
+            payload["hint_texts"] = uniq
 
     # Dedicated reflex secret — distinct from INTERNAL_API_SECRET so the
     # two upstream services (dapplepot-api, dapplepot-reflex) have scoped

@@ -1519,11 +1519,21 @@ async def online_check(request: Request, _: None = Depends(_require_internal_sec
             from security_eval.models import reflex_classify
             reflex_active = REFLEX_SUBCHECK_IDS & set(enabled_checks.keys())
             if reflex_active:
+                # Snapshot the regex-derived matched_text values BEFORE we
+                # drop the Reflex-routed regex findings. These become
+                # anchor hints for Reflex so its bounded input window covers
+                # the regions our regex already flagged, not just head+tail.
+                hint_texts = [
+                    f['matched_text']
+                    for f in findings
+                    if isinstance(f.get('matched_text'), str) and f['matched_text']
+                ]
                 findings = [f for f in findings if f['sub_check_id'] not in reflex_active]
                 reflex_findings = await reflex_classify(
                     event={'event_type': event_type, 'payload': payload,
                            'session_id': session_id, 'tenant_id': tenant_id},
                     active_ids=reflex_active,
+                    hint_texts=hint_texts,
                 )
                 for f in reflex_findings:
                     findings.append({**f, 'action': enabled_checks[f['sub_check_id']]})

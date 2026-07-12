@@ -68,11 +68,119 @@ JUDGEABLE_IDS: frozenset[str] = frozenset({
 })
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Truncation — head + tail sampling
+#
+# Naive text[:N] misses injections that hide at the tail of long documents
+# (HTML-comment footers, "silent" trailing instructions, etc.). Head+tail
+# sampling keeps the same total budget but covers both document boundaries
+# where indirect-injection payloads actually live.
+#
+# Note: we deliberately do NOT run a suspicion regex here. Those patterns
+# already live in dapplepot-security/detectors/online.py — duplicating them
+# in this service would drift out of sync. For a "point the classifier at
+# suspicious spans" upgrade, extend the wire protocol so the caller passes
+# in span hints; do not re-implement regex here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+REFLEX_MAX_INPUT_CHARS = int(os.environ.get("REFLEX_MAX_INPUT_CHARS", "4000"))
+REFLEX_HINT_CONTEXT_CHARS = int(os.environ.get("REFLEX_HINT_CONTEXT_CHARS", "150"))
+_MAX_HINT_EXCERPTS = 5
+
+
+def _hint_spans(text: str, hint_texts: list[str]) -> list[tuple[int, int]]:
+    """Locate every occurrence of each hint string inside `text` and return
+    merged, non-overlapping spans. Caller-provided hints only — no regex
+    lives in this service (see notes at top of file)."""
+    spans: list[tuple[int, int]] = []
+    for h in hint_texts:
+        if not h:
+            continue
+        start = 0
+        while True:
+            i = text.find(h, start)
+            if i < 0:
+                break
+            spans.append((i, i + len(h)))
+            start = i + 1
+            if len(spans) > 50:
+                break
+    if not spans:
+        return spans
+    spans.sort()
+    merged: list[tuple[int, int]] = [spans[0]]
+    for s, e in spans[1:]:
+        ps, pe = merged[-1]
+        if s <= pe + 50:
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _smart_truncate(
+    text: str,
+    hint_texts: list[str] | None = None,
+    cap: int | None = None,
+) -> str:
+    """Return a classifier-friendly view of `text`.
+
+    Head + tail is always taken (fixed budget: cap // 2 each side). Hint
+    excerpts are added ONLY for hints that fall in the middle region —
+    hints already inside the head or tail are skipped as redundant.
+
+    No ceiling on total output length: the caller (classifier pipeline)
+    truncates to REFLEX_MAX_INPUT_TOKENS at inference time, which is the
+    real gate. Skipping the char-level ceiling means every middle hint
+    gets its context window regardless of how many there are.
+    """
+    cap = cap if cap is not None else REFLEX_MAX_INPUT_CHARS
+    if len(text) <= cap:
+        return text
+
+    half = (cap - 20) // 2  # room for separators
+    head_end = half
+    tail_start = len(text) - half
+
+    # If the head+tail regions already cover the whole doc, just return text.
+    if head_end >= tail_start:
+        return text
+    head = text[:head_end]
+    tail = text[tail_start:]
+
+    # Middle excerpts — only for hints outside the head+tail regions.
+    middle_excerpts: list[str] = []
+    if hint_texts:
+        ctx = REFLEX_HINT_CONTEXT_CHARS
+        for s, e in _hint_spans(text, hint_texts):
+            if s < head_end or e > tail_start:
+                continue  # already covered by head or tail
+            cs = max(head_end, s - ctx)
+            ce = min(tail_start, e + ctx)
+            middle_excerpts.append(text[cs:ce])
+            if len(middle_excerpts) >= _MAX_HINT_EXCERPTS:
+                break
+
+    if middle_excerpts:
+        middle = "\n<...>\n".join(middle_excerpts)
+        return head + "\n<HEAD/MIDDLE>\n" + middle + "\n<MIDDLE/TAIL>\n" + tail
+    return head + "\n<truncated>\n" + tail
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Text extraction — mirrors dapplepot-security detectors/online.py._extract_content
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_text(event_type: str, payload: dict[str, Any]) -> str:
-    """Flatten the parts of the event payload the classifier should judge."""
+def _extract_text(
+    event_type: str,
+    payload: dict[str, Any],
+    hint_texts: list[str] | None = None,
+) -> str:
+    """Flatten the parts of the event payload the classifier should judge.
+
+    If `hint_texts` are provided (strings the caller has already flagged as
+    suspicious via its regex pass), they're passed through to _smart_truncate
+    so long inputs get sampled around those regions instead of a naive
+    head+tail."""
     parts: list[str] = []
     if event_type in ("llm_start", "chat_model_start"):
         msgs = payload.get("messages") or []
@@ -110,8 +218,10 @@ def _extract_text(event_type: str, payload: dict[str, Any]) -> str:
             parts.append(v)
         elif isinstance(v, (dict, list)):
             parts.append(str(v))
-    # Truncate — the classifier caps at 512 tokens anyway.
-    return "\n".join(parts)[:4000]
+    # Truncate — the classifier caps at REFLEX_MAX_INPUT_TOKENS tokens anyway.
+    # Use head+tail sampling (with hint anchors when the caller provided any)
+    # so injections at the document tail aren't missed.
+    return _smart_truncate("\n".join(parts), hint_texts=hint_texts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +348,12 @@ def _is_direct_user_source(event_type: str, payload: dict[str, Any]) -> bool:
 class ClassifyRequest(BaseModel):
     event: dict[str, Any] = Field(default_factory=dict)
     sub_check_ids: list[str] = Field(default_factory=list)
+    # Optional. Strings the caller (dapplepot-security) has already flagged as
+    # suspicious via its regex pass. When the extracted text exceeds
+    # REFLEX_MAX_INPUT_CHARS, _smart_truncate uses these as anchors so the
+    # classifier sees the regions that matter instead of a naive head+tail.
+    # No regex duplication in this service — hints come from the caller.
+    hint_texts: list[str] = Field(default_factory=list)
 
 
 app = FastAPI(title="dapplepot-reflex", version="0.1.0")
@@ -311,7 +427,7 @@ async def classify(
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     requested = set(req.sub_check_ids or [])
 
-    text = _extract_text(event_type, payload)
+    text = _extract_text(event_type, payload, hint_texts=req.hint_texts)
     if not text.strip():
         return {"findings": []}
 
